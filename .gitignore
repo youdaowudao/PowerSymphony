@@ -1,0 +1,75 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+
+# Python 覆盖率细分文件
+.coverage.*
+coverage/
+
+# Python 构建/打包补充
+.eggs/
+pip-wheel-metadata/
+
+# 常见本地缓存
+.cache/
+.tox/
+.nox/
+
+# 临时编辑文件
+*.swp
+*.swo
+*~
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+
+# 本地配置与敏感数据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cookie
+cookies*.json
+*cookies*.json
+
+# 浏览器本地状态
+.browser-profiles/
+.playwright/
+
+# 运行输出
+logs/
+*.log
+tmp/
+temp/
+output/
+outputs/
+data/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本机配置
+.codex/config.toml
+.agents/
+
+# Git 工作区
+.worktrees/
+worktrees/
