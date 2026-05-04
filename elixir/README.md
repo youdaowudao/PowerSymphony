@@ -169,6 +169,12 @@ The observability UI now runs on a minimal Phoenix stack:
 
 ## Testing
 
+Choose the validation command based on the current `git diff`.
+
+- Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a test run.
+- Localized code changes should use targeted validation first.
+- Run the full gate only for core code changes, test/build config changes, startup/execution-flow changes, or final pre-PR revalidation:
+
 ```bash
 make all
 ```

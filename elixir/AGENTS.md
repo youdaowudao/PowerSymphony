@@ -6,7 +6,11 @@ This directory contains the Elixir agent orchestration service that polls Linear
 
 - Elixir: `1.19.x` (OTP 28) via `mise`.
 - Install deps: `mix setup`.
-- Main quality gate: `make all` (format check, lint, coverage, dialyzer).
+- Full validation command: `make all` (format check, lint, coverage, dialyzer).
+- Do not run `make all` by default.
+- First inspect `git diff` and choose a validation level that matches the change scope.
+- Only run `make all` for core code changes, test/build config changes, changes that touch startup/execution flow, or final pre-PR revalidation.
+- For docs-only updates, read-only investigation, or Linear triage/cleanup, do not run `make all`.
 
 
 ## Codebase-Specific Conventions
@@ -26,7 +30,11 @@ This directory contains the Elixir agent orchestration service that polls Linear
 
 ## Tests and Validation
 
-Run targeted tests while iterating, then run full gates before handoff.
+Start by checking `git diff`, then choose the lightest validation that proves the change.
+
+- Docs-only, read-only investigation, or Linear triage/cleanup: no test run required.
+- Localized code changes: run targeted tests that directly cover the edited behavior.
+- Core code changes, test/build config changes, startup/execution-flow changes, or final pre-PR revalidation: run `make all`.
 
 ```bash
 make all

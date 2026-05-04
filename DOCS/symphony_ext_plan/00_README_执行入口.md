@@ -97,7 +97,7 @@ Project Worker B
 可以把下面这一段作为每轮 AI 执行的固定前缀：
 
 ```text
-你正在基于 OpenAI Symphony Elixir 原型机做二次开发。禁止换语言，禁止全量重写，禁止把多个项目塞进一个核心 Orchestrator。主线是：新增多项目 Control Plane，管理多个单项目 Symphony worker；每个 worker 仍读取自己的 WORKFLOW.generated.md、logs_root、workspace_root、内部 API port。Web 总览页只能读取轻量 summary，不允许默认拉取 raw event、完整 timeline、完整 prompt、完整 shell output。Codex 线程观测必须通过后端 state reducer 生成 phase/action/health，再给前端展示。每轮修改必须先按当前阶段要求执行：阶段 1 先完成创建仓库、阅读文档、确认方向和骨架搭建；从阶段 2 起必须先读当前源码和相关测试，再给出设计差异、修改文件、测试命令、回滚方式。不要生成小型任务列表，按本文档的阶段和质量门禁推进。
+你正在基于 OpenAI Symphony Elixir 原型机做二次开发。禁止换语言，禁止全量重写，禁止把多个项目塞进一个核心 Orchestrator。主线是：新增多项目 Control Plane，管理多个单项目 Symphony worker；每个 worker 仍读取自己的 WORKFLOW.generated.md、logs_root、workspace_root、内部 API port。Web 总览页只能读取轻量 summary，不允许默认拉取 raw event、完整 timeline、完整 prompt、完整 shell output。Codex 线程观测必须通过后端 state reducer 生成 phase/action/health，再给前端展示。每轮修改必须先按当前阶段要求执行：阶段 1 先完成创建仓库、阅读文档、确认方向和骨架搭建；从阶段 2 起必须先读当前源码和相关测试，并按《07_质量门禁与验收标准.md》先基于 `git diff` 判断验证级别，再给出设计差异、修改文件、测试命令、回滚方式。禁止默认运行 `make -C elixir all`；只有核心代码改动、测试/构建配置改动、或 PR 前最终重核验时才允许。文档-only、只读勘测、Linear 整理阶段不得运行该命令。不要生成小型任务列表，按本文档的阶段和质量门禁推进。
 ```
 
 ---
@@ -143,7 +143,7 @@ Project Worker B
 
 - 修改了哪些文件；
 - 保持了哪些原型机行为不变；
-- 增加了哪些测试；
-- 跑了哪些命令；
-- 哪些质量门禁通过；
+- `git diff` 判定的验证级别与理由；
+- 如果本轮存在代码/配置改动：增加了哪些测试、跑了哪些命令、哪些质量门禁通过；
+- 如果本轮是文档-only、只读勘测或 Linear 整理：为什么不需要运行测试；
 - 如何回滚。
