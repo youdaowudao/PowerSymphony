@@ -145,20 +145,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
 
   defp validate_missing_fields(errors, project, index, project_id) do
     Enum.reduce(@required_fields, errors, fn field, acc ->
-      case Map.fetch(project, field) do
-        :error ->
-          acc ++ [missing_field_error(field, index, project_id)]
-
-        {:ok, value} when is_binary(value) ->
-          if String.trim(value) == "" do
-            acc ++ [missing_field_error(field, index, project_id)]
-          else
-            acc
-          end
-
-        {:ok, _value} ->
-          acc ++ [invalid_required_field_error(field, index, project_id)]
-      end
+      acc ++ validate_required_field(Map.fetch(project, field), field, index, project_id)
     end)
   end
 
@@ -226,35 +213,52 @@ defmodule SymphonyElixir.ProjectConfigStore do
 
   defp validate_paths(errors, project, index, project_id) do
     Enum.reduce(@path_fields, errors, fn field, acc ->
-      case Map.get(project, field) do
-        value when is_binary(value) ->
-          if String.trim(value) == "" do
-            acc
-          else
-            expanded = Path.expand(value)
-
-            cond do
-              Path.type(value) != :absolute ->
-                acc ++ [invalid_path_error(field, index, project_id, "must be an absolute path")]
-
-              path_escape?(value) ->
-                acc ++ [unsafe_path_error(field, index, project_id, "must not contain path traversal segments")]
-
-              true ->
-                case PathSafety.canonicalize(expanded) do
-                  {:ok, _canonical_path} ->
-                    acc
-
-                  {:error, {:path_canonicalize_failed, _path, reason}} ->
-                    acc ++ [invalid_path_error(field, index, project_id, "failed to canonicalize path: #{inspect(reason)}")]
-                end
-            end
-          end
-
-        _ ->
-          acc
-      end
+      acc ++ validate_path_field(Map.get(project, field), field, index, project_id)
     end)
+  end
+
+  defp validate_required_field(:error, field, index, project_id) do
+    [missing_field_error(field, index, project_id)]
+  end
+
+  defp validate_required_field({:ok, value}, field, index, project_id) when is_binary(value) do
+    if String.trim(value) == "" do
+      [missing_field_error(field, index, project_id)]
+    else
+      []
+    end
+  end
+
+  defp validate_required_field({:ok, _value}, field, index, project_id) do
+    [invalid_required_field_error(field, index, project_id)]
+  end
+
+  defp validate_path_field(value, field, index, project_id) when is_binary(value) do
+    cond do
+      String.trim(value) == "" ->
+        []
+
+      Path.type(value) != :absolute ->
+        [invalid_path_error(field, index, project_id, "must be an absolute path")]
+
+      path_escape?(value) ->
+        [unsafe_path_error(field, index, project_id, "must not contain path traversal segments")]
+
+      true ->
+        canonicalize_path_error(Path.expand(value), field, index, project_id)
+    end
+  end
+
+  defp validate_path_field(_value, _field, _index, _project_id), do: []
+
+  defp canonicalize_path_error(expanded, field, index, project_id) do
+    case PathSafety.canonicalize(expanded) do
+      {:ok, _canonical_path} ->
+        []
+
+      {:error, {:path_canonicalize_failed, _path, reason}} ->
+        [invalid_path_error(field, index, project_id, "failed to canonicalize path: #{inspect(reason)}")]
+    end
   end
 
   defp path_escape?(value) when is_binary(value) do
