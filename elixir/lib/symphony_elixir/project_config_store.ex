@@ -79,6 +79,11 @@ defmodule SymphonyElixir.ProjectConfigStore do
   end
 
   defp validate_projects(projects) do
+    project_refs =
+      projects
+      |> Enum.with_index()
+      |> Enum.flat_map(&project_ref/1)
+
     {normalized, errors} =
       projects
       |> Enum.with_index()
@@ -91,7 +96,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
 
     errors =
       errors ++
-        duplicate_id_errors(normalized)
+        duplicate_id_errors(project_refs)
 
     case errors do
       [] -> {:ok, normalized |> Enum.reverse() |> Enum.map(&elem(&1, 0))}
@@ -138,36 +143,21 @@ defmodule SymphonyElixir.ProjectConfigStore do
      ]}
   end
 
-  defp validate_missing_fields(errors, project, index, _project_id) do
+  defp validate_missing_fields(errors, project, index, project_id) do
     Enum.reduce(@required_fields, errors, fn field, acc ->
-      case Map.get(project, field) do
-        value when is_binary(value) ->
+      case Map.fetch(project, field) do
+        :error ->
+          acc ++ [missing_field_error(field, index, project_id)]
+
+        {:ok, value} when is_binary(value) ->
           if String.trim(value) == "" do
-            acc ++
-              [
-                %ProjectConfigError{
-                  type: :missing_field,
-                  field: field,
-                  project_index: index,
-                  project_id: nil,
-                  message: "#{field} is required"
-                }
-              ]
+            acc ++ [missing_field_error(field, index, project_id)]
           else
             acc
           end
 
-        _ ->
-          acc ++
-            [
-              %ProjectConfigError{
-                type: :missing_field,
-                field: field,
-                project_index: index,
-                project_id: nil,
-                message: "#{field} is required"
-              }
-            ]
+        {:ok, _value} ->
+          acc ++ [invalid_required_field_error(field, index, project_id)]
       end
     end)
   end
@@ -273,23 +263,32 @@ defmodule SymphonyElixir.ProjectConfigStore do
     |> Enum.any?(&(&1 == ".."))
   end
 
+  defp project_ref({project, index}) when is_map(project) do
+    case string_or_nil(Map.get(project, "id")) do
+      nil -> []
+      project_id -> [{project_id, index}]
+    end
+  end
+
+  defp project_ref({_project, _index}), do: []
+
   defp duplicate_id_errors(projects) do
     duplicate_ids =
       projects
-      |> Enum.group_by(fn {project, _index} -> project.id end)
+      |> Enum.group_by(fn {project_id, _index} -> project_id end)
       |> Enum.filter(fn {_id, entries} -> length(entries) > 1 end)
       |> Map.new()
 
     projects
-    |> Enum.flat_map(fn {project, index} ->
-      if Map.has_key?(duplicate_ids, project.id) do
+    |> Enum.flat_map(fn {project_id, index} ->
+      if Map.has_key?(duplicate_ids, project_id) do
         [
           %ProjectConfigError{
             type: :duplicate_project_id,
             field: "id",
             project_index: index,
-            project_id: project.id,
-            message: "duplicate project id: #{project.id}"
+            project_id: project_id,
+            message: "duplicate project id: #{project_id}"
           }
         ]
       else
@@ -327,6 +326,26 @@ defmodule SymphonyElixir.ProjectConfigStore do
       type: :yaml_parse_error,
       field: "projects",
       message: message
+    }
+  end
+
+  defp missing_field_error(field, index, project_id) do
+    %ProjectConfigError{
+      type: :missing_field,
+      field: field,
+      project_index: index,
+      project_id: project_id,
+      message: "#{field} is required"
+    }
+  end
+
+  defp invalid_required_field_error(field, index, project_id) do
+    %ProjectConfigError{
+      type: :invalid_field,
+      field: field,
+      project_index: index,
+      project_id: project_id,
+      message: "#{field} must be a non-empty string"
     }
   end
 
