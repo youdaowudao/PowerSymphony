@@ -1,0 +1,14 @@
+# Static control-plane config only.
+# Do not place runtime state, validation state, pid, health, or worker status here.
+projects:
+  - id: chatgpt-extension
+    name: ChatGPT Extension
+    workflow_generated: /home/user/code/chatgpt-extension/WORKFLOW.generated.md
+    workspace_root: /home/user/.symphony/workspaces/chatgpt-extension
+    logs_root: /home/user/.symphony/logs/chatgpt-extension
+
+  - id: docs-site
+    name: Docs Site
+    workflow_generated: /home/user/code/docs-site/WORKFLOW.generated.md
+    workspace_root: /home/user/.symphony/workspaces/docs-site
+    logs_root: /home/user/.symphony/logs/docs-site
