@@ -927,9 +927,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if metadata[:delay_type] == :premature_turn_end_hold do
       if attempt >= @premature_turn_end_hold_limit do
-        Logger.warning(
-          "Issue remains active after repeated premature turn end: #{issue_context(issue)}; converging to blocked local claim"
-        )
+        Logger.warning("Issue remains active after repeated premature turn end: #{issue_context(issue)}; converging to blocked local claim")
 
         {:noreply,
          block_issue_claim(state, issue.id, %{
@@ -1202,9 +1200,7 @@ defmodule SymphonyElixir.Orchestrator do
     if Map.has_key?(state.blocked_claims, issue.id) do
       cond do
         terminal_issue_state?(issue.state, terminal_states) ->
-          Logger.info(
-            "Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim"
-          )
+          Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
 
           cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
           release_issue_claim(state, issue.id)
@@ -1213,9 +1209,7 @@ defmodule SymphonyElixir.Orchestrator do
           put_blocked_claim_issue(state, issue.id, issue)
 
         true ->
-          Logger.info(
-            "Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim"
-          )
+          Logger.info("Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim")
 
           release_issue_claim(state, issue.id)
       end
@@ -1470,9 +1464,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_normal_worker_exit(state, issue_id, running_entry, session_id) do
     case Map.get(running_entry, :run_result) do
       %{status: :continuation_required} = run_result ->
-        Logger.info(
-          "Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check"
-        )
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check")
 
         state
         |> complete_issue(issue_id)
@@ -1484,16 +1476,12 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       %{status: :completed} = run_result ->
-        Logger.info(
-          "Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled"
-        )
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled")
 
         complete_issue(state, issue_id, release_claim?: true)
 
       %{status: :failed, reason: :premature_turn_end} = run_result ->
-        Logger.warning(
-          "Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck"
-        )
+        Logger.warning("Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck")
 
         state
         |> complete_issue(issue_id)
@@ -1506,9 +1494,7 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       _ ->
-        Logger.warning(
-          "Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry"
-        )
+        Logger.warning("Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry")
 
         next_attempt = next_retry_attempt_from_running(running_entry)
 

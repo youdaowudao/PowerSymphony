@@ -543,7 +543,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:agent_run_result, issue_id, %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}})
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :issue_still_active,
+         turn_count: 1
+       }}
+    )
+
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -670,7 +679,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:agent_run_result, issue_id, %{status: :continuation_required, reason: :max_turns_reached, turn_count: 2}})
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :max_turns_reached,
+         turn_count: 2
+       }}
+    )
+
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -746,7 +764,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:agent_run_result, issue_id, %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}})
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :issue_still_active,
+         turn_count: 1
+       }}
+    )
+
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
 
@@ -1694,9 +1721,15 @@ defmodule SymphonyElixir.CoreTest do
 
       assert :ok = AgentRunner.run(issue, parent, issue_state_fetcher: state_fetcher)
 
-      assert_receive {:agent_run_result, "issue-run-result",
-                      %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}},
-                     500
+      assert_receive(
+        {:agent_run_result, "issue-run-result",
+         %{
+           status: :continuation_required,
+           reason: :issue_still_active,
+           turn_count: 1
+         }},
+        500
+      )
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -1887,9 +1920,15 @@ defmodule SymphonyElixir.CoreTest do
 
       assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
 
-      assert_receive {:agent_run_result, "issue-max-turns-result",
-                      %{status: :continuation_required, reason: :max_turns_reached, turn_count: 2}},
-                     500
+      assert_receive(
+        {:agent_run_result, "issue-max-turns-result",
+         %{
+           status: :continuation_required,
+           reason: :max_turns_reached,
+           turn_count: 2
+         }},
+        500
+      )
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -1966,8 +2005,7 @@ defmodule SymphonyElixir.CoreTest do
 
       assert :ok = AgentRunner.run(issue, self())
 
-      assert_receive {:agent_run_result, "issue-turn-failed-result",
-                      %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+      assert_receive {:agent_run_result, "issue-turn-failed-result", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
                      500
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
@@ -2045,8 +2083,7 @@ defmodule SymphonyElixir.CoreTest do
 
       assert :ok = AgentRunner.run(issue, self())
 
-      assert_receive {:agent_run_result, "issue-turn-cancelled-result",
-                      %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+      assert_receive {:agent_run_result, "issue-turn-cancelled-result", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
                      500
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
@@ -2100,6 +2137,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.claimed, issue_id)
     assert MapSet.member?(state.completed, issue_id)
+
     assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :premature_turn_end_hold} =
              state.retry_attempts[issue_id]
 
@@ -2197,8 +2235,10 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.claimed, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
+
     assert %{attempt: 3, reason: :premature_turn_end, issue: %Issue{id: ^issue_id}} =
              state.blocked_claims[issue_id]
+
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
@@ -2258,6 +2298,7 @@ defmodule SymphonyElixir.CoreTest do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
     issue_id = "issue-run-failed-terminal-release"
     issue_identifier = "MT-572"
+
     test_root =
       Path.join(
         System.tmp_dir!(),

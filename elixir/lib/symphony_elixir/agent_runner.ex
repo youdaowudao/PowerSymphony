@@ -189,9 +189,7 @@ defmodule SymphonyElixir.AgentRunner do
       turn_count: turn_number
     })
 
-    Logger.warning(
-      "Agent turn ended prematurely for #{issue_context(issue)} turn=#{turn_number} reason=#{inspect(reason)}"
-    )
+    Logger.warning("Agent turn ended prematurely for #{issue_context(issue)} turn=#{turn_number} reason=#{inspect(reason)}")
 
     :ok
   end
