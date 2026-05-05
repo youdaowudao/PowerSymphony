@@ -711,6 +711,79 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "active issue with non-terminal blocker is not dispatchable" do
+    issue = %Issue{
+      id: "issue-active-blocked",
+      identifier: "MT-563A",
+      title: "Blocked active issue",
+      description: "Should not dispatch while blocker is not terminal",
+      state: "In Progress",
+      blocked_by: [%{state: "In Progress"}],
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "active issue becomes dispatchable after all blockers reach terminal state" do
+    blocked_issue = %Issue{
+      id: "issue-active-unblocked",
+      identifier: "MT-563B",
+      title: "Previously blocked active issue",
+      description: "Should dispatch after blockers close",
+      state: "In Progress",
+      blocked_by: [%{state: "In Progress"}],
+      labels: []
+    }
+
+    unblocked_issue = %Issue{blocked_issue | blocked_by: [%{state: "Done"}]}
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(blocked_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(unblocked_issue, state)
+  end
+
+  test "revalidate blocks active issue retry until blockers are terminal" do
+    issue = %Issue{
+      id: "issue-active-revalidate",
+      identifier: "MT-563C",
+      title: "Blocked active retry",
+      description: "Should skip retry while blocker remains active",
+      state: "In Progress",
+      blocked_by: [],
+      labels: []
+    }
+
+    assert {:skip, %Issue{id: "issue-active-revalidate"} = blocked_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(issue, fn [_issue_id] ->
+               {:ok, [%Issue{issue | blocked_by: [%{state: "Todo"}]}]}
+             end)
+
+    assert blocked_issue.blocked_by == [%{state: "Todo"}]
+
+    assert {:ok, %Issue{id: "issue-active-revalidate"} = unblocked_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(issue, fn [_issue_id] ->
+               {:ok, [%Issue{issue | blocked_by: [%{state: "Done"}]}]}
+             end)
+
+    assert unblocked_issue.blocked_by == [%{state: "Done"}]
+  end
+
   test "continuation retry callback redispatches through the real retry_issue path while keeping claim until handoff" do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
     issue_id = "issue-continuation-retry-callback"
