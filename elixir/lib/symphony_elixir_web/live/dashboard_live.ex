@@ -10,13 +10,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    runtime_mode = runtime_mode()
+
     socket =
       socket
       |> assign(:payload, load_payload())
       |> assign(:projects_payload, load_projects_payload())
+      |> assign(:runtime_mode, runtime_mode)
       |> assign(:now, DateTime.utc_now())
 
-    if connected?(socket) do
+    if connected?(socket) and runtime_mode != :control_plane do
       :ok = ObservabilityPubSub.subscribe()
       schedule_runtime_tick()
     end
@@ -70,6 +73,56 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </div>
       </header>
 
+      <%= if @runtime_mode == :control_plane do %>
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Projects</h2>
+              <p class="section-copy">Static project config validation and placeholder runtime state.</p>
+            </div>
+          </div>
+
+          <%= if @projects_payload.projects == [] do %>
+            <p class="empty-state">No projects registered.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 680px;">
+                <thead>
+                  <tr>
+                    <th>Project</th>
+                    <th>Validation</th>
+                    <th>Runtime</th>
+                    <th>Errors</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={project <- @projects_payload.projects}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= project.project_name || project.project_id || "n/a" %></span>
+                        <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(project.validation_result)}>
+                        <%= project.validation_result %>
+                      </span>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(project.runtime_state.status)}>
+                        <%= project.runtime_state.status %>
+                      </span>
+                    </td>
+                    <td>
+                      <%= project.validation_errors |> Enum.map(&validation_error_label/1) |> Enum.join(", ") |> blank_to_na() %>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+      <% else %>
       <%= if @payload[:error] do %>
         <section class="error-card">
           <h2 class="error-title">
@@ -296,12 +349,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
       <% end %>
+      <% end %>
     </section>
     """
   end
 
   defp load_payload do
-    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+    if runtime_mode() == :control_plane do
+      Presenter.empty_state_payload()
+    else
+      Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+    end
   end
 
   defp load_projects_payload do
@@ -318,6 +376,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp project_registry do
     Endpoint.config(:project_registry) || %SymphonyElixir.ProjectRegistry{entries: []}
+  end
+
+  defp runtime_mode do
+    Endpoint.config(:runtime_mode) || :workflow
   end
 
   defp completed_runtime_seconds(payload) do
