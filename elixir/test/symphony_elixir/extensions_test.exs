@@ -77,6 +77,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule StaticProjectRegistry do
+    defstruct entries: []
+  end
+
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
 
@@ -96,6 +100,20 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
+    end)
+
+    :ok
+  end
+
+  setup do
+    project_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
+
+    on_exit(fn ->
+      if is_nil(project_config_path) do
+        Application.delete_env(:symphony_elixir, :project_config_path_override)
+      else
+        Application.put_env(:symphony_elixir, :project_config_path_override, project_config_path)
+      end
     end)
 
     :ok
@@ -427,6 +445,49 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "phoenix control-plane api exposes project registry summaries" do
+    start_test_endpoint(
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          },
+          %{
+            project_id: "Beta",
+            project_name: "Beta",
+            validation_result: :invalid,
+            validation_errors: [%{field: "id", message: "id must match ..."}],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      },
+      snapshot_timeout_ms: 50
+    )
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    assert Enum.map(payload["projects"], & &1["project_id"]) == ["alpha", "Beta"]
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    assert detail["project"]["runtime_state"]["status"] == "not_started"
+    assert detail["project"]["validation_result"] == "valid"
+
+    assert json_response(post(build_conn(), "/api/v1/projects", %{}), 405) == %{
+             "error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/summary", %{}), 405) == %{
+             "error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/missing/summary"), 404) == %{
+             "error" => %{"code" => "project_not_found", "message" => "Project not found"}
+           }
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
@@ -536,10 +597,36 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       )
 
-    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          },
+          %{
+            project_id: "Beta",
+            project_name: "Beta",
+            validation_result: :invalid,
+            validation_errors: [%{field: "id", message: "id must match ..."}],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      },
+      snapshot_timeout_ms: 50
+    )
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Operations Dashboard"
+    assert html =~ "Projects"
+    assert html =~ "Alpha"
+    assert html =~ "Beta"
+    assert html =~ "not_started"
+    assert html =~ "invalid"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
@@ -670,6 +757,72 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert method_not_allowed_response.body["error"]["code"] == "method_not_allowed"
 
     assert {:error, _reason} = HttpServer.start_link(host: "bad host", port: 0)
+  end
+
+  test "http server auto-loads project registry from static project config path" do
+    snapshot = static_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :AutoLoadedProjectRegistryOrchestrator)
+
+    refresh = %{
+      queued: true,
+      coalesced: false,
+      requested_at: DateTime.utc_now(),
+      operations: ["poll"]
+    }
+
+    config_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-project-registry-http-server-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(config_root) end)
+    File.mkdir_p!(config_root)
+
+    config_path = Path.join(config_root, "symphony.projects.yaml")
+
+    File.write!(config_path, """
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+      - id: Beta
+        name: Beta
+        workflow_generated: /tmp/beta/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/beta
+        logs_root: /tmp/logs/beta
+    """)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    server_opts = [
+      host: "127.0.0.1",
+      port: 0,
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50
+    ]
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+    start_supervised!({HttpServer, server_opts})
+
+    port = wait_for_bound_port()
+
+    projects_response = Req.get!("http://127.0.0.1:#{port}/api/v1/projects")
+    assert projects_response.status == 200
+
+    assert Enum.map(projects_response.body["projects"], & &1["project_id"]) == ["alpha", "Beta"]
+    assert Enum.map(projects_response.body["projects"], & &1["runtime_state"]["status"]) == ["not_started", "not_started"]
+    assert Enum.map(projects_response.body["projects"], & &1["validation_result"]) == ["valid", "invalid"]
+
+    dashboard_response = Req.get!("http://127.0.0.1:#{port}/")
+    assert dashboard_response.status == 200
+    assert dashboard_response.body =~ "Projects"
+    assert dashboard_response.body =~ "Alpha"
+    assert dashboard_response.body =~ "Beta"
+    assert dashboard_response.body =~ "not_started"
+    assert dashboard_response.body =~ "invalid"
   end
 
   defp start_test_endpoint(overrides) do

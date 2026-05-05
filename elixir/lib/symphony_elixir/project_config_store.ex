@@ -41,11 +41,50 @@ defmodule SymphonyElixir.ProjectConfigStore do
 
   @spec parse_string(String.t()) :: {:ok, [ProjectConfig.t()]} | {:error, [ProjectConfigError.t()]}
   def parse_string(yaml) when is_binary(yaml) do
+    with {:ok, projects} <- decode_projects(yaml) do
+      validate_projects(projects)
+    end
+  end
+
+  @spec decode_projects(String.t()) :: {:ok, [map()]} | {:error, [ProjectConfigError.t()]}
+  def decode_projects(yaml) when is_binary(yaml) do
     with {:ok, decoded} <- decode_yaml(yaml),
          {:ok, projects} <- fetch_projects(decoded),
          :ok <- validate_root_fields(decoded) do
-      validate_projects(projects)
+      {:ok, projects}
     end
+  end
+
+  @spec validate_raw_projects([term()]) ::
+          [%{normalized_config: ProjectConfig.t() | nil, validation_errors: [ProjectConfigError.t()]}]
+  def validate_raw_projects(projects) when is_list(projects) do
+    duplicate_errors_by_index =
+      projects
+      |> Enum.with_index()
+      |> Enum.flat_map(&project_ref/1)
+      |> duplicate_id_errors()
+      |> Enum.group_by(& &1.project_index)
+
+    projects
+    |> Enum.with_index()
+    |> Enum.map(fn {project, index} ->
+      validation_errors =
+        case validate_project(project, index) do
+          {:ok, _config} -> []
+          {:error, errors} -> errors
+        end
+
+      combined_errors = validation_errors ++ Map.get(duplicate_errors_by_index, index, [])
+
+      case combined_errors do
+        [] ->
+          {:ok, config} = validate_project(project, index)
+          %{normalized_config: config, validation_errors: []}
+
+        _ ->
+          %{normalized_config: nil, validation_errors: combined_errors}
+      end
+    end)
   end
 
   defp decode_yaml(yaml) do

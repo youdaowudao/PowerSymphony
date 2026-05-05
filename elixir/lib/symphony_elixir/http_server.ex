@@ -3,7 +3,7 @@ defmodule SymphonyElixir.HttpServer do
   Compatibility facade that starts the Phoenix observability endpoint when enabled.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator}
+  alias SymphonyElixir.{Config, Orchestrator, ProjectRegistryLoader}
   alias SymphonyElixirWeb.Endpoint
 
   @secret_key_bytes 48
@@ -25,12 +25,15 @@ defmodule SymphonyElixir.HttpServer do
         snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
 
         with {:ok, ip} <- parse_host(host) do
+          project_registry = Keyword.get(opts, :project_registry, ProjectRegistryLoader.load())
+
           endpoint_opts = [
             server: true,
             http: [ip: ip, port: port],
             url: [host: normalize_host(host)],
             orchestrator: orchestrator,
             snapshot_timeout_ms: snapshot_timeout_ms,
+            project_registry: project_registry,
             secret_key_base: secret_key_base()
           ]
 
