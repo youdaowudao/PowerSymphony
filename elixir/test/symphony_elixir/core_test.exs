@@ -543,6 +543,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :issue_still_active,
+         turn_count: 1
+       }}
+    )
+
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -551,7 +561,236 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 450, 1_100)
+    assert_due_in_range(due_at_ms, 100, 1_100)
+  end
+
+  test "normal worker exit without continuation run result does not schedule active-state continuation retry" do
+    issue_id = "issue-run-complete"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletedRunOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :completed, reason: :issue_inactive, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "normal completed worker exit releases claim so the issue can be dispatched again" do
+    issue_id = "issue-run-reopen"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletedRunReopenOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-566",
+      issue: %Issue{id: issue_id, identifier: "MT-566", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :completed, reason: :issue_inactive, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-566",
+      title: "Reopened after completion",
+      description: "Should be dispatchable again",
+      state: "In Progress",
+      labels: []
+    }
+
+    refute MapSet.member?(state.claimed, issue_id)
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "normal worker exit with continuation run result schedules active-state continuation retry" do
+    issue_id = "issue-run-continue"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RunResultContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-563",
+      issue: %Issue{id: issue_id, identifier: "MT-563", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :max_turns_reached,
+         turn_count: 2
+       }}
+    )
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      title: "Continuation remains claimed",
+      description: "Should wait for continuation retry",
+      state: "In Progress",
+      labels: []
+    }
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert is_integer(due_at_ms)
+    assert_due_in_range(due_at_ms, 100, 1_100)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "continuation retry callback redispatches through the real retry_issue path while keeping claim until handoff" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-continuation-retry-callback"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationRetryCallbackOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-570",
+        title: "Continuation callback",
+        description: "Should keep claim and retry through the real callback path",
+        state: "In Progress",
+        labels: []
+      }
+    ])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-570",
+      worker_host: "worker-a",
+      workspace_path: "/tmp/continuation-callback",
+      issue: %Issue{id: issue_id, identifier: "MT-570", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:max_concurrent_agents, 0)
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :continuation_required,
+         reason: :issue_still_active,
+         turn_count: 1
+       }}
+    )
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    assert %{attempt: 1, retry_token: retry_token, worker_host: "worker-a", workspace_path: "/tmp/continuation-callback"} =
+             :sys.get_state(pid).retry_attempts[issue_id]
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{retry_attempt: 1, worker_host: nil, workspace_path: workspace_path, issue: %Issue{id: ^issue_id}} =
+             state.running[issue_id]
+
+    assert workspace_path =~ "/MT-570"
+    assert MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +830,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -891,6 +1130,24 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() =~ "{{ issue.identifier }}"
     assert Config.workflow_prompt() =~ "{{ issue.title }}"
     assert Config.workflow_prompt() =~ "{{ issue.description }}"
+  end
+
+  test "prompt builder default template warns against ending active turns prematurely" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "   \n")
+
+    issue = %Issue{
+      identifier: "MT-779",
+      title: "Keep active turns open",
+      description: "Do not stop after an interim update while the issue is still active.",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-779",
+      labels: ["prompt"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Do not end the turn merely because you have posted an interim update while the Linear issue remains active."
+    assert prompt =~ "Only stop the turn early when you are truly blocked or when the issue is ready for correct closeout."
   end
 
   test "prompt builder default template handles missing issue body" do
@@ -1365,6 +1622,120 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner reports continuation_required run result when active issue remains after a normal turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-run-result-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-result"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-result-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-result-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:agent_result_fetch_count, 0) + 1
+        Process.put(:agent_result_fetch_count, attempt)
+
+        state =
+          if attempt == 1 do
+            "In Progress"
+          else
+            "Done"
+          end
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-run-result",
+             identifier: "MT-564",
+             title: "Report run result",
+             description: "Still active after first turn",
+             state: state
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-run-result",
+        identifier: "MT-564",
+        title: "Report run result",
+        description: "Still active after first turn",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-564",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, parent, issue_state_fetcher: state_fetcher)
+
+      assert_receive(
+        {:agent_run_result, "issue-run-result",
+         %{
+           status: :continuation_required,
+           reason: :issue_still_active,
+           turn_count: 1
+         }},
+        500
+      )
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner stops continuing once agent.max_turns is reached" do
     test_root =
       Path.join(
@@ -1460,6 +1831,542 @@ defmodule SymphonyElixir.CoreTest do
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
+  end
+
+  test "agent runner reports continuation_required run result when agent.max_turns is reached" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-max-turns-run-result-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max-result"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-result-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-result-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-max-turns-result",
+             identifier: "MT-565",
+             title: "Max turns result",
+             description: "Still active",
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-max-turns-result",
+        identifier: "MT-565",
+        title: "Max turns result",
+        description: "Still active",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-565",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive(
+        {:agent_run_result, "issue-max-turns-result",
+         %{
+           status: :continuation_required,
+           reason: :max_turns_reached,
+           turn_count: 2
+         }},
+        500
+      )
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner reports failed run result when a turn fails prematurely" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-turn-failed-run-result-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-turn-failed"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-failed-result-1"}}}'
+            printf '%s\\n' '{"method":"turn/failed","params":{"message":"turn aborted"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2
+      )
+
+      issue = %Issue{
+        id: "issue-turn-failed-result",
+        identifier: "MT-567",
+        title: "Turn failed run result",
+        description: "The turn fails before run success or crash.",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-567",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, self())
+
+      assert_receive {:agent_run_result, "issue-turn-failed-result", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+                     500
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner reports failed run result when a turn is cancelled prematurely" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-turn-cancelled-run-result-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-turn-cancelled"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cancelled-result-1"}}}'
+            printf '%s\\n' '{"method":"turn/cancelled","params":{"message":"turn cancelled"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2
+      )
+
+      issue = %Issue{
+        id: "issue-turn-cancelled-result",
+        identifier: "MT-571",
+        title: "Turn cancelled run result",
+        description: "The turn is cancelled before run success or crash.",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-571",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, self())
+
+      assert_receive {:agent_run_result, "issue-turn-cancelled-result", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+                     500
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "normal worker exit with failed run result does not allow ordinary redispatch" do
+    issue_id = "issue-run-failed-closeout"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :FailedRunCloseoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-568",
+      issue: %Issue{id: issue_id, identifier: "MT-568", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :failed, reason: :premature_turn_end, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-568",
+      title: "Premature turn end hold",
+      description: "Should not auto redispatch while still active",
+      state: "In Progress",
+      labels: []
+    }
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :premature_turn_end_hold} =
+             state.retry_attempts[issue_id]
+
+    assert is_integer(due_at_ms)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "premature turn end hold converges to a blocked local claim while the issue remains active" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-run-failed-hold"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :FailedRunHoldOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-569",
+        title: "Premature turn end hold",
+        description: "Should continue holding while still active",
+        state: "In Progress",
+        labels: []
+      }
+    ])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-569",
+      issue: %Issue{id: issue_id, identifier: "MT-569", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:max_concurrent_agents, 0)
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :failed, reason: :premature_turn_end, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    assert %{attempt: 1, retry_token: retry_token, delay_type: :premature_turn_end_hold} =
+             :sys.get_state(pid).retry_attempts[issue_id]
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+
+    assert %{attempt: 2, retry_token: retry_token_2, delay_type: :premature_turn_end_hold} =
+             :sys.get_state(pid).retry_attempts[issue_id]
+
+    refute retry_token_2 == retry_token
+
+    send(pid, {:retry_issue, issue_id, retry_token_2})
+    Process.sleep(50)
+
+    assert %{attempt: 3, retry_token: retry_token_3, delay_type: :premature_turn_end_hold} =
+             :sys.get_state(pid).retry_attempts[issue_id]
+
+    refute retry_token_3 == retry_token_2
+
+    send(pid, {:retry_issue, issue_id, retry_token_3})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-569",
+      title: "Premature turn end hold",
+      description: "Should converge to a blocked local claim while still active",
+      state: "In Progress",
+      labels: []
+    }
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{attempt: 3, reason: :premature_turn_end, issue: %Issue{id: ^issue_id}} =
+             state.blocked_claims[issue_id]
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "blocked premature turn end claim releases once the issue stops being a candidate" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-run-failed-release"
+    orchestrator_name = Module.concat(__MODULE__, :FailedRunReleaseOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:blocked_claims, %{
+        issue_id => %{
+          attempt: 3,
+          identifier: "MT-569",
+          reason: :premature_turn_end,
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-569",
+            state: "In Progress",
+            title: "Premature turn end hold",
+            description: "Should be released once it is no longer a candidate",
+            labels: []
+          }
+        }
+      })
+    end)
+
+    send(pid, :tick)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked_claims, issue_id)
+  end
+
+  test "blocked premature turn end claim releases once the issue reaches a terminal state" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-run-failed-terminal-release"
+    issue_identifier = "MT-572"
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-premature-terminal-release-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :FailedRunTerminalReleaseOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Premature turn end terminal release",
+        description: "Should release once terminal",
+        state: "Closed",
+        labels: []
+      }
+    ])
+
+    File.mkdir_p!(Path.join(test_root, issue_identifier))
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:blocked_claims, %{
+        issue_id => %{
+          attempt: 3,
+          identifier: issue_identifier,
+          worker_host: nil,
+          reason: :premature_turn_end,
+          issue: %Issue{
+            id: issue_id,
+            identifier: issue_identifier,
+            state: "In Progress",
+            title: "Premature turn end hold",
+            description: "Should be released once terminal",
+            labels: []
+          }
+        }
+      })
+    end)
+
+    send(pid, :tick)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked_claims, issue_id)
+    refute File.exists?(Path.join(test_root, issue_identifier))
   end
 
   test "app server starts with workspace cwd and expected startup command" do

@@ -18,6 +18,9 @@ defmodule SymphonyElixir.Config do
   {% else %}
   No description provided.
   {% endif %}
+
+  Do not end the turn merely because you have posted an interim update while the Linear issue remains active.
+  Only stop the turn early when you are truly blocked or when the issue is ready for correct closeout.
   """
 
   @type codex_runtime_settings :: %{
