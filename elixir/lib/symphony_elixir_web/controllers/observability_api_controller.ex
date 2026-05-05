@@ -10,17 +10,25 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    end
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
   def issue(conn, %{"issue_identifier" => issue_identifier}) do
-    case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
-      {:ok, payload} ->
-        json(conn, payload)
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
+        {:ok, payload} ->
+          json(conn, payload)
 
-      {:error, :issue_not_found} ->
-        error_response(conn, 404, "issue_not_found", "Issue not found")
+        {:error, :issue_not_found} ->
+          error_response(conn, 404, "issue_not_found", "Issue not found")
+      end
     end
   end
 
@@ -42,14 +50,18 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec refresh(Conn.t(), map()) :: Conn.t()
   def refresh(conn, _params) do
-    case Presenter.refresh_payload(orchestrator()) do
-      {:ok, payload} ->
-        conn
-        |> put_status(202)
-        |> json(payload)
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case Presenter.refresh_payload(orchestrator()) do
+        {:ok, payload} ->
+          conn
+          |> put_status(202)
+          |> json(payload)
 
-      {:error, :unavailable} ->
-        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+        {:error, :unavailable} ->
+          error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+      end
     end
   end
 
@@ -69,6 +81,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> json(%{error: %{code: code, message: message}})
   end
 
+  defp control_plane_not_available(conn) do
+    error_response(
+      conn,
+      404,
+      "not_available_in_control_plane",
+      "Route not available in control-plane mode"
+    )
+  end
+
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
   end
@@ -79,5 +100,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp project_registry do
     Endpoint.config(:project_registry) || %SymphonyElixir.ProjectRegistry{entries: []}
+  end
+
+  defp control_plane_mode? do
+    Endpoint.config(:runtime_mode) == :control_plane
   end
 end

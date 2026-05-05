@@ -694,6 +694,89 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "snapshot_unavailable"
   end
 
+  test "control-plane dashboard stays lightweight and only shows static project snapshot" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          },
+          %{
+            project_id: "beta",
+            project_name: "Beta",
+            validation_result: :invalid,
+            validation_errors: [%{field: "workspace_root", message: "workspace_root is required"}],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Projects"
+    assert html =~ "Alpha"
+    assert html =~ "Beta"
+    assert html =~ "not_started"
+    assert html =~ "invalid"
+    refute html =~ "Running sessions"
+    refute html =~ "Retry queue"
+    refute html =~ "Rate limits"
+    refute html =~ "Copy ID"
+    refute html =~ "MT-HTTP"
+  end
+
+  test "control-plane dashboard does not refresh from observability pubsub updates" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      }
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+    refute render(view) =~ "Gamma"
+
+    Application.put_env(
+      :symphony_elixir,
+      SymphonyElixirWeb.Endpoint,
+      Keyword.merge(
+        Application.fetch_env!(:symphony_elixir, SymphonyElixirWeb.Endpoint),
+        project_registry: %StaticProjectRegistry{
+          entries: [
+            %{
+              project_id: "gamma",
+              project_name: "Gamma",
+              validation_result: :valid,
+              validation_errors: [],
+              runtime_state: %{status: :not_started}
+            }
+          ]
+        }
+      )
+    )
+
+    StatusDashboard.notify_update()
+    Process.sleep(50)
+
+    refute render(view) =~ "Gamma"
+  end
+
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
     spec = HttpServer.child_spec(port: 0)
     assert spec.id == HttpServer
@@ -825,6 +908,70 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert dashboard_response.body =~ "invalid"
   end
 
+  test "http server boots in control-plane mode without reading WORKFLOW.md" do
+    previous_mode = Application.get_env(:symphony_elixir, :runtime_mode)
+    previous_host = Application.get_env(:symphony_elixir, :control_plane_host_override)
+    previous_port = Application.get_env(:symphony_elixir, :server_port_override)
+
+    on_exit(fn ->
+      restore_app_env(:runtime_mode, previous_mode)
+      restore_app_env(:control_plane_host_override, previous_host)
+      restore_app_env(:server_port_override, previous_port)
+    end)
+
+    config_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-control-plane-http-server-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(config_root) end)
+    File.mkdir_p!(config_root)
+
+    config_path = Path.join(config_root, "symphony.projects.yaml")
+
+    File.write!(config_path, """
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """)
+
+    Workflow.set_workflow_file_path(Path.join(config_root, "MISSING_WORKFLOW.md"))
+    Application.put_env(:symphony_elixir, :runtime_mode, :control_plane)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :control_plane_host_override, "127.0.0.1")
+    Application.put_env(:symphony_elixir, :server_port_override, 0)
+
+    start_supervised!({SymphonyElixir.ControlPlaneSnapshotServer, name: SymphonyElixir.ControlPlaneSnapshotServer})
+    start_supervised!({HttpServer, []})
+
+    port = wait_for_bound_port()
+
+    projects_response = Req.get!("http://127.0.0.1:#{port}/api/v1/projects")
+    assert projects_response.status == 200
+    assert Enum.map(projects_response.body["projects"], & &1["project_id"]) == ["alpha"]
+
+    state_response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
+    assert state_response.status == 404
+    assert state_response.body["error"]["code"] == "not_available_in_control_plane"
+
+    issue_response = Req.get!("http://127.0.0.1:#{port}/api/v1/alpha")
+    assert issue_response.status == 404
+    assert issue_response.body["error"]["code"] == "not_available_in_control_plane"
+
+    refresh_response =
+      Req.post!("http://127.0.0.1:#{port}/api/v1/refresh",
+        headers: [{"content-type", "application/x-www-form-urlencoded"}],
+        body: ""
+      )
+
+    assert refresh_response.status == 404
+    assert refresh_response.body["error"]["code"] == "not_available_in_control_plane"
+  end
+
   defp start_test_endpoint(overrides) do
     endpoint_config =
       :symphony_elixir
@@ -900,4 +1047,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       end
     end
   end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 end

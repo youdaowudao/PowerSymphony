@@ -5,6 +5,14 @@ defmodule SymphonyElixirWeb.Presenter do
 
   alias SymphonyElixir.{Config, Orchestrator, ProjectRegistry, StatusDashboard}
 
+  @empty_state_payload %{
+    counts: %{running: 0, retrying: 0},
+    running: [],
+    retrying: [],
+    codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    rate_limits: nil
+  }
+
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
@@ -29,6 +37,11 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
     end
+  end
+
+  @spec empty_state_payload() :: map()
+  def empty_state_payload do
+    Map.put(@empty_state_payload, :generated_at, generated_at())
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
@@ -58,6 +71,17 @@ defmodule SymphonyElixirWeb.Presenter do
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
+  end
+
+  @spec empty_refresh_payload() :: {:ok, map()}
+  def empty_refresh_payload do
+    {:ok,
+     %{
+       queued: false,
+       coalesced: false,
+       requested_at: generated_at(),
+       operations: []
+     }}
   end
 
   @spec projects_payload(ProjectRegistry.t() | %{entries: [map()]}) :: map()

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_VALUE=""
+HAS_CONFIG=0
+ARGS=()
+
+while (($#)); do
+  case "$1" in
+    --config)
+      HAS_CONFIG=1
+      shift
+      if (($# == 0)); then
+        ARGS+=("--config")
+        break
+      fi
+      CONFIG_VALUE="$1"
+      if [[ "$CONFIG_VALUE" != /* ]]; then
+        CONFIG_VALUE="$ROOT_DIR/$CONFIG_VALUE"
+      fi
+      ARGS+=("--config" "$CONFIG_VALUE")
+      ;;
+    --config=*)
+      HAS_CONFIG=1
+      CONFIG_VALUE="${1#--config=}"
+      if [[ "$CONFIG_VALUE" != /* ]]; then
+        CONFIG_VALUE="$ROOT_DIR/$CONFIG_VALUE"
+      fi
+      ARGS+=("--config=$CONFIG_VALUE")
+      ;;
+    *)
+      ARGS+=("$1")
+      ;;
+  esac
+  shift
+done
+
+if [[ "$HAS_CONFIG" -eq 0 ]]; then
+  ARGS=("--config" "$ROOT_DIR/symphony.projects.yaml" "${ARGS[@]}")
+fi
+
+cd "$ROOT_DIR/elixir"
+
+exec mise exec -- mix run --no-start -e '
+{exit_code, message} = SymphonyElixir.ControlCLI.main_result(System.argv())
+if is_binary(message), do: IO.puts(:stderr, message)
+System.halt(exit_code)
+' -- "${ARGS[@]}"

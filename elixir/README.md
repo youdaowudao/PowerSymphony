@@ -65,6 +65,12 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+Standalone control plane:
+
+```bash
+./bin/symphony_control --config ./symphony.projects.yaml --port 4000
+```
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
@@ -79,6 +85,10 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+
+The standalone `../bin/symphony_control` entrypoint only reads `symphony.projects.yaml` plus the
+static `ProjectRegistry` snapshot. It does not require a valid `WORKFLOW.md`, does not start the
+worker orchestrator, and only exposes the lightweight project list dashboard/API.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
