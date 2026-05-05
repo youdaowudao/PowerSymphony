@@ -210,6 +210,38 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert missing_projects.message == "projects is required"
   end
 
+  test "rejects unknown root-level fields" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    extra: true
+    """
+
+    assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+
+    assert_error(errors, :invalid_field, nil, nil, "extra")
+  end
+
+  test "rejects runtime-only root-level fields" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    health: ok
+    """
+
+    assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+
+    assert_error(errors, :invalid_field, nil, nil, "health")
+  end
+
   test "reports non-map project entries" do
     yaml = """
     projects:
@@ -298,16 +330,11 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
            end)
   end
 
-  test "reports canonicalize failures for unreadable path segments", %{tmp_dir: tmp_dir} do
-    blocked_dir = Path.join(tmp_dir, "blocked")
-    workflow_path = Path.join(blocked_dir, "WORKFLOW.generated.md")
+  test "reports canonicalize failures for non-directory path segments", %{tmp_dir: tmp_dir} do
+    blocked_path = Path.join(tmp_dir, "blocked")
+    workflow_path = Path.join(blocked_path, "WORKFLOW.generated.md")
 
-    File.mkdir_p!(blocked_dir)
-    File.chmod!(blocked_dir, 0o000)
-
-    on_exit(fn ->
-      File.chmod!(blocked_dir, 0o755)
-    end)
+    File.write!(blocked_path, "not a directory")
 
     yaml = """
     projects:

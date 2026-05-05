@@ -15,6 +15,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
                          "worker_status"
                        ])
 
+  @root_allowed_fields MapSet.new(["projects"])
   @required_fields ~w(id name workflow_generated workspace_root logs_root)
   @allowed_fields MapSet.new(@required_fields)
   @project_id_regex ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -41,7 +42,8 @@ defmodule SymphonyElixir.ProjectConfigStore do
   @spec parse_string(String.t()) :: {:ok, [ProjectConfig.t()]} | {:error, [ProjectConfigError.t()]}
   def parse_string(yaml) when is_binary(yaml) do
     with {:ok, decoded} <- decode_yaml(yaml),
-         {:ok, projects} <- fetch_projects(decoded) do
+         {:ok, projects} <- fetch_projects(decoded),
+         :ok <- validate_root_fields(decoded) do
       validate_projects(projects)
     end
   end
@@ -76,6 +78,41 @@ defmodule SymphonyElixir.ProjectConfigStore do
          message: "projects is required"
        }
      ]}
+  end
+
+  defp validate_root_fields(decoded) do
+    errors =
+      Enum.reduce(decoded, [], fn {field, _value}, acc ->
+        cond do
+          MapSet.member?(@root_allowed_fields, field) ->
+            acc
+
+          MapSet.member?(@runtime_only_fields, field) ->
+            acc ++
+              [
+                %ProjectConfigError{
+                  type: :invalid_field,
+                  field: field,
+                  message: "#{field} must not appear in static project config"
+                }
+              ]
+
+          true ->
+            acc ++
+              [
+                %ProjectConfigError{
+                  type: :invalid_field,
+                  field: field,
+                  message: "#{field} is not part of the M1 static project schema"
+                }
+              ]
+        end
+      end)
+
+    case errors do
+      [] -> :ok
+      _ -> {:error, errors}
+    end
   end
 
   defp validate_projects(projects) do

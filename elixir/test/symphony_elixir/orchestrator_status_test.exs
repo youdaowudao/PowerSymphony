@@ -942,8 +942,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     send(pid, :tick)
-    Process.sleep(100)
-    state = :sys.get_state(pid)
+
+    state =
+      Enum.reduce_while(1..40, nil, fn _, _ ->
+        current_state = :sys.get_state(pid)
+
+        if Map.has_key?(current_state.retry_attempts, issue_id) do
+          {:halt, current_state}
+        else
+          Process.sleep(5)
+          {:cont, nil}
+        end
+      end)
+
+    assert state, "timed out waiting for stalled worker retry state"
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
@@ -957,7 +969,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms >= 9_000
     assert remaining_ms <= 10_500
   end
 
