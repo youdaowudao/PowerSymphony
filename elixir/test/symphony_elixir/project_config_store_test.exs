@@ -115,6 +115,120 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert_error(errors, :invalid_field, 1, "alpha", "workflow_generated")
   end
 
+  test "validate_raw_projects groups duplicate id errors onto each conflicting project" do
+    projects = [
+      %{
+        "id" => "alpha",
+        "name" => "Alpha",
+        "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
+        "workspace_root" => "/tmp/workspaces/alpha",
+        "logs_root" => "/tmp/logs/alpha"
+      },
+      %{
+        "id" => "alpha",
+        "name" => "Alpha Duplicate",
+        "workflow_generated" => "/tmp/alpha-2/WORKFLOW.generated.md",
+        "workspace_root" => "/tmp/workspaces/alpha-2",
+        "logs_root" => "/tmp/logs/alpha-2"
+      }
+    ]
+
+    assert [
+             %{normalized_config: nil, validation_errors: first_errors},
+             %{normalized_config: nil, validation_errors: second_errors}
+           ] = ProjectConfigStore.validate_raw_projects(projects)
+
+    assert [
+             %ProjectConfigError{
+               type: :duplicate_project_id,
+               field: "id",
+               project_index: 0,
+               project_id: "alpha"
+             }
+           ] = first_errors
+
+    assert [
+             %ProjectConfigError{
+               type: :duplicate_project_id,
+               field: "id",
+               project_index: 1,
+               project_id: "alpha"
+             }
+           ] = second_errors
+  end
+
+  test "validate_raw_projects keeps project validation errors alongside duplicate id errors" do
+    projects = [
+      %{
+        "id" => "alpha",
+        "name" => "Alpha",
+        "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
+        "workspace_root" => "/tmp/workspaces/alpha",
+        "logs_root" => "/tmp/logs/alpha"
+      },
+      %{
+        "id" => "alpha",
+        "name" => "Alpha Duplicate",
+        "workflow_generated" => "relative/WORKFLOW.generated.md",
+        "workspace_root" => "/tmp/workspaces/alpha-2",
+        "logs_root" => "/tmp/logs/alpha-2"
+      }
+    ]
+
+    assert [
+             %{normalized_config: nil, validation_errors: first_errors},
+             %{normalized_config: nil, validation_errors: second_errors}
+           ] = ProjectConfigStore.validate_raw_projects(projects)
+
+    assert [
+             %ProjectConfigError{
+               type: :duplicate_project_id,
+               field: "id",
+               project_index: 0,
+               project_id: "alpha"
+             }
+           ] = first_errors
+
+    assert Enum.any?(second_errors, fn error ->
+             error.type == :duplicate_project_id and
+               error.field == "id" and
+               error.project_index == 1 and
+               error.project_id == "alpha"
+           end)
+
+    assert Enum.any?(second_errors, fn error ->
+             error.type == :invalid_field and
+               error.field == "workflow_generated" and
+               error.project_index == 1 and
+               error.project_id == "alpha"
+           end)
+  end
+
+  test "validate_raw_projects returns normalized config for a valid project with no errors" do
+    projects = [
+      %{
+        "id" => "alpha",
+        "name" => "Alpha",
+        "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
+        "workspace_root" => "/tmp/workspaces/alpha",
+        "logs_root" => "/tmp/logs/alpha"
+      }
+    ]
+
+    assert [
+             %{
+               normalized_config: %ProjectConfig{
+                 id: "alpha",
+                 name: "Alpha",
+                 workflow_generated: "/tmp/alpha/WORKFLOW.generated.md",
+                 workspace_root: "/tmp/workspaces/alpha",
+                 logs_root: "/tmp/logs/alpha"
+               },
+               validation_errors: []
+             }
+           ] = ProjectConfigStore.validate_raw_projects(projects)
+  end
+
   test "reports invalid_field for required fields with the wrong type" do
     yaml = """
     projects:

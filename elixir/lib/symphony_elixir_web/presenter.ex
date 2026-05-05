@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, ProjectRegistry, StatusDashboard}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -60,6 +60,30 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec projects_payload(ProjectRegistry.t() | %{entries: [map()]}) :: map()
+  def projects_payload(registry) do
+    %{
+      generated_at: generated_at(),
+      projects: Enum.map(project_entries(registry), &project_entry_payload/1)
+    }
+  end
+
+  @spec project_summary_payload(String.t(), ProjectRegistry.t() | %{entries: [map()]}) ::
+          {:ok, map()} | {:error, :project_not_found}
+  def project_summary_payload(project_id, registry) when is_binary(project_id) do
+    case Enum.find(project_entries(registry), &(&1.project_id == project_id)) do
+      nil ->
+        {:error, :project_not_found}
+
+      entry ->
+        {:ok,
+         %{
+           generated_at: generated_at(),
+           project: project_entry_payload(entry)
+         }}
+    end
+  end
+
   defp issue_payload_body(issue_identifier, running, retry) do
     %{
       issue_identifier: issue_identifier,
@@ -82,6 +106,24 @@ defmodule SymphonyElixirWeb.Presenter do
       last_error: retry && retry.error,
       tracked: %{}
     }
+  end
+
+  defp project_entries(%ProjectRegistry{} = registry), do: ProjectRegistry.entries(registry)
+  defp project_entries(%{entries: entries}) when is_list(entries), do: entries
+  defp project_entries(_registry), do: []
+
+  defp project_entry_payload(entry) do
+    %{
+      project_id: entry.project_id,
+      project_name: entry.project_name,
+      validation_result: to_string(entry.validation_result),
+      validation_errors: Enum.map(entry.validation_errors, &project_validation_error_payload/1),
+      runtime_state: %{status: to_string(entry.runtime_state.status)}
+    }
+  end
+
+  defp project_validation_error_payload(%{field: field, message: message}) do
+    %{field: field, message: message}
   end
 
   defp issue_id_from_entries(running, retry),
@@ -180,6 +222,10 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp generated_at do
+    DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

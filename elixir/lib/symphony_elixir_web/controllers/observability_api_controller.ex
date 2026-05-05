@@ -24,6 +24,22 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec projects(Conn.t(), map()) :: Conn.t()
+  def projects(conn, _params) do
+    json(conn, Presenter.projects_payload(project_registry()))
+  end
+
+  @spec project_summary(Conn.t(), map()) :: Conn.t()
+  def project_summary(conn, %{"project_id" => project_id}) do
+    case Presenter.project_summary_payload(project_id, project_registry()) do
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, :project_not_found} ->
+        error_response(conn, 404, "project_not_found", "Project not found")
+    end
+  end
+
   @spec refresh(Conn.t(), map()) :: Conn.t()
   def refresh(conn, _params) do
     case Presenter.refresh_payload(orchestrator()) do
@@ -59,5 +75,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
+  end
+
+  defp project_registry do
+    Endpoint.config(:project_registry) || %SymphonyElixir.ProjectRegistry{entries: []}
   end
 end
