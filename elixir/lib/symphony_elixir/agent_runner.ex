@@ -8,6 +8,14 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
+  @type run_result_status :: :completed | :continuation_required | :failed
+  @type run_result_reason ::
+          :issue_inactive | :issue_still_active | :max_turns_reached | :premature_turn_end
+  @type run_result :: %{
+          status: run_result_status(),
+          reason: run_result_reason(),
+          turn_count: pos_integer()
+        }
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -76,6 +84,28 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  defp send_run_result(recipient, %Issue{id: issue_id}, %{
+         status: status,
+         reason: reason,
+         turn_count: turn_count
+       })
+       when is_binary(issue_id) and is_pid(recipient) and is_atom(status) and is_atom(reason) and
+              is_integer(turn_count) and turn_count > 0 do
+    send(
+      recipient,
+      {:agent_run_result, issue_id,
+       %{
+         status: status,
+         reason: reason,
+         turn_count: turn_count
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_run_result(_recipient, _issue, _run_result), do: :ok
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
@@ -92,42 +122,82 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    case AppServer.run_turn(
+           app_session,
+           prompt,
+           issue,
+           on_message: codex_message_handler(codex_update_recipient, issue)
+         ) do
+      {:ok, turn_session} ->
+        Logger.info("Completed agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+        case continue_with_issue?(issue, issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < max_turns ->
+            send_run_result(codex_update_recipient, issue, %{
+              status: :continuation_required,
+              reason: :issue_still_active,
+              turn_count: turn_number
+            })
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+            do_run_codex_turns(
+              app_session,
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              turn_number + 1,
+              max_turns
+            )
 
-          :ok
+          {:continue, refreshed_issue} ->
+            send_run_result(codex_update_recipient, issue, %{
+              status: :continuation_required,
+              reason: :max_turns_reached,
+              turn_count: turn_number
+            })
 
-        {:done, _refreshed_issue} ->
-          :ok
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+            :ok
+
+          {:done, _refreshed_issue} ->
+            send_run_result(codex_update_recipient, issue, %{
+              status: :completed,
+              reason: :issue_inactive,
+              turn_count: turn_number
+            })
+
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        handle_turn_error(reason, issue, codex_update_recipient, turn_number)
     end
+  end
+
+  defp handle_turn_error({error_type, _details} = reason, issue, codex_update_recipient, turn_number)
+       when error_type in [:turn_failed, :turn_cancelled] do
+    send_run_result(codex_update_recipient, issue, %{
+      status: :failed,
+      reason: :premature_turn_end,
+      turn_count: turn_number
+    })
+
+    Logger.warning(
+      "Agent turn ended prematurely for #{issue_context(issue)} turn=#{turn_number} reason=#{inspect(reason)}"
+    )
+
+    :ok
+  end
+
+  defp handle_turn_error(reason, _issue, _codex_update_recipient, _turn_number) do
+    {:error, reason}
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)

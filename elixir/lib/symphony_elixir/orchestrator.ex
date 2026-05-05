@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
+  @premature_turn_end_recheck_delay_ms 1_000
+  @premature_turn_end_hold_limit 3
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -36,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      blocked_claims: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -132,16 +135,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -203,6 +197,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info({:agent_run_result, issue_id, run_result}, %{running: running} = state)
+      when is_binary(issue_id) and is_map(run_result) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry = Map.put(running_entry, :run_result, run_result)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info({:agent_run_result, _issue_id, _run_result}, state), do: {:noreply, state}
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -222,7 +230,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state =
+      state
+      |> reconcile_running_issues()
+      |> reconcile_blocked_claims()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -437,6 +448,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
+            blocked_claims: Map.delete(state.blocked_claims, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
 
@@ -719,6 +731,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
+            run_result: nil,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -727,6 +740,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
+            blocked_claims: Map.delete(state.blocked_claims, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
 
@@ -762,12 +776,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
-  defp complete_issue(%State{} = state, issue_id) do
-    %{
+  defp complete_issue(%State{} = state, issue_id, opts \\ []) do
+    state = %{
       state
       | completed: MapSet.put(state.completed, issue_id),
+        blocked_claims: Map.delete(state.blocked_claims, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+
+    if Keyword.get(opts, :release_claim?, false) do
+      release_issue_claim(state, issue_id)
+    else
+      state
+    end
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
@@ -782,6 +803,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    delay_type = pick_retry_delay_type(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -803,6 +825,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            delay_type: delay_type,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -815,6 +838,7 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          delay_type: Map.get(retry_entry, :delay_type),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -901,35 +925,95 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+    if metadata[:delay_type] == :premature_turn_end_hold do
+      if attempt >= @premature_turn_end_hold_limit do
+        Logger.warning(
+          "Issue remains active after repeated premature turn end: #{issue_context(issue)}; converging to blocked local claim"
+        )
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
+        {:noreply,
+         block_issue_claim(state, issue.id, %{
+           attempt: attempt,
            identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+           worker_host: metadata[:worker_host],
+           workspace_path: metadata[:workspace_path],
+           reason: :premature_turn_end,
+           issue: issue
+         })}
+      else
+        Logger.debug("Issue remains active after premature turn end: #{issue_context(issue)}; holding claim")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             delay_type: :premature_turn_end_hold
+           })
+         )}
+      end
+    else
+      if retry_candidate_issue?(issue, terminal_state_set()) and
+           dispatch_slots_available?(issue, state) and
+           worker_slots_available?(state, metadata[:worker_host]) do
+        {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      else
+        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "no available orchestrator slots"
+           })
+         )}
+      end
     end
   end
 
+  defp block_issue_claim(%State{} = state, issue_id, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    blocked_claim = %{
+      attempt: metadata[:attempt],
+      identifier: metadata[:identifier] || issue_id,
+      worker_host: metadata[:worker_host],
+      workspace_path: metadata[:workspace_path],
+      reason: metadata[:reason] || :premature_turn_end,
+      issue: metadata[:issue]
+    }
+
+    %{
+      state
+      | claimed: MapSet.put(state.claimed, issue_id),
+        blocked_claims: Map.put(state.blocked_claims, issue_id, blocked_claim),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        blocked_claims: Map.delete(state.blocked_claims, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :premature_turn_end_hold ->
+        @premature_turn_end_recheck_delay_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -962,6 +1046,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_delay_type(previous_retry, metadata) do
+    metadata[:delay_type] || Map.get(previous_retry, :delay_type)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -1058,6 +1146,97 @@ defmodule SymphonyElixir.Orchestrator do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
+  defp reconcile_blocked_claims(%State{blocked_claims: blocked_claims} = state)
+       when blocked_claims == %{} do
+    state
+  end
+
+  defp reconcile_blocked_claims(%State{} = state) do
+    blocked_issue_ids = Map.keys(state.blocked_claims)
+
+    case Tracker.fetch_issue_states_by_ids(blocked_issue_ids) do
+      {:ok, issues} ->
+        state
+        |> reconcile_blocked_claim_issue_states(issues)
+        |> reconcile_missing_blocked_claim_issue_ids(blocked_issue_ids, issues)
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh blocked claim issue states: #{inspect(reason)}; keeping blocked claims")
+        state
+    end
+  end
+
+  defp reconcile_blocked_claim_issue_states(%State{} = state, issues) when is_list(issues) do
+    terminal_states = terminal_state_set()
+
+    Enum.reduce(issues, state, fn
+      %Issue{} = issue, state_acc ->
+        reconcile_blocked_claim_issue_state(state_acc, issue, terminal_states)
+
+      _, state_acc ->
+        state_acc
+    end)
+  end
+
+  defp reconcile_missing_blocked_claim_issue_ids(%State{} = state, requested_issue_ids, issues)
+       when is_list(requested_issue_ids) and is_list(issues) do
+    visible_issue_ids =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
+      if MapSet.member?(visible_issue_ids, issue_id) do
+        state_acc
+      else
+        Logger.info("Blocked claim issue no longer visible: issue_id=#{issue_id}; releasing claim")
+        release_issue_claim(state_acc, issue_id)
+      end
+    end)
+  end
+
+  defp reconcile_blocked_claim_issue_state(%State{} = state, %Issue{} = issue, terminal_states) do
+    if Map.has_key?(state.blocked_claims, issue.id) do
+      cond do
+        terminal_issue_state?(issue.state, terminal_states) ->
+          Logger.info(
+            "Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim"
+          )
+
+          cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
+          release_issue_claim(state, issue.id)
+
+        retry_candidate_issue?(issue, terminal_states) ->
+          put_blocked_claim_issue(state, issue.id, issue)
+
+        true ->
+          Logger.info(
+            "Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim"
+          )
+
+          release_issue_claim(state, issue.id)
+      end
+    else
+      state
+    end
+  end
+
+  defp put_blocked_claim_issue(%State{} = state, issue_id, %Issue{} = issue) do
+    update_in(state.blocked_claims[issue_id], fn
+      nil -> nil
+      blocked_claim -> Map.put(blocked_claim, :issue, issue)
+    end)
+  end
+
+  defp blocked_claim_worker_host(%State{} = state, issue_id) do
+    state.blocked_claims
+    |> Map.get(issue_id, %{})
+    |> Map.get(:worker_host)
+  end
+
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
@@ -1140,10 +1319,24 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    blocked =
+      state.blocked_claims
+      |> Enum.map(fn {issue_id, blocked_claim} ->
+        %{
+          issue_id: issue_id,
+          attempt: Map.get(blocked_claim, :attempt),
+          due_in_ms: nil,
+          identifier: Map.get(blocked_claim, :identifier),
+          error: Atom.to_string(Map.get(blocked_claim, :reason, :premature_turn_end)),
+          worker_host: Map.get(blocked_claim, :worker_host),
+          workspace_path: Map.get(blocked_claim, :workspace_path)
+        }
+      end)
+
     {:reply,
      %{
        running: running,
-       retrying: retrying,
+       retrying: retrying ++ blocked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1272,6 +1465,60 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
+  end
+
+  defp handle_normal_worker_exit(state, issue_id, running_entry, session_id) do
+    case Map.get(running_entry, :run_result) do
+      %{status: :continuation_required} = run_result ->
+        Logger.info(
+          "Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check"
+        )
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
+      %{status: :completed} = run_result ->
+        Logger.info(
+          "Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled"
+        )
+
+        complete_issue(state, issue_id, release_claim?: true)
+
+      %{status: :failed, reason: :premature_turn_end} = run_result ->
+        Logger.warning(
+          "Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck"
+        )
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :premature_turn_end_hold,
+          error: "premature turn end",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
+      _ ->
+        Logger.warning(
+          "Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry"
+        )
+
+        next_attempt = next_retry_attempt_from_running(running_entry)
+
+        schedule_issue_retry(state, issue_id, next_attempt, %{
+          identifier: running_entry.identifier,
+          error: "agent exited normally without run_result",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+    end
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
