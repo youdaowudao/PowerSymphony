@@ -13,7 +13,7 @@ defmodule SymphonyElixir.ProjectRegistryLoader do
       path when is_binary(path) ->
         case ProjectRegistry.load(path) do
           {:ok, registry} -> registry
-          {:error, _errors} -> empty_registry()
+          {:error, errors} -> ProjectRegistry.invalid_registry(errors)
         end
 
       nil ->
@@ -23,11 +23,14 @@ defmodule SymphonyElixir.ProjectRegistryLoader do
 
   @spec project_config_path() :: Path.t() | nil
   def project_config_path do
-    path =
-      Application.get_env(:symphony_elixir, :project_config_path_override) ||
-        Path.expand(@default_config_filename)
+    case Application.get_env(:symphony_elixir, :project_config_path_override) do
+      path when is_binary(path) ->
+        Path.expand(path)
 
-    if File.regular?(path), do: path, else: nil
+      _ ->
+        path = Path.expand(@default_config_filename)
+        if File.regular?(path), do: path, else: nil
+    end
   end
 
   @spec empty_registry() :: ProjectRegistry.t()

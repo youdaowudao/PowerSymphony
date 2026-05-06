@@ -683,6 +683,35 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
   end
 
+  test "dashboard omits project summary links for invalid entries without project_id" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          },
+          %{
+            project_id: nil,
+            project_name: nil,
+            validation_result: :invalid,
+            validation_errors: [%{field: "config_path", message: "invalid yaml"}],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "/api/v1/projects/alpha/summary"
+    refute html =~ "/api/v1/projects//summary"
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -729,6 +758,50 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Rate limits"
     refute html =~ "Copy ID"
     refute html =~ "MT-HTTP"
+  end
+
+  test "control-plane startup loads invalid project registry as visible validation error instead of an empty list" do
+    config_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-invalid-project-registry-http-#{System.unique_integer([:positive])}"
+      )
+
+    config_path = Path.join(config_root, "symphony.projects.yaml")
+
+    on_exit(fn -> File.rm_rf!(config_root) end)
+    File.mkdir_p!(config_root)
+    File.write!(config_path, "projects: [\n")
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: SymphonyElixir.ProjectRegistryLoader.load()
+    )
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+
+    assert [
+             %{
+               "project_id" => nil,
+               "project_name" => nil,
+               "validation_result" => "invalid",
+               "runtime_state" => %{"status" => "not_started"},
+               "validation_errors" => [
+                 %{"field" => field, "message" => message}
+               ]
+             }
+           ] = payload["projects"]
+
+    assert field == "projects"
+    assert message =~ "yaml"
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Projects"
+    assert html =~ "invalid"
+    assert html =~ "projects: "
+    refute html =~ "No projects registered."
   end
 
   test "control-plane dashboard does not refresh from observability pubsub updates" do

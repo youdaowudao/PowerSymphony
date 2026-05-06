@@ -1809,6 +1809,104 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner stops continuation when refreshed active issue gains a non-terminal blocker" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-blocked-continuation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-blocked"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-blocked-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      issue = %Issue{
+        id: "issue-blocked-continuation",
+        identifier: "MT-572",
+        title: "Do not continue when blocked",
+        description: "Continuation should honor blocker gate",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-572",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: issue.id,
+             identifier: issue.identifier,
+             title: issue.title,
+             description: issue.description,
+             state: "In Progress",
+             blocked_by: [%{state: "Todo"}]
+           }
+         ]}
+      end
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive {:agent_run_result, "issue-blocked-continuation", run_result}, 500
+      assert run_result.status == :completed
+      assert run_result.reason == :issue_inactive
+      assert run_result.turn_count == 1
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner stops continuing once agent.max_turns is reached" do
     test_root =
       Path.join(
@@ -2164,6 +2262,78 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner reports failed run result when a turn times out" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-turn-timeout-run-result-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-turn-timeout"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-timeout-result-1"}}}'
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 50,
+        max_turns: 2
+      )
+
+      issue = %Issue{
+        id: "issue-turn-timeout-result",
+        identifier: "MT-573",
+        title: "Turn timeout run result",
+        description: "The turn times out before run success or crash.",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-573",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, self())
+
+      assert_receive {:agent_run_result, "issue-turn-timeout-result", %{status: :failed, reason: :turn_timeout, turn_count: 1}},
+                     500
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "normal worker exit with failed run result does not allow ordinary redispatch" do
     issue_id = "issue-run-failed-closeout"
     ref = make_ref()
@@ -2216,6 +2386,47 @@ defmodule SymphonyElixir.CoreTest do
 
     assert is_integer(due_at_ms)
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "normal worker exit with timeout run result schedules ordinary retry instead of premature hold" do
+    issue_id = "issue-run-timeout-closeout"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :TimeoutRunCloseoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-574",
+      issue: %Issue{id: issue_id, identifier: "MT-574", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :failed, reason: :turn_timeout, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, error: "turn_timeout"} = state.retry_attempts[issue_id]
+    refute state.retry_attempts[issue_id].delay_type == :premature_turn_end_hold
+    refute MapSet.member?(state.completed, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked_claims, issue_id)
   end
 
   test "premature turn end hold converges to a blocked local claim while the issue remains active" do

@@ -1489,6 +1489,18 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(running_entry, :workspace_path)
         })
 
+      %{status: :failed, reason: :turn_timeout} = run_result ->
+        Logger.warning("Agent task timed out for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling ordinary retry")
+
+        next_attempt = next_retry_attempt_from_running(running_entry)
+
+        schedule_issue_retry(state, issue_id, next_attempt, %{
+          identifier: running_entry.identifier,
+          error: "turn_timeout",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
       _ ->
         Logger.warning("Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry")
 

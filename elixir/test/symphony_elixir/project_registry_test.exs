@@ -191,7 +191,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
            ] = ProjectRegistry.entries(registry)
   end
 
-  test "loader returns empty registry when override path does not exist" do
+  test "loader exposes invalid registry entry when override path does not exist" do
     previous_override = Application.get_env(:symphony_elixir, :project_config_path_override)
 
     on_exit(fn ->
@@ -210,11 +210,26 @@ defmodule SymphonyElixir.ProjectRegistryTest do
 
     Application.put_env(:symphony_elixir, :project_config_path_override, missing_path)
 
-    assert ProjectRegistryLoader.project_config_path() == nil
-    assert %ProjectRegistry{entries: []} = ProjectRegistryLoader.load()
+    assert ProjectRegistryLoader.project_config_path() == missing_path
+
+    assert %ProjectRegistry{
+             entries: [
+               %ProjectRegistry.Entry{
+                 project_id: nil,
+                 project_name: nil,
+                 normalized_config: nil,
+                 validation_result: :invalid,
+                 runtime_state: %{status: :not_started},
+                 validation_errors: [%ProjectConfigError{field: "config_path", message: message}]
+               }
+             ]
+           } = ProjectRegistryLoader.load()
+
+    assert message =~ "failed to read config file"
+    assert message =~ "enoent"
   end
 
-  test "loader returns empty registry when override config is invalid" do
+  test "loader exposes invalid override config as an invalid registry entry" do
     previous_override = Application.get_env(:symphony_elixir, :project_config_path_override)
 
     on_exit(fn ->
@@ -237,6 +252,21 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
 
     assert ProjectRegistryLoader.project_config_path() == config_path
-    assert %ProjectRegistry{entries: []} = ProjectRegistryLoader.load()
+
+    assert %ProjectRegistry{
+             entries: [
+               %ProjectRegistry.Entry{
+                 project_id: nil,
+                 project_name: nil,
+                 normalized_config: nil,
+                 validation_result: :invalid,
+                 runtime_state: %{status: :not_started},
+                 validation_errors: [%ProjectConfigError{field: field, message: message}]
+               }
+             ]
+           } = ProjectRegistryLoader.load()
+
+    assert field == "projects"
+    assert message =~ "yaml"
   end
 end

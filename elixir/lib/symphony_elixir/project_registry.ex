@@ -48,6 +48,22 @@ defmodule SymphonyElixir.ProjectRegistry do
     end
   end
 
+  @spec invalid_registry([ProjectConfigError.t()]) :: t()
+  def invalid_registry(errors) when is_list(errors) do
+    %__MODULE__{
+      entries: [
+        %Entry{
+          project_id: nil,
+          project_name: nil,
+          normalized_config: nil,
+          validation_result: :invalid,
+          validation_errors: errors,
+          runtime_state: %{status: :not_started}
+        }
+      ]
+    }
+  end
+
   @spec entries(t()) :: [Entry.t()]
   def entries(%__MODULE__{entries: entries}), do: entries
 

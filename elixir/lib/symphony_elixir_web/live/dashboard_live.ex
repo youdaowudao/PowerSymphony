@@ -100,7 +100,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= project.project_name || project.project_id || "n/a" %></span>
-                        <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                        <%= if is_binary(project.project_id) and project.project_id != "" do %>
+                          <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                        <% end %>
                       </div>
                     </td>
                     <td>
@@ -187,7 +189,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= project.project_name || project.project_id || "n/a" %></span>
-                        <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                        <%= if is_binary(project.project_id) and project.project_id != "" do %>
+                          <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                        <% end %>
                       </div>
                     </td>
                     <td>
