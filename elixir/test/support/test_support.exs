@@ -1,5 +1,7 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
+  @test_max_cases_env "SYMPHONY_TEST_MAX_CASES"
+  @mix_test_max_cases_env "MIX_TEST_MAX_CASES"
 
   defmacro __using__(_opts) do
     quote do
@@ -68,6 +70,13 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def ex_unit_options(env \\ System.get_env()) do
+    case Map.get(env, @test_max_cases_env) || Map.get(env, @mix_test_max_cases_env) do
+      nil -> []
+      value -> [max_cases: parse_positive_integer!(value)]
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
@@ -286,5 +295,16 @@ defmodule SymphonyElixir.TestSupport do
       |> Enum.map_join("\n", &("    " <> &1))
 
     "  #{name}: |\n#{indented}"
+  end
+
+  defp parse_positive_integer!(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed > 0 ->
+        parsed
+
+      _ ->
+        raise ArgumentError,
+              "test max cases must be a positive integer, got: #{inspect(value)}"
+    end
   end
 end

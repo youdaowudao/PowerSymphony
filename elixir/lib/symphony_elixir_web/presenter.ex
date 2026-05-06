@@ -142,8 +142,42 @@ defmodule SymphonyElixirWeb.Presenter do
       project_name: entry.project_name,
       validation_result: to_string(entry.validation_result),
       validation_errors: Enum.map(entry.validation_errors, &project_validation_error_payload/1),
-      runtime_state: %{status: to_string(entry.runtime_state.status)}
+      runtime_state: project_runtime_payload(entry.runtime_state)
     }
+  end
+
+  defp project_runtime_payload(runtime_state) when is_map(runtime_state) do
+    %{
+      status: runtime_state_status(runtime_state),
+      pid: Map.get(runtime_state, :pid),
+      worker_port: Map.get(runtime_state, :worker_port),
+      started_at: iso8601(Map.get(runtime_state, :started_at)),
+      exit_code: Map.get(runtime_state, :exit_code),
+      exit_reason: Map.get(runtime_state, :exit_reason),
+      stdout_path: Map.get(runtime_state, :stdout_path),
+      stderr_path: Map.get(runtime_state, :stderr_path),
+      error_summary: Map.get(runtime_state, :error_summary)
+    }
+  end
+
+  defp project_runtime_payload(_runtime_state) do
+    %{
+      status: "not_started",
+      pid: nil,
+      worker_port: nil,
+      started_at: nil,
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: nil,
+      stderr_path: nil,
+      error_summary: nil
+    }
+  end
+
+  defp runtime_state_status(runtime_state) do
+    runtime_state
+    |> Map.get(:status, :not_started)
+    |> to_string()
   end
 
   defp project_validation_error_payload(%{field: field, message: message}) do

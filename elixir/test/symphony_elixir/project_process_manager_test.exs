@@ -1,0 +1,1502 @@
+defmodule SymphonyElixir.ProjectProcessManagerTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.ProjectProcessManager
+
+  setup do
+    previous_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
+
+    on_exit(fn ->
+      restore_app_env(:project_config_path_override, previous_config_path)
+    end)
+
+    :ok
+  end
+
+  test "starts a project worker and records pid, port, stdout/stderr paths" do
+    test_root = temp_root!("start-worker")
+    manager_name = Module.concat(__MODULE__, StartManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert runtime_state.status == :running
+    assert is_integer(runtime_state.pid)
+    assert runtime_state.worker_port == port
+    assert %DateTime{} = runtime_state.started_at
+    assert File.regular?(runtime_state.stdout_path)
+    assert File.regular?(runtime_state.stderr_path)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.pid == runtime_state.pid
+    assert entry.runtime_state.worker_port == port
+    assert %DateTime{} = entry.runtime_state.started_at
+    assert entry.runtime_state.stdout_path == runtime_state.stdout_path
+    assert entry.runtime_state.stderr_path == runtime_state.stderr_path
+
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    assert File.read!(Path.join(runtime_dir, "worker.pid")) == Integer.to_string(runtime_state.pid)
+    persisted = runtime_dir |> Path.join("runtime.json") |> File.read!() |> Jason.decode!()
+    assert persisted["status"] == "running"
+    assert persisted["pid"] == runtime_state.pid
+    assert persisted["worker_port"] == port
+    assert persisted["stdout_path"] == runtime_state.stdout_path
+    assert persisted["stderr_path"] == runtime_state.stderr_path
+
+    assert_eventually(fn -> request_ok?(port) end)
+  end
+
+  test "stops one project without affecting another running project" do
+    test_root = temp_root!("stop-one-project")
+    manager_name = Module.concat(__MODULE__, StopManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder:
+         fake_worker_builder(%{
+           "alpha" => "normal",
+           "beta" => "normal"
+         })}
+    )
+
+    assert {:ok, alpha_running} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:ok, beta_running} = ProjectProcessManager.start_project(manager_name, "beta")
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert stopped_state.status == :stopped
+    assert is_nil(stopped_state.pid)
+
+    alpha_entry = fetch_entry!(manager_name, "alpha")
+    beta_entry = fetch_entry!(manager_name, "beta")
+
+    assert alpha_entry.runtime_state.status == :stopped
+    assert is_nil(alpha_entry.runtime_state.pid)
+    assert beta_entry.runtime_state.status == :running
+    assert beta_entry.runtime_state.pid == beta_running.pid
+    assert beta_entry.runtime_state.pid != alpha_running.pid
+    assert_eventually(fn -> request_ok?(beta_port) end)
+  end
+
+  test "restarts a project worker with a new pid" do
+    test_root = temp_root!("restart-worker")
+    manager_name = Module.concat(__MODULE__, RestartManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, first_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:ok, restarted_state} = ProjectProcessManager.restart_project(manager_name, "alpha")
+
+    assert restarted_state.status == :running
+    assert restarted_state.pid != first_state.pid
+    assert fetch_entry!(manager_name, "alpha").runtime_state.pid == restarted_state.pid
+    assert_eventually(fn -> request_ok?(port) end)
+  end
+
+  test "marks crashed when fake worker exits unexpectedly" do
+    test_root = temp_root!("crash-worker")
+    manager_name = Module.concat(__MODULE__, CrashManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {_, 0} = System.cmd("kill", ["-9", Integer.to_string(running_state.pid)])
+
+    assert_eventually(fn ->
+      fetch_entry!(manager_name, "alpha").runtime_state.status == :crashed
+    end)
+
+    crashed_entry = fetch_entry!(manager_name, "alpha")
+    assert crashed_entry.runtime_state.status == :crashed
+    assert crashed_entry.runtime_state.exit_code != nil
+    assert crashed_entry.runtime_state.exit_reason != nil
+  end
+
+  test "marks start_failed when worker command exits during startup" do
+    test_root = temp_root!("start-failed")
+    manager_name = Module.concat(__MODULE__, StartFailedManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "crash"})})
+
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert is_nil(entry.runtime_state.pid)
+    assert entry.runtime_state.exit_code != nil
+    assert entry.runtime_state.error_summary != nil
+  end
+
+  test "start_link/0 uses the configured default manager name" do
+    test_root = temp_root!("direct-start-link")
+    manager_name = Module.concat(__MODULE__, DirectStartLinkManager)
+    port = reserve_tcp_port!()
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    assert {:ok, pid} = ProjectProcessManager.start_link()
+    assert Process.alive?(pid)
+    assert GenServer.whereis(manager_name) == pid
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :not_started
+
+    GenServer.stop(pid)
+  end
+
+  test "marks start_failed with status 0 when startup command exits cleanly" do
+    test_root = temp_root!("start-failed-zero-exit")
+    manager_name = Module.concat(__MODULE__, ZeroExitStartFailedManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 0.05")})
+
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 0
+    assert entry.runtime_state.exit_reason == "worker exited with status 0"
+  end
+
+  test "marks start_failed when bash executable is unavailable" do
+    test_root = temp_root!("bash-not-found")
+    manager_name = Module.concat(__MODULE__, BashNotFoundManager)
+    port = reserve_tcp_port!()
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      if previous_path do
+        System.put_env("PATH", previous_path)
+      else
+        System.delete_env("PATH")
+      end
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    System.put_env("PATH", "")
+
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.started_at == nil
+    assert entry.runtime_state.error_summary == "worker failed to start: :bash_not_found"
+  end
+
+  test "startup shell output does not prevent start_failed projection" do
+    test_root = temp_root!("startup-output")
+    manager_name = Module.concat(__MODULE__, StartupOutputManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("printf boot-noise")})
+
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 0
+    assert entry.runtime_state.exit_reason == "worker exited with status 0"
+    assert entry.runtime_state.error_summary == "worker command exited during startup"
+  end
+
+  test "startup shell parse errors surface as start_failed" do
+    test_root = temp_root!("startup-parse-error")
+    manager_name = Module.concat(__MODULE__, StartupParseErrorManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("(")})
+
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 2
+    assert entry.runtime_state.exit_reason == "worker exited with status 2"
+  end
+
+  test "startup data message before grace timeout recurses and can still reach running" do
+    test_root = temp_root!("startup-data-recursion")
+    manager_name = Module.concat(__MODULE__, StartupDataRecursionManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 2")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    send(manager_pid, {startup_port, {:data, "boot-noise"}})
+
+    assert {:ok, runtime_state} = Task.await(task, 3_000)
+    assert runtime_state.status == :running
+    assert is_integer(runtime_state.pid)
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert stopped_state.status == :stopped
+  end
+
+  test "closed port during startup falls back to await_exit_status recursion" do
+    test_root = temp_root!("startup-closed-port")
+    manager_name = Module.concat(__MODULE__, StartupClosedPortManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    send(manager_pid, {startup_port, {:data, "prelude"}})
+    Process.sleep(30)
+    Port.close(startup_port)
+    send(manager_pid, {startup_port, {:data, "after-close"}})
+    send(manager_pid, {startup_port, {:exit_status, 41}})
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 41
+    assert entry.runtime_state.exit_reason == "worker exited with status 41"
+
+    kill_pid(os_pid)
+  end
+
+  test "timeout grace can consume a late exit_status message" do
+    test_root = temp_root!("startup-timeout-exit-status")
+    manager_name = Module.concat(__MODULE__, StartupTimeoutExitStatusManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Process.sleep(1_050)
+    send(manager_pid, {startup_port, {:exit_status, 23}})
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 23
+    assert entry.runtime_state.exit_reason == "worker exited with status 23"
+
+    kill_pid(os_pid)
+  end
+
+  test "timeout grace can consume late data and recurse back into startup wait" do
+    test_root = temp_root!("startup-timeout-data")
+    manager_name = Module.concat(__MODULE__, StartupTimeoutDataManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 3")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Process.sleep(1_050)
+    send(manager_pid, {startup_port, {:data, "late-boot-noise"}})
+
+    assert {:ok, runtime_state} = Task.await(task, 3_000)
+    assert runtime_state.status == :running
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert stopped_state.status == :stopped
+  end
+
+  test "timeout fallback awaits exit_status after the port stops being open" do
+    test_root = temp_root!("startup-timeout-closed-port")
+    manager_name = Module.concat(__MODULE__, StartupTimeoutClosedPortManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Process.sleep(1_050)
+    Port.close(startup_port)
+    send(manager_pid, {startup_port, {:exit_status, 31}})
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 31
+    assert entry.runtime_state.exit_reason == "worker exited with status 31"
+
+    kill_pid(os_pid)
+  end
+
+  test "startup detects closed port before grace timeout and awaits injected exit_status" do
+    test_root = temp_root!("startup-closed-port-exit-status")
+    manager_name = Module.concat(__MODULE__, StartupClosedPortExitStatusManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Port.close(startup_port)
+    send(manager_pid, {startup_port, {:exit_status, 52}})
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 52
+    assert entry.runtime_state.exit_reason == "worker exited with status 52"
+
+    kill_pid(os_pid)
+  end
+
+  test "startup timeout fallback can recurse on await_exit_status data and then time out" do
+    test_root = temp_root!("startup-timeout-await-exit-status-data")
+    manager_name = Module.concat(__MODULE__, StartupTimeoutAwaitExitStatusDataManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Process.sleep(1_050)
+    Port.close(startup_port)
+    Process.sleep(150)
+    send(manager_pid, {startup_port, {:data, "await-exit-status-noise"}})
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == nil
+    assert entry.runtime_state.exit_reason == nil
+
+    kill_pid(os_pid)
+  end
+
+  test "projects with invalid static config or missing workflow file project as config_invalid" do
+    missing_root = temp_root!("missing-workflow")
+    manager_name = Module.concat(__MODULE__, InvalidProjectionManager)
+    port = reserve_tcp_port!()
+
+    missing_config_path =
+      write_projects_config!(missing_root, [
+        project_fixture(missing_root, "alpha", port, workflow?: false)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, missing_config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    missing_entry = fetch_entry!(manager_name, "alpha")
+    assert missing_entry.runtime_state.status == :config_invalid
+    assert {:error, :config_invalid} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    invalid_root = temp_root!("invalid-static")
+    invalid_config_path = write_invalid_projects_config!(invalid_root)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, invalid_config_path)
+
+    invalid_registry = ProjectProcessManager.project_registry(manager_name)
+    [invalid_entry] = invalid_registry.entries
+    assert invalid_entry.validation_result == :invalid
+    assert invalid_entry.runtime_state.status == :config_invalid
+  end
+
+  test "projected config_invalid and disabled states do not persist in internal runtime state" do
+    test_root = temp_root!("projected-states")
+    manager_name = Module.concat(__MODULE__, ProjectedStatesManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    alpha = project_fixture(test_root, "alpha", alpha_port, workflow?: false)
+    beta = project_fixture(test_root, "beta", beta_port, enabled: false)
+
+    config_path = write_projects_config!(test_root, [alpha, beta])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder:
+         fake_worker_builder(%{
+           "alpha" => "normal",
+           "beta" => "normal"
+         })}
+    )
+
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :config_invalid
+    assert fetch_entry!(manager_name, "beta").runtime_state.status == :disabled
+
+    internal_state = :sys.get_state(manager_name)
+    assert internal_state.runtimes["alpha"].status == :not_started
+    assert internal_state.runtimes["beta"].status == :not_started
+
+    File.mkdir_p!(Path.dirname(alpha.workflow_generated))
+    write_workflow_file!(alpha.workflow_generated)
+    write_projects_config!(test_root, [%{alpha | enabled: true}, %{beta | enabled: true}])
+
+    assert {:ok, alpha_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:ok, beta_state} = ProjectProcessManager.start_project(manager_name, "beta")
+    assert alpha_state.status == :running
+    assert beta_state.status == :running
+  end
+
+  test "explicit manager calls avoid global env routing collisions" do
+    test_root = temp_root!("manager-routing")
+    manager_name = Module.concat(__MODULE__, RoutingManager)
+    wrong_manager = Module.concat(__MODULE__, WrongRoutingManager)
+    port = reserve_tcp_port!()
+
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    Application.put_env(:symphony_elixir, :project_process_manager_name, wrong_manager)
+
+    assert {:ok, state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert state.worker_port == port
+    assert ProjectProcessManager.project_registry(manager_name) |> find_entry!("alpha") |> Map.get(:runtime_state) |> Map.get(:worker_port) == port
+  end
+
+  test "default-name API routes through configured manager name and fallback registry works without server" do
+    test_root = temp_root!("default-api")
+    configured_name = Module.concat(__MODULE__, DefaultApiManager)
+    port = reserve_tcp_port!()
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, configured_name)
+
+    fallback_entry = ProjectProcessManager.project_registry() |> find_entry!("alpha")
+    assert fallback_entry.runtime_state.status == :not_started
+    assert fallback_entry.runtime_state.worker_port == port
+
+    start_supervised!({ProjectProcessManager, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, started_state} = ProjectProcessManager.start_project("alpha")
+    assert started_state.status == :running
+    assert started_state.worker_port == port
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project("alpha")
+    assert stopped_state.status == :stopped
+
+    assert {:ok, restarted_state} = ProjectProcessManager.restart_project("alpha")
+    assert restarted_state.status == :running
+    assert restarted_state.pid != started_state.pid
+  end
+
+  test "returns not_found for missing projects across project actions" do
+    test_root = temp_root!("missing-project")
+    manager_name = Module.concat(__MODULE__, MissingProjectManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert {:error, :not_found} = ProjectProcessManager.start_project(manager_name, "missing")
+    assert {:error, :not_found} = ProjectProcessManager.stop_project(manager_name, "missing")
+    assert {:error, :not_found} = ProjectProcessManager.restart_project(manager_name, "missing")
+  end
+
+  test "returns disabled for disabled projects and not_running for stopped projects" do
+    test_root = temp_root!("disabled-not-running")
+    manager_name = Module.concat(__MODULE__, DisabledManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port, enabled: false),
+        project_fixture(test_root, "beta", beta_port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert {:error, :disabled} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:error, :not_running} = ProjectProcessManager.stop_project(manager_name, "beta")
+  end
+
+  test "restarts a not-running project via allow_not_running path" do
+    test_root = temp_root!("restart-not-running")
+    manager_name = Module.concat(__MODULE__, RestartStoppedManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.restart_project(manager_name, "alpha")
+    assert runtime_state.status == :running
+    assert runtime_state.worker_port == port
+  end
+
+  test "ignores stray startup data messages and rejects already running projects" do
+    test_root = temp_root!("already-running")
+    manager_name = Module.concat(__MODULE__, AlreadyRunningManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    manager_pid = GenServer.whereis(manager_name)
+    send(manager_pid, {:synthetic_port, {:data, "ignored"}})
+    Process.sleep(20)
+
+    assert {:error, :already_running} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.pid == running_state.pid
+  end
+
+  test "restart_project returns disabled when restart falls through allow_not_running path" do
+    test_root = temp_root!("restart-disabled")
+    manager_name = Module.concat(__MODULE__, RestartDisabledManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port, enabled: false)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert {:error, :disabled} = ProjectProcessManager.restart_project(manager_name, "alpha")
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :disabled
+  end
+
+  test "loads invalid persisted runtimes as not_started and projects invalid entries as config_invalid" do
+    test_root = temp_root!("invalid-persisted-runtime")
+    manager_name = Module.concat(__MODULE__, InvalidPersistedRuntimeManager)
+    alpha_port = reserve_tcp_port!()
+    invalid_config_path = write_invalid_projects_config!(test_root)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, invalid_config_path)
+
+    invalid_registry = ProjectProcessManager.project_registry(manager_name)
+    [invalid_entry] = invalid_registry.entries
+    assert invalid_entry.project_id == "alpha"
+    assert invalid_entry.validation_result == :invalid
+    assert invalid_entry.normalized_config == nil
+    assert invalid_entry.runtime_state.status == :config_invalid
+
+    alpha = project_fixture(test_root, "alpha", alpha_port)
+    valid_config_path = write_projects_config!(test_root, [alpha])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, valid_config_path)
+
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    File.mkdir_p!(runtime_dir)
+    File.write!(Path.join(runtime_dir, "runtime.json"), "{not-json")
+    File.write!(Path.join(runtime_dir, "worker.pid"), "not-a-pid")
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :not_started
+    assert entry.runtime_state.pid == nil
+
+    internal_state = :sys.get_state(manager_name)
+    assert Map.keys(internal_state.runtimes) == ["alpha"]
+  end
+
+  test "loads persisted runtimes with invalid pid files and downgrades dead running workers" do
+    test_root = temp_root!("persisted-dead-worker")
+    manager_name = Module.concat(__MODULE__, PersistedDeadWorkerManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    alpha = project_fixture(test_root, "alpha", alpha_port)
+    beta = project_fixture(test_root, "beta", beta_port)
+    config_path = write_projects_config!(test_root, [alpha, beta])
+
+    alpha_runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    File.mkdir_p!(alpha_runtime_dir)
+
+    File.write!(
+      Path.join(alpha_runtime_dir, "runtime.json"),
+      Jason.encode!(%{
+        status: "crashed",
+        pid: nil,
+        worker_port: alpha_port,
+        started_at: nil,
+        exit_code: 11,
+        exit_reason: "persisted-crash",
+        stdout_path: Path.join(alpha_runtime_dir, "worker.stdout.log"),
+        stderr_path: Path.join(alpha_runtime_dir, "worker.stderr.log"),
+        error_summary: "persisted-crash"
+      })
+    )
+
+    File.write!(Path.join(alpha_runtime_dir, "worker.pid"), "not-a-pid")
+
+    dead_pid = 999_999
+    beta_runtime_dir = control_plane_runtime_dir(test_root, "beta")
+    File.mkdir_p!(beta_runtime_dir)
+
+    File.write!(
+      Path.join(beta_runtime_dir, "runtime.json"),
+      Jason.encode!(%{
+        status: "running",
+        pid: dead_pid,
+        worker_port: beta_port,
+        started_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+        exit_code: nil,
+        exit_reason: nil,
+        stdout_path: Path.join(beta_runtime_dir, "worker.stdout.log"),
+        stderr_path: Path.join(beta_runtime_dir, "worker.stderr.log"),
+        error_summary: nil
+      })
+    )
+
+    File.write!(Path.join(beta_runtime_dir, "worker.pid"), Integer.to_string(dead_pid))
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    alpha_entry = fetch_entry!(manager_name, "alpha")
+    assert alpha_entry.runtime_state.status == :crashed
+    assert alpha_entry.runtime_state.pid == nil
+    assert alpha_entry.runtime_state.exit_reason == "persisted-crash"
+
+    beta_entry = fetch_entry!(manager_name, "beta")
+    assert beta_entry.runtime_state.status == :stopped
+    assert beta_entry.runtime_state.pid == nil
+    assert beta_entry.runtime_state.exit_reason == "worker pid no longer exists"
+    assert beta_entry.runtime_state.error_summary == nil
+  end
+
+  test "skips nil project_id entries when loading persisted runtimes and refreshing runtime truth" do
+    test_root = temp_root!("nil-project-id")
+    manager_name = Module.concat(__MODULE__, NilProjectIdManager)
+    config_path = write_missing_id_projects_config!(test_root)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    [entry] = ProjectProcessManager.project_registry(manager_name).entries
+    assert entry.project_id == nil
+    assert entry.validation_result == :invalid
+    assert entry.runtime_state.status == :config_invalid
+
+    internal_state = :sys.get_state(manager_name)
+    assert internal_state.runtimes == %{}
+  end
+
+  test "normalizes persisted runtime status strings and invalid timestamps" do
+    test_root = temp_root!("persisted-statuses")
+    manager_name = Module.concat(__MODULE__, PersistedStatusManager)
+    statuses = ["not_started", "starting", "running", "stopping", "stopped", "crashed", "start_failed", "disabled", "config_invalid", "mystery"]
+
+    projects =
+      Enum.with_index(statuses, 1)
+      |> Enum.map(fn {status, index} ->
+        project_fixture(test_root, "project-#{index}", reserve_tcp_port!(), enabled: status != "disabled")
+      end)
+
+    config_path = write_projects_config!(test_root, projects)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    Enum.zip(projects, statuses)
+    |> Enum.each(fn {project, status} ->
+      runtime_dir = control_plane_runtime_dir(test_root, project.id)
+      File.mkdir_p!(runtime_dir)
+
+      File.write!(
+        Path.join(runtime_dir, "runtime.json"),
+        Jason.encode!(%{
+          status: status,
+          pid: nil,
+          worker_port: project.worker_port,
+          started_at: "not-a-datetime",
+          exit_code: 17,
+          exit_reason: "reason-#{status}",
+          stdout_path: Path.join(runtime_dir, "worker.stdout.log"),
+          stderr_path: Path.join(runtime_dir, "worker.stderr.log"),
+          error_summary: "error-#{status}"
+        })
+      )
+    end)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    expected_statuses = [
+      :not_started,
+      :starting,
+      :running,
+      :stopping,
+      :stopped,
+      :crashed,
+      :start_failed,
+      :disabled,
+      :config_invalid,
+      :not_started
+    ]
+
+    Enum.zip(projects, expected_statuses)
+    |> Enum.each(fn {project, expected_status} ->
+      entry = fetch_entry!(manager_name, project.id)
+      assert entry.runtime_state.status == expected_status
+      assert entry.runtime_state.started_at == nil
+      assert entry.runtime_state.exit_code == 17
+    end)
+  end
+
+  test "default command builder quotes generated workflow paths" do
+    test_root = temp_root!("default-command-builder 'quoted'")
+    manager_name = Module.concat(__MODULE__, DefaultCommandBuilderManager)
+    port = reserve_tcp_port!()
+    project_id = "alpha"
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, project_id, port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name})
+
+    entry = fetch_entry!(manager_name, project_id)
+    command = :sys.get_state(manager_name).command_builder.(entry)
+
+    assert command =~ "./bin/symphony --logs-root "
+    assert command =~ "--port #{port}"
+    assert command =~ shell_escape(entry.normalized_config.logs_root)
+    assert command =~ shell_escape(entry.normalized_config.workflow_generated)
+  end
+
+  test "project registry reconciles dead in-memory workers as crashed" do
+    test_root = temp_root!("dead-runtime-reconcile")
+    manager_name = Module.concat(__MODULE__, DeadRuntimeReconcileManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    :sys.replace_state(manager_name, fn state ->
+      put_in(state.runtimes["alpha"], %{
+        status: :running,
+        pid: 999_998,
+        worker_port: port,
+        started_at: nil,
+        exit_code: nil,
+        exit_reason: nil,
+        stdout_path: nil,
+        stderr_path: nil,
+        error_summary: nil
+      })
+    end)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :crashed
+    assert entry.runtime_state.pid == nil
+    assert entry.runtime_state.exit_reason == "worker pid no longer exists"
+    assert entry.runtime_state.error_summary == "worker pid no longer exists"
+  end
+
+  test "unknown active port exit statuses persist stopped runtime in missing project directory" do
+    test_root = temp_root!("missing-runtime-dir")
+    manager_name = Module.concat(__MODULE__, MissingRuntimeDirManager)
+    port = reserve_tcp_port!()
+    missing_runtime_dir = Path.join(System.tmp_dir!(), "symphony-project-process-manager-missing")
+
+    on_exit(fn ->
+      File.rm_rf!(missing_runtime_dir)
+    end)
+
+    File.rm_rf!(missing_runtime_dir)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    fake_port = open_sleep_port(5)
+
+    on_exit(fn ->
+      close_port(fake_port)
+    end)
+
+    :sys.replace_state(manager_name, fn state ->
+      %{
+        state
+        | active_ports: %{inspect(fake_port) => %{project_id: "missing-project", port: fake_port}},
+          runtimes: %{}
+      }
+    end)
+
+    send(GenServer.whereis(manager_name), {fake_port, {:exit_status, 17}})
+    Process.sleep(50)
+
+    persisted = missing_runtime_dir |> Path.join("runtime.json") |> File.read!() |> Jason.decode!()
+    assert persisted["status"] == "stopped"
+    assert persisted["pid"] == nil
+    assert persisted["exit_code"] == 17
+    assert persisted["exit_reason"] == "worker exited with status 17"
+  end
+
+  test "runtime exit projections cover stopping and starting states" do
+    test_root = temp_root!("runtime-exit-projections")
+    manager_name = Module.concat(__MODULE__, RuntimeExitProjectionManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    alpha_fake_port = open_sleep_port(5)
+    beta_fake_port = open_sleep_port(5)
+
+    on_exit(fn ->
+      close_port(alpha_fake_port)
+      close_port(beta_fake_port)
+    end)
+
+    :sys.replace_state(manager_name, fn state ->
+      %{
+        state
+        | active_ports: %{
+            inspect(alpha_fake_port) => %{project_id: "alpha", port: alpha_fake_port},
+            inspect(beta_fake_port) => %{project_id: "beta", port: beta_fake_port}
+          },
+          runtimes: %{
+            "alpha" => %{
+              status: :stopping,
+              pid: 1_001,
+              worker_port: alpha_port,
+              started_at: nil,
+              exit_code: nil,
+              exit_reason: nil,
+              stdout_path: nil,
+              stderr_path: nil,
+              error_summary: "old"
+            },
+            "beta" => %{
+              status: :starting,
+              pid: 1_002,
+              worker_port: beta_port,
+              started_at: nil,
+              exit_code: nil,
+              exit_reason: nil,
+              stdout_path: nil,
+              stderr_path: nil,
+              error_summary: nil
+            }
+          }
+      }
+    end)
+
+    manager_pid = GenServer.whereis(manager_name)
+    send(manager_pid, {alpha_fake_port, {:exit_status, 21}})
+    send(manager_pid, {beta_fake_port, {:exit_status, 22}})
+
+    assert_eventually(fn ->
+      alpha_entry = fetch_entry!(manager_name, "alpha")
+      beta_entry = fetch_entry!(manager_name, "beta")
+
+      alpha_entry.runtime_state.status == :stopped and
+        alpha_entry.runtime_state.error_summary == nil and
+        beta_entry.runtime_state.status == :start_failed and
+        beta_entry.runtime_state.error_summary == "worker command exited during startup"
+    end)
+  end
+
+  test "closed startup port falls back through await_exit_status after port_open check" do
+    test_root = temp_root!("startup-closed-port-await-exit-status")
+    manager_name = Module.concat(__MODULE__, StartupClosedPortAwaitExitStatusManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    Port.close(startup_port)
+
+    Task.start(fn ->
+      Process.sleep(100)
+      send(manager_pid, {startup_port, {:exit_status, 61}})
+    end)
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code == 61
+    assert entry.runtime_state.exit_reason == "worker exited with status 61"
+
+    kill_pid(os_pid)
+  end
+
+  test "stops a hang worker and clears runtime resources" do
+    test_root = temp_root!("hang-worker")
+    manager_name = Module.concat(__MODULE__, HangManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "hang"})})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert running_state.status == :running
+    assert is_integer(running_state.pid)
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert stopped_state.status == :stopped
+    assert is_nil(stopped_state.pid)
+
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :stopped
+    refute File.exists?(Path.join(runtime_dir, "worker.pid"))
+    assert_eventually(fn -> not process_alive?(running_state.pid) end)
+  end
+
+  test "reconciles persisted pid after control-plane restart" do
+    test_root = temp_root!("reconcile-pid")
+    manager_name = Module.concat(__MODULE__, ReconcileManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    {pid, cleanup_ref} = launch_detached_fake_worker!(port)
+
+    on_exit(fn ->
+      cleanup_detached_worker(pid, cleanup_ref)
+    end)
+
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    File.mkdir_p!(runtime_dir)
+    File.write!(Path.join(runtime_dir, "worker.pid"), Integer.to_string(pid))
+
+    runtime_payload = %{
+      status: "running",
+      pid: pid,
+      worker_port: port,
+      started_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: Path.join(runtime_dir, "worker.stdout.log"),
+      stderr_path: Path.join(runtime_dir, "worker.stderr.log"),
+      error_summary: nil
+    }
+
+    File.write!(Path.join(runtime_dir, "runtime.json"), Jason.encode!(runtime_payload))
+    File.write!(Path.join(runtime_dir, "worker.stdout.log"), "")
+    File.write!(Path.join(runtime_dir, "worker.stderr.log"), "")
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.pid == pid
+    assert entry.runtime_state.worker_port == port
+    assert request_ok?(port)
+  end
+
+  defp fetch_entry!(manager_name, project_id) do
+    registry = ProjectProcessManager.project_registry(manager_name)
+    entry = Enum.find(registry.entries, &(&1.project_id == project_id))
+    assert entry != nil
+    entry
+  end
+
+  defp find_entry!(registry, project_id) do
+    entry = Enum.find(registry.entries, &(&1.project_id == project_id))
+    assert entry != nil
+    entry
+  end
+
+  defp fake_worker_builder(modes) do
+    fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
+
+    fn entry ->
+      mode = Map.get(modes, entry.project_id, "normal")
+
+      "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+    end
+  end
+
+  defp raw_command_builder(command) do
+    fn _entry -> command end
+  end
+
+  defp await_worker_pid!(runtime_dir, attempts \\ 40)
+
+  defp await_worker_pid!(runtime_dir, attempts) when attempts > 0 do
+    pid_path = Path.join(runtime_dir, "worker.pid")
+
+    case File.read(pid_path) do
+      {:ok, raw_pid} ->
+        case Integer.parse(String.trim(raw_pid)) do
+          {pid, _rest} -> pid
+          :error -> retry_worker_pid!(runtime_dir, attempts)
+        end
+
+      _other ->
+        retry_worker_pid!(runtime_dir, attempts)
+    end
+  end
+
+  defp await_worker_pid!(_runtime_dir, 0), do: flunk("failed to read worker pid")
+
+  defp retry_worker_pid!(runtime_dir, attempts) do
+    Process.sleep(10)
+    await_worker_pid!(runtime_dir, attempts - 1)
+  end
+
+  defp await_port_for_os_pid!(existing_ports, os_pid, attempts \\ 40)
+
+  defp await_port_for_os_pid!(existing_ports, os_pid, attempts) when attempts > 0 do
+    port =
+      Enum.find(:erlang.ports() -- existing_ports, fn port ->
+        match?({:os_pid, ^os_pid}, :erlang.port_info(port, :os_pid))
+      end)
+
+    if is_port(port) do
+      port
+    else
+      Process.sleep(10)
+      await_port_for_os_pid!(existing_ports, os_pid, attempts - 1)
+    end
+  end
+
+  defp await_port_for_os_pid!(_existing_ports, _os_pid, 0), do: flunk("failed to observe startup port for worker pid")
+
+  defp temp_root!(label) do
+    root = Path.join(System.tmp_dir!(), "symphony-project-process-manager-#{label}-#{System.unique_integer([:positive])}")
+    File.rm_rf!(root)
+    File.mkdir_p!(root)
+    root
+  end
+
+  defp project_fixture(test_root, project_id, worker_port, opts \\ []) do
+    project_root = Path.join(test_root, project_id)
+    workspace_root = Path.join(project_root, "workspace")
+    logs_root = Path.join(project_root, "logs")
+    workflow_path = Path.join(project_root, "generated/WORKFLOW.md")
+
+    File.mkdir_p!(workspace_root)
+    File.mkdir_p!(logs_root)
+
+    if Keyword.get(opts, :workflow?, true) do
+      File.mkdir_p!(Path.dirname(workflow_path))
+      write_workflow_file!(workflow_path)
+    end
+
+    %{
+      id: project_id,
+      name: String.capitalize(project_id),
+      workflow_generated: workflow_path,
+      workspace_root: workspace_root,
+      logs_root: logs_root,
+      enabled: Keyword.get(opts, :enabled, true),
+      worker_port: worker_port
+    }
+  end
+
+  defp write_projects_config!(test_root, projects) do
+    config_path = Path.join(test_root, "symphony.projects.yaml")
+
+    body =
+      [
+        "projects:",
+        Enum.map_join(projects, "\n", &project_yaml/1)
+      ]
+      |> Enum.join("\n")
+      |> Kernel.<>("\n")
+
+    File.write!(config_path, body)
+    config_path
+  end
+
+  defp write_invalid_projects_config!(test_root) do
+    config_path = Path.join(test_root, "invalid.projects.yaml")
+
+    File.write!(
+      config_path,
+      """
+      projects:
+        - id: alpha
+          name: Alpha
+          workflow_generated: "/tmp/alpha/WORKFLOW.md"
+          workspace_root: "/tmp/alpha/workspace"
+          logs_root: "/tmp/alpha/logs"
+          enabled: true
+          worker_port: nope
+      """
+    )
+
+    config_path
+  end
+
+  defp write_missing_id_projects_config!(test_root) do
+    config_path = Path.join(test_root, "missing-id.projects.yaml")
+
+    File.write!(
+      config_path,
+      """
+      projects:
+        - name: Alpha
+          workflow_generated: "/tmp/alpha/WORKFLOW.md"
+          workspace_root: "/tmp/alpha/workspace"
+          logs_root: "/tmp/alpha/logs"
+          enabled: true
+          worker_port: 4010
+      """
+    )
+
+    config_path
+  end
+
+  defp project_yaml(project) do
+    """
+      - id: "#{project.id}"
+        name: "#{project.name}"
+        workflow_generated: "#{project.workflow_generated}"
+        workspace_root: "#{project.workspace_root}"
+        logs_root: "#{project.logs_root}"
+        enabled: #{if(project.enabled, do: "true", else: "false")}
+        worker_port: #{project.worker_port}
+    """
+  end
+
+  defp control_plane_runtime_dir(test_root, project_id) do
+    Path.join([test_root, project_id, "logs", "control-plane"])
+  end
+
+  defp request_ok?(port) do
+    case :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}], 1_000) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+
+        result =
+          case :gen_tcp.recv(socket, 0, 1_000) do
+            {:ok, response} -> String.contains?(response, "200 OK")
+            _other -> false
+          end
+
+        :ok = :gen_tcp.close(socket)
+        result
+
+      _other ->
+        false
+    end
+  end
+
+  defp process_alive?(pid) when is_integer(pid) do
+    case System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      _other -> false
+    end
+  end
+
+  defp launch_detached_fake_worker!(port) do
+    script_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
+    stdout_path = Path.join(System.tmp_dir!(), "detached-fake-worker-#{port}.stdout.log")
+    stderr_path = Path.join(System.tmp_dir!(), "detached-fake-worker-#{port}.stderr.log")
+
+    port_handle =
+      Port.open(
+        {:spawn_executable, String.to_charlist(System.find_executable("bash"))},
+        [
+          :binary,
+          :exit_status,
+          args: [
+            ~c"-lc",
+            String.to_charlist("exec nohup elixir #{shell_escape(script_path)} --mode normal --port #{port} < /dev/null >> #{shell_escape(stdout_path)} 2>> #{shell_escape(stderr_path)} & echo $!")
+          ]
+        ]
+      )
+
+    pid =
+      receive do
+        {^port_handle, {:data, output}} ->
+          output
+          |> IO.iodata_to_binary()
+          |> String.trim()
+          |> String.to_integer()
+      after
+        2_000 -> flunk("failed to capture detached worker pid")
+      end
+
+    cleanup_ref =
+      receive do
+        {^port_handle, {:exit_status, status}} ->
+          assert status == 0
+          make_ref()
+      after
+        2_000 -> flunk("detached worker launch command did not exit cleanly")
+      end
+
+    assert_eventually(fn -> request_ok?(port) end)
+    {pid, cleanup_ref}
+  end
+
+  defp cleanup_detached_worker(pid, _cleanup_ref) do
+    _ = System.cmd("kill", ["-9", Integer.to_string(pid)])
+    :ok
+  end
+
+  defp open_sleep_port(seconds) do
+    Port.open(
+      {:spawn_executable, String.to_charlist(System.find_executable("bash"))},
+      [
+        :binary,
+        :exit_status,
+        args: [~c"-lc", String.to_charlist("sleep #{seconds}")]
+      ]
+    )
+  end
+
+  defp close_port(port) when is_port(port) do
+    if Port.info(port) != nil do
+      Port.close(port)
+    end
+
+    :ok
+  end
+
+  defp kill_pid(pid) when is_integer(pid) do
+    _ = System.cmd("kill", ["-9", Integer.to_string(pid)])
+    :ok
+  end
+
+  defp assert_eventually(fun, attempts \\ 20)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(50)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp reserve_tcp_port! do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp shell_escape(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+end

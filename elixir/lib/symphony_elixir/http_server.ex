@@ -3,7 +3,7 @@ defmodule SymphonyElixir.HttpServer do
   Compatibility facade that starts the Phoenix observability endpoint when enabled.
   """
 
-  alias SymphonyElixir.{Orchestrator, ProjectRegistryLoader}
+  alias SymphonyElixir.{Orchestrator, ProjectProcessManager, ProjectRegistryLoader}
   alias SymphonyElixirWeb.Endpoint
 
   @secret_key_bytes 48
@@ -25,7 +25,7 @@ defmodule SymphonyElixir.HttpServer do
         snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
 
         with {:ok, ip} <- parse_host(host) do
-          project_registry = Keyword.get(opts, :project_registry, ProjectRegistryLoader.load())
+          project_registry = Keyword.get(opts, :project_registry)
 
           endpoint_opts = [
             server: true,
@@ -52,6 +52,17 @@ defmodule SymphonyElixir.HttpServer do
     end
   end
 
+  @spec project_registry() :: SymphonyElixir.ProjectRegistry.t()
+  def project_registry do
+    case Endpoint.config(:project_registry) do
+      nil ->
+        project_registry_from_manager_or_loader()
+
+      registry ->
+        registry
+    end
+  end
+
   @spec bound_port(term()) :: non_neg_integer() | nil
   def bound_port(_server \\ __MODULE__) do
     case Bandit.PhoenixAdapter.server_info(Endpoint, :http) do
@@ -69,6 +80,29 @@ defmodule SymphonyElixir.HttpServer do
       :control_plane -> SymphonyElixir.ControlPlaneSnapshotServer
       :workflow -> Orchestrator
     end
+  end
+
+  defp project_registry_from_manager_or_loader do
+    if project_process_manager_alive?() do
+      ProjectProcessManager.project_registry()
+    else
+      ProjectRegistryLoader.load()
+    end
+  end
+
+  defp project_process_manager_alive? do
+    case GenServer.whereis(project_process_manager_name()) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      _other -> false
+    end
+  end
+
+  defp project_process_manager_name do
+    Application.get_env(
+      :symphony_elixir,
+      :project_process_manager_name,
+      SymphonyElixir.ProjectProcessManager
+    )
   end
 
   defp parse_host({_, _, _, _} = ip), do: {:ok, ip}
