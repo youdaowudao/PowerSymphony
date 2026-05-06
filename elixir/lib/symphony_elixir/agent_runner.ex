@@ -244,8 +244,16 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
   defp retry_candidate_issue?(%Issue{} = issue) do
-    active_issue_state?(issue.state) and !issue_blocked_by_non_terminal?(issue)
+    issue_routable_to_worker?(issue) and
+      active_issue_state?(issue.state) and
+      !issue_blocked_by_non_terminal?(issue)
   end
+
+  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
+       when is_boolean(assigned_to_worker),
+       do: assigned_to_worker
+
+  defp issue_routable_to_worker?(_issue), do: true
 
   defp issue_blocked_by_non_terminal?(%Issue{blocked_by: blockers}) when is_list(blockers) do
     terminal_states = terminal_state_set()
