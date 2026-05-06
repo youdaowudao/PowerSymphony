@@ -27,6 +27,7 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
              Phoenix.PubSub,
              Task.Supervisor,
              SymphonyElixir.ControlPlaneSnapshotServer,
+             SymphonyElixir.ProjectProcessManager,
              SymphonyElixir.HttpServer
            ]
   end

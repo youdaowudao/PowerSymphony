@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.{HttpServer, ProjectProcessManager}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -46,6 +47,21 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :project_not_found} ->
         error_response(conn, 404, "project_not_found", "Project not found")
     end
+  end
+
+  @spec start_project(Conn.t(), map()) :: Conn.t()
+  def start_project(conn, %{"project_id" => project_id}) do
+    control_plane_project_action(conn, project_id, &ProjectProcessManager.start_project/1)
+  end
+
+  @spec stop_project(Conn.t(), map()) :: Conn.t()
+  def stop_project(conn, %{"project_id" => project_id}) do
+    control_plane_project_action(conn, project_id, &ProjectProcessManager.stop_project/1)
+  end
+
+  @spec restart_project(Conn.t(), map()) :: Conn.t()
+  def restart_project(conn, %{"project_id" => project_id}) do
+    control_plane_project_action(conn, project_id, &ProjectProcessManager.restart_project/1)
   end
 
   @spec refresh(Conn.t(), map()) :: Conn.t()
@@ -99,10 +115,40 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp project_registry do
-    Endpoint.config(:project_registry) || %SymphonyElixir.ProjectRegistry{entries: []}
+    HttpServer.project_registry()
   end
 
   defp control_plane_mode? do
     Endpoint.config(:runtime_mode) == :control_plane
+  end
+
+  defp project_action(conn, project_id, action) do
+    case action.(project_id) do
+      {:ok, _runtime_state} ->
+        case Presenter.project_summary_payload(project_id, project_registry()) do
+          {:ok, payload} ->
+            conn
+            |> put_status(202)
+            |> json(payload)
+
+          {:error, :project_not_found} ->
+            error_response(conn, 404, "project_not_found", "Project not found")
+        end
+
+      {:error, :not_found} ->
+        error_response(conn, 404, "project_not_found", "Project not found")
+
+      {:error, reason}
+      when reason in [:config_invalid, :disabled, :already_running, :not_running, :start_failed] ->
+        error_response(conn, 409, Atom.to_string(reason), "Project action is not allowed")
+    end
+  end
+
+  defp control_plane_project_action(conn, project_id, action) do
+    if control_plane_mode?() do
+      project_action(conn, project_id, action)
+    else
+      control_plane_not_available(conn)
+    end
   end
 end

@@ -17,9 +17,11 @@ defmodule SymphonyElixir.ProjectConfigStore do
 
   @root_allowed_fields MapSet.new(["projects"])
   @required_fields ~w(id name workflow_generated workspace_root logs_root)
-  @allowed_fields MapSet.new(@required_fields)
+  @optional_fields ~w(enabled worker_port)
+  @allowed_fields MapSet.new(@required_fields ++ @optional_fields)
   @project_id_regex ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
   @path_fields ~w(workflow_generated workspace_root logs_root)
+  @worker_port_base 4101
 
   @spec load(Path.t()) :: {:ok, [ProjectConfig.t()]} | {:error, [ProjectConfigError.t()]}
   def load(path) when is_binary(path) do
@@ -190,6 +192,8 @@ defmodule SymphonyElixir.ProjectConfigStore do
       |> validate_unknown_fields(project, index, project_id)
       |> validate_project_id(project_id, index)
       |> validate_paths(project, index, project_id)
+      |> validate_enabled(project, index, project_id)
+      |> validate_worker_port(project, index, project_id)
 
     case errors do
       [] ->
@@ -197,6 +201,8 @@ defmodule SymphonyElixir.ProjectConfigStore do
          %ProjectConfig{
            id: project_id,
            name: String.trim(project["name"]),
+           enabled: normalized_enabled(project),
+           worker_port: normalized_worker_port(project, index),
            workflow_generated: canonical_path(project["workflow_generated"]),
            workspace_root: canonical_path(project["workspace_root"]),
            logs_root: canonical_path(project["logs_root"])
@@ -293,6 +299,27 @@ defmodule SymphonyElixir.ProjectConfigStore do
     end)
   end
 
+  defp validate_enabled(errors, project, index, project_id) do
+    case Map.fetch(project, "enabled") do
+      :error -> errors
+      {:ok, value} when is_boolean(value) -> errors
+      {:ok, _value} -> errors ++ [invalid_enabled_error(index, project_id)]
+    end
+  end
+
+  defp validate_worker_port(errors, project, index, project_id) do
+    case Map.fetch(project, "worker_port") do
+      :error ->
+        errors
+
+      {:ok, value} when is_integer(value) and value >= 0 ->
+        errors
+
+      {:ok, _value} ->
+        errors ++ [invalid_worker_port_error(index, project_id)]
+    end
+  end
+
   defp validate_required_field(:error, field, index, project_id) do
     [missing_field_error(field, index, project_id)]
   end
@@ -382,6 +409,14 @@ defmodule SymphonyElixir.ProjectConfigStore do
     canonical
   end
 
+  defp normalized_enabled(project) do
+    Map.get(project, "enabled", true)
+  end
+
+  defp normalized_worker_port(project, index) do
+    Map.get(project, "worker_port", @worker_port_base + index)
+  end
+
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, nested}, acc ->
       Map.put(acc, normalize_key(key), normalize_keys(nested))
@@ -426,6 +461,26 @@ defmodule SymphonyElixir.ProjectConfigStore do
       project_index: index,
       project_id: project_id,
       message: "#{field} must be a non-empty string"
+    }
+  end
+
+  defp invalid_enabled_error(index, project_id) do
+    %ProjectConfigError{
+      type: :invalid_field,
+      field: "enabled",
+      project_index: index,
+      project_id: project_id,
+      message: "enabled must be a boolean"
+    }
+  end
+
+  defp invalid_worker_port_error(index, project_id) do
+    %ProjectConfigError{
+      type: :invalid_field,
+      field: "worker_port",
+      project_index: index,
+      project_id: project_id,
+      message: "worker_port must be a non-negative integer"
     }
   end
 
