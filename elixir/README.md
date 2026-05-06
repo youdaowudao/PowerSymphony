@@ -68,7 +68,7 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 Standalone control plane:
 
 ```bash
-./bin/symphony_control --config ./symphony.projects.yaml --port 4000
+../bin/symphony_control --config ../symphony.projects.example.yaml --port 4000
 ```
 
 ## Configuration

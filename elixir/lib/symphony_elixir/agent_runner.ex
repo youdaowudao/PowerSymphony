@@ -10,7 +10,7 @@ defmodule SymphonyElixir.AgentRunner do
   @type worker_host :: String.t() | nil
   @type run_result_status :: :completed | :continuation_required | :failed
   @type run_result_reason ::
-          :issue_inactive | :issue_still_active | :max_turns_reached | :premature_turn_end
+          :issue_inactive | :issue_still_active | :max_turns_reached | :premature_turn_end | :turn_timeout
   @type run_result :: %{
           status: run_result_status(),
           reason: run_result_reason(),
@@ -194,6 +194,18 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
+  defp handle_turn_error(:turn_timeout, issue, codex_update_recipient, turn_number) do
+    send_run_result(codex_update_recipient, issue, %{
+      status: :failed,
+      reason: :turn_timeout,
+      turn_count: turn_number
+    })
+
+    Logger.warning("Agent turn timed out for #{issue_context(issue)} turn=#{turn_number}")
+
+    :ok
+  end
+
   defp handle_turn_error(reason, _issue, _codex_update_recipient, _turn_number) do
     {:error, reason}
   end
@@ -215,7 +227,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
+        if retry_candidate_issue?(refreshed_issue) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -230,6 +242,39 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp retry_candidate_issue?(%Issue{} = issue) do
+    issue_routable_to_worker?(issue) and
+      active_issue_state?(issue.state) and
+      !issue_blocked_by_non_terminal?(issue)
+  end
+
+  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
+       when is_boolean(assigned_to_worker),
+       do: assigned_to_worker
+
+  defp issue_routable_to_worker?(_issue), do: true
+
+  defp issue_blocked_by_non_terminal?(%Issue{blocked_by: blockers}) when is_list(blockers) do
+    terminal_states = terminal_state_set()
+
+    Enum.any?(blockers, fn
+      %{state: blocker_state} when is_binary(blocker_state) ->
+        !MapSet.member?(terminal_states, normalize_issue_state(blocker_state))
+
+      _ ->
+        true
+    end)
+  end
+
+  defp issue_blocked_by_non_terminal?(_issue), do: false
+
+  defp terminal_state_set do
+    Config.settings!().tracker.terminal_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
