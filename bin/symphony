@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CALLER_CWD="$(pwd)"
+ARGS=()
+WORKFLOW_SET=0
+SKIP_DEFAULT_WORKFLOW=0
+
+expand_from_caller() {
+  local path="$1"
+
+  if [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s\n' "$CALLER_CWD/${path#./}"
+  fi
+}
+
+while (($#)); do
+  case "$1" in
+    --logs-root)
+      ARGS+=("$1")
+      shift
+      if (($# == 0)); then
+        SKIP_DEFAULT_WORKFLOW=1
+        break
+      fi
+      if [[ "$1" == --* ]]; then
+        SKIP_DEFAULT_WORKFLOW=1
+        continue
+      fi
+      ARGS+=("$(expand_from_caller "$1")")
+      ;;
+    --logs-root=*)
+      ARGS+=("--logs-root=$(expand_from_caller "${1#--logs-root=}")")
+      ;;
+    --port)
+      ARGS+=("$1")
+      shift
+      if (($# == 0)); then
+        SKIP_DEFAULT_WORKFLOW=1
+        break
+      fi
+      if [[ "$1" == --* ]]; then
+        SKIP_DEFAULT_WORKFLOW=1
+        continue
+      fi
+      ARGS+=("$1")
+      ;;
+    --*)
+      ARGS+=("$1")
+      ;;
+    *)
+      if [[ "$WORKFLOW_SET" -eq 0 ]]; then
+        ARGS+=("$(expand_from_caller "$1")")
+        WORKFLOW_SET=1
+      else
+        ARGS+=("$1")
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [[ "$WORKFLOW_SET" -eq 0 && "$SKIP_DEFAULT_WORKFLOW" -eq 0 ]]; then
+  ARGS+=("$(expand_from_caller "WORKFLOW.md")")
+fi
+
+cd "$ROOT_DIR/elixir"
+
+exec mise exec -- mix run --no-start -e '
+SymphonyElixir.CLI.main(System.argv())
+' -- "${ARGS[@]}"
