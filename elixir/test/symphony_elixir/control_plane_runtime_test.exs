@@ -28,6 +28,7 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
              Task.Supervisor,
              SymphonyElixir.ControlPlaneSnapshotServer,
              SymphonyElixir.ProjectProcessManager,
+             SymphonyElixir.WorkerHealthPoller,
              SymphonyElixir.HttpServer
            ]
   end

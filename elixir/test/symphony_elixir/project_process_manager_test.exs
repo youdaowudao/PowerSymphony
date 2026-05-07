@@ -647,6 +647,527 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert restarted_state.pid != started_state.pid
   end
 
+  test "running worker health success keeps lifecycle running and records timestamps" do
+    test_root = temp_root!("health-success")
+    manager_name = Module.concat(__MODULE__, HealthSuccessManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    check_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    seen_at = DateTime.add(check_at, 1, :second)
+
+    targets = ProjectProcessManager.health_poll_targets(manager_name)
+    assert [%{project_id: "alpha", worker_port: ^port, health_check_timeout_ms: 50}] = targets
+
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "alpha", seen_at)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.pid == runtime_state.pid
+    assert entry.runtime_state.health_status == :healthy
+    assert entry.runtime_state.last_seen_at == seen_at
+    assert entry.runtime_state.last_health_check_at == seen_at
+    assert entry.runtime_state.last_error == nil
+    assert entry.runtime_state.health_check_timeout_ms == 50
+  end
+
+  test "default-name health APIs route through configured manager name" do
+    test_root = temp_root!("default-health-api")
+    configured_name = Module.concat(__MODULE__, DefaultHealthApiManager)
+    port = reserve_tcp_port!()
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, configured_name)
+
+    start_supervised!({ProjectProcessManager, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project("alpha")
+    assert runtime_state.status == :running
+
+    assert [%{project_id: "alpha", worker_port: ^port, health_check_timeout_ms: 50}] =
+             ProjectProcessManager.health_poll_targets()
+
+    seen_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    assert :ok = ProjectProcessManager.record_health_success("alpha", seen_at)
+
+    entry = fetch_entry!(configured_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.last_seen_at == seen_at
+    assert entry.runtime_state.health_status == :healthy
+  end
+
+  test "default-name health failure API routes through configured manager name" do
+    test_root = temp_root!("default-health-failure-api")
+    configured_name = Module.concat(__MODULE__, DefaultHealthFailureApiManager)
+    port = reserve_tcp_port!()
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, configured_name)
+
+    start_supervised!({ProjectProcessManager, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project("alpha")
+    assert runtime_state.status == :running
+
+    baseline_seen_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    assert :ok = ProjectProcessManager.record_health_success("alpha", baseline_seen_at)
+
+    failure_at = DateTime.add(baseline_seen_at, 55, :millisecond)
+    assert :ok = ProjectProcessManager.record_health_failure("alpha", failure_at, "request timed out")
+
+    entry = fetch_entry!(configured_name, "alpha")
+    assert entry.runtime_state.status == :unreachable
+    assert entry.runtime_state.health_status == :unreachable
+    assert entry.runtime_state.last_error == "request timed out"
+  end
+
+  test "running worker failure after timeout projects as unreachable and later success returns to running" do
+    test_root = temp_root!("health-unreachable")
+    manager_name = Module.concat(__MODULE__, HealthUnreachableManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    baseline_seen_at = DateTime.utc_now()
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "alpha", baseline_seen_at)
+
+    before_timeout = DateTime.add(baseline_seen_at, 49, :millisecond)
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "alpha",
+               before_timeout,
+               "connection refused"
+             )
+
+    running_entry = fetch_entry!(manager_name, "alpha")
+    assert running_entry.runtime_state.status == :running
+    assert running_entry.runtime_state.health_status != :unreachable
+    assert running_entry.runtime_state.pid == runtime_state.pid
+
+    after_timeout = DateTime.add(baseline_seen_at, 55, :millisecond)
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "alpha",
+               after_timeout,
+               "request timed out"
+             )
+
+    unreachable_entry = fetch_entry!(manager_name, "alpha")
+    assert unreachable_entry.runtime_state.status == :unreachable
+    assert unreachable_entry.runtime_state.health_status == :unreachable
+    assert unreachable_entry.runtime_state.last_health_check_at == after_timeout
+    assert unreachable_entry.runtime_state.last_seen_at == baseline_seen_at
+    assert unreachable_entry.runtime_state.last_error == "request timed out"
+
+    assert [%{project_id: "alpha", worker_port: ^port, health_check_timeout_ms: 50}] =
+             ProjectProcessManager.health_poll_targets(manager_name)
+
+    recovery_at = DateTime.add(after_timeout, 1, :second)
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "alpha", recovery_at)
+
+    recovered_entry = fetch_entry!(manager_name, "alpha")
+    assert recovered_entry.runtime_state.status == :running
+    assert recovered_entry.runtime_state.health_status == :healthy
+    assert recovered_entry.runtime_state.last_seen_at == recovery_at
+    assert recovered_entry.runtime_state.last_health_check_at == recovery_at
+    assert recovered_entry.runtime_state.last_error == nil
+  end
+
+  test "health updates do not overwrite stopped crashed start_failed disabled or config_invalid states" do
+    test_root = temp_root!("health-no-overwrite")
+    manager_name = Module.concat(__MODULE__, HealthNoOverwriteManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+    gamma_port = reserve_tcp_port!()
+    delta_port = reserve_tcp_port!()
+    epsilon_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port),
+        project_fixture(test_root, "gamma", gamma_port),
+        project_fixture(test_root, "delta", delta_port, enabled: false),
+        project_fixture(test_root, "epsilon", epsilon_port, workflow?: false)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder:
+         fake_worker_builder(%{
+           "alpha" => "normal",
+           "beta" => "normal",
+           "gamma" => "crash"
+         })}
+    )
+
+    assert {:ok, _} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:ok, _} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert {:ok, _} = ProjectProcessManager.start_project(manager_name, "beta")
+    assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "gamma")
+
+    failed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    for project_id <- ~w(alpha beta gamma delta epsilon) do
+      assert :ok =
+               ProjectProcessManager.record_health_failure(
+                 manager_name,
+                 project_id,
+                 DateTime.add(failed_at, 1, :second),
+                 "#{project_id}-failure"
+               )
+
+      assert :ok =
+               ProjectProcessManager.record_health_success(
+                 manager_name,
+                 project_id,
+                 DateTime.add(failed_at, 2, :second)
+               )
+    end
+
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :stopped
+    assert fetch_entry!(manager_name, "beta").runtime_state.status == :running
+    assert fetch_entry!(manager_name, "gamma").runtime_state.status == :start_failed
+    assert fetch_entry!(manager_name, "delta").runtime_state.status == :disabled
+    assert fetch_entry!(manager_name, "epsilon").runtime_state.status == :config_invalid
+  end
+
+  test "health updates do not overwrite a real crashed worker back to running" do
+    test_root = temp_root!("health-real-crashed")
+    manager_name = Module.concat(__MODULE__, HealthRealCrashedManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {_, 0} = System.cmd("kill", ["-9", Integer.to_string(running_state.pid)])
+
+    assert_eventually(fn ->
+      fetch_entry!(manager_name, "alpha").runtime_state.status == :crashed
+    end)
+
+    crashed_entry = fetch_entry!(manager_name, "alpha")
+    assert crashed_entry.runtime_state.status == :crashed
+    assert crashed_entry.runtime_state.pid == nil
+
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "alpha", observed_at)
+
+    still_crashed_entry = fetch_entry!(manager_name, "alpha")
+    assert still_crashed_entry.runtime_state.status == :crashed
+    refute still_crashed_entry.runtime_state.status == :running
+    assert still_crashed_entry.runtime_state.last_health_check_at == observed_at
+    assert still_crashed_entry.runtime_state.last_seen_at == nil
+  end
+
+  test "health poll targets ignore invalid entries and missing health updates are no-ops" do
+    test_root = temp_root!("health-invalid-entry")
+    manager_name = Module.concat(__MODULE__, HealthInvalidEntryManager)
+    config_path = write_missing_id_projects_config!(test_root)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert ProjectProcessManager.health_poll_targets(manager_name) == []
+
+    state_before = :sys.get_state(manager_name)
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "missing-project", observed_at)
+    assert :ok = ProjectProcessManager.record_health_failure(manager_name, "missing-project", observed_at, "boom")
+
+    assert :sys.get_state(manager_name) == state_before
+  end
+
+  test "loads persisted health statuses and times out running workers without a reference timestamp" do
+    test_root = temp_root!("persisted-health-statuses")
+    manager_name = Module.concat(__MODULE__, PersistedHealthStatusesManager)
+
+    projects = [
+      project_fixture(test_root, "alpha", reserve_tcp_port!()),
+      project_fixture(test_root, "beta", reserve_tcp_port!()),
+      project_fixture(test_root, "gamma", reserve_tcp_port!()),
+      project_fixture(test_root, "delta", reserve_tcp_port!())
+    ]
+
+    config_path = write_projects_config!(test_root, projects)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    Enum.each(projects, fn project ->
+      runtime_dir = control_plane_runtime_dir(test_root, project.id)
+      File.mkdir_p!(runtime_dir)
+      File.write!(Path.join(runtime_dir, "worker.stdout.log"), "")
+      File.write!(Path.join(runtime_dir, "worker.stderr.log"), "")
+    end)
+
+    write_runtime_json!(test_root, "alpha", %{
+      status: "running",
+      pid: nil,
+      worker_port: Enum.at(projects, 0).worker_port,
+      started_at: nil,
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: Path.join(control_plane_runtime_dir(test_root, "alpha"), "worker.stdout.log"),
+      stderr_path: Path.join(control_plane_runtime_dir(test_root, "alpha"), "worker.stderr.log"),
+      error_summary: nil,
+      health_status: "healthy",
+      last_seen_at: nil,
+      last_health_check_at: DateTime.utc_now() |> DateTime.truncate(:second),
+      last_error: nil,
+      health_check_timeout_ms: 50
+    })
+
+    write_runtime_json!(test_root, "beta", %{
+      status: "running",
+      pid: nil,
+      worker_port: Enum.at(projects, 1).worker_port,
+      started_at: nil,
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: Path.join(control_plane_runtime_dir(test_root, "beta"), "worker.stdout.log"),
+      stderr_path: Path.join(control_plane_runtime_dir(test_root, "beta"), "worker.stderr.log"),
+      error_summary: nil,
+      health_status: "degraded",
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil,
+      health_check_timeout_ms: 50
+    })
+
+    write_runtime_json!(test_root, "gamma", %{
+      status: "running",
+      pid: nil,
+      worker_port: Enum.at(projects, 2).worker_port,
+      started_at: nil,
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: Path.join(control_plane_runtime_dir(test_root, "gamma"), "worker.stdout.log"),
+      stderr_path: Path.join(control_plane_runtime_dir(test_root, "gamma"), "worker.stderr.log"),
+      error_summary: nil,
+      health_status: "mystery",
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil,
+      health_check_timeout_ms: 50
+    })
+
+    write_runtime_json!(test_root, "delta", %{
+      status: "running",
+      pid: nil,
+      worker_port: Enum.at(projects, 3).worker_port,
+      started_at: nil,
+      exit_code: nil,
+      exit_reason: nil,
+      stdout_path: Path.join(control_plane_runtime_dir(test_root, "delta"), "worker.stdout.log"),
+      stderr_path: Path.join(control_plane_runtime_dir(test_root, "delta"), "worker.stderr.log"),
+      error_summary: nil,
+      health_status: "unknown",
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil,
+      health_check_timeout_ms: 50
+    })
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert fetch_entry!(manager_name, "alpha").runtime_state.health_status == :healthy
+    assert fetch_entry!(manager_name, "beta").runtime_state.health_status == :degraded
+    assert fetch_entry!(manager_name, "gamma").runtime_state.health_status == :unknown
+
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "delta",
+               observed_at,
+               "delta timeout"
+             )
+
+    delta_entry = fetch_entry!(manager_name, "delta")
+    assert delta_entry.runtime_state.status == :unreachable
+    assert delta_entry.runtime_state.health_status == :unreachable
+    assert delta_entry.runtime_state.last_seen_at == nil
+    assert delta_entry.runtime_state.last_error == "delta timeout"
+  end
+
+  test "health metadata persists and reloads from runtime.json" do
+    test_root = temp_root!("health-persist")
+    manager_name = Module.concat(__MODULE__, HealthPersistManager)
+    reloaded_manager = Module.concat(__MODULE__, HealthPersistReloadedManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 250})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    manager_pid =
+      start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    failure_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "alpha",
+               DateTime.add(failure_at, 300, :millisecond),
+               "request timed out"
+             )
+
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+    persisted = runtime_dir |> Path.join("runtime.json") |> File.read!() |> Jason.decode!()
+    assert persisted["status"] == "running"
+    assert persisted["health_status"] == "unreachable"
+    assert persisted["last_health_check_at"] != nil
+    assert persisted["last_error"] == "request timed out"
+    assert persisted["health_check_timeout_ms"] == 250
+
+    GenServer.stop(manager_pid)
+
+    start_supervised!(%{
+      id: reloaded_manager,
+      start:
+        {ProjectProcessManager, :start_link,
+         [
+           [
+             name: reloaded_manager,
+             command_builder: fake_worker_builder(%{})
+           ]
+         ]},
+      restart: :temporary
+    })
+
+    entry = fetch_entry!(reloaded_manager, "alpha")
+    assert entry.runtime_state.status == :unreachable
+    assert entry.runtime_state.health_status == :unreachable
+    assert %DateTime{} = entry.runtime_state.last_health_check_at
+    assert entry.runtime_state.last_error == "request timed out"
+    assert entry.runtime_state.health_check_timeout_ms == 250
+  end
+
+  test "health updates do not cross projects" do
+    test_root = temp_root!("health-isolation")
+    manager_name = Module.concat(__MODULE__, HealthIsolationManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder:
+         fake_worker_builder(%{
+           "alpha" => "normal",
+           "beta" => "normal"
+         })}
+    )
+
+    assert {:ok, _} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert {:ok, _} = ProjectProcessManager.start_project(manager_name, "beta")
+
+    alpha_seen_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    beta_failure_at = DateTime.add(alpha_seen_at, 100, :millisecond)
+
+    assert :ok = ProjectProcessManager.record_health_success(manager_name, "alpha", alpha_seen_at)
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "beta",
+               beta_failure_at,
+               "beta timeout"
+             )
+
+    assert :ok =
+             ProjectProcessManager.record_health_failure(
+               manager_name,
+               "beta",
+               DateTime.add(beta_failure_at, 100, :millisecond),
+               "beta timeout"
+             )
+
+    alpha_entry = fetch_entry!(manager_name, "alpha")
+    beta_entry = fetch_entry!(manager_name, "beta")
+
+    assert alpha_entry.runtime_state.status == :running
+    assert alpha_entry.runtime_state.last_seen_at == alpha_seen_at
+    assert alpha_entry.runtime_state.last_error == nil
+
+    assert beta_entry.runtime_state.status == :unreachable
+    assert beta_entry.runtime_state.last_seen_at == nil
+    assert beta_entry.runtime_state.last_error == "beta timeout"
+  end
+
   test "returns not_found for missing projects across project actions" do
     test_root = temp_root!("missing-project")
     manager_name = Module.concat(__MODULE__, MissingProjectManager)
@@ -1376,6 +1897,12 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     Path.join([test_root, project_id, "logs", "control-plane"])
   end
 
+  defp write_runtime_json!(test_root, project_id, payload) do
+    runtime_dir = control_plane_runtime_dir(test_root, project_id)
+    File.mkdir_p!(runtime_dir)
+    File.write!(Path.join(runtime_dir, "runtime.json"), Jason.encode!(payload))
+  end
+
   defp request_ok?(port) do
     case :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}], 1_000) do
       {:ok, socket} ->
@@ -1440,7 +1967,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
         2_000 -> flunk("detached worker launch command did not exit cleanly")
       end
 
-    assert_eventually(fn -> request_ok?(port) end)
+    assert_eventually(fn -> request_ok?(port) end, 80)
     {pid, cleanup_ref}
   end
 

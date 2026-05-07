@@ -84,7 +84,7 @@ defmodule SymphonyElixir.HttpServer do
 
   defp project_registry_from_manager_or_loader do
     if project_process_manager_alive?() do
-      ProjectProcessManager.project_registry()
+      ProjectProcessManager.project_registry(project_process_manager_name())
     else
       ProjectRegistryLoader.load()
     end

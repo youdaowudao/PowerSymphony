@@ -28,6 +28,7 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    get("/api/v1/health", ObservabilityApiController, :health)
     get("/api/v1/state", ObservabilityApiController, :state)
     get("/api/v1/projects", ObservabilityApiController, :projects)
     get("/api/v1/projects/:project_id/summary", ObservabilityApiController, :project_summary)
@@ -36,6 +37,7 @@ defmodule SymphonyElixirWeb.Router do
     post("/api/v1/projects/:project_id/restart", ObservabilityApiController, :restart_project)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
+    match(:*, "/api/v1/health", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/projects", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/projects/:project_id/summary", ObservabilityApiController, :method_not_allowed)
