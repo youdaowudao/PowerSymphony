@@ -29,3 +29,9 @@
 - 不得根据记忆、推测、相似文件或已有上下文，擅自补写用户指定但当前仓库中不存在的目标文件。
 - 如果仓库内容与用户描述不一致，默认先提示用户同步仓库或提供准确路径。
 - 编辑目标文件前，先检查该文件是否已有用户操作而造成的本地改动,避免二次打乱用户已经开始操作的原文件和上下文。
+
+## 本地测试并发约定
+
+- 本地运行 `make all` 或 `mix test --cover` 时，如需主动降低测试并发，使用环境变量 `SYMPHONY_TEST_MAX_CASES` 控制 ExUnit `max_cases`。
+- 例如：`SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all`、`SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
+- 该约定仅用于本地执行，不得修改 CI 默认行为，不得借此降低 coverage threshold，也不得删测试。

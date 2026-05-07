@@ -31,7 +31,16 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
            ]
   end
 
-  test "workflow mode preserves the existing runtime children" do
+  test "workflow mode can still include full runtime children when test override is disabled" do
+    previous_disable_runtime_workers =
+      Application.get_env(:symphony_elixir, :disable_runtime_workers_in_tests)
+
+    on_exit(fn ->
+      restore_app_env(:disable_runtime_workers_in_tests, previous_disable_runtime_workers)
+    end)
+
+    Application.put_env(:symphony_elixir, :disable_runtime_workers_in_tests, false)
+
     ids =
       SymphonyApplication.child_specs(:workflow)
       |> Enum.map(&child_id/1)
@@ -43,6 +52,27 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
              SymphonyElixir.Orchestrator,
              SymphonyElixir.HttpServer,
              SymphonyElixir.StatusDashboard
+           ]
+  end
+
+  test "workflow mode in test env does not auto-start runtime workers" do
+    previous_disable_runtime_workers =
+      Application.get_env(:symphony_elixir, :disable_runtime_workers_in_tests)
+
+    on_exit(fn ->
+      restore_app_env(:disable_runtime_workers_in_tests, previous_disable_runtime_workers)
+    end)
+
+    Application.put_env(:symphony_elixir, :disable_runtime_workers_in_tests, true)
+
+    ids =
+      SymphonyApplication.child_specs(:workflow)
+      |> Enum.map(&child_id/1)
+
+    assert ids == [
+             Phoenix.PubSub,
+             Task.Supervisor,
+             SymphonyElixir.WorkflowStore
            ]
   end
 
@@ -149,6 +179,17 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
 
     Application.put_env(:symphony_elixir, :server_port_override, 4999)
     assert SymphonyElixir.server_port() == 4999
+  end
+
+  test "application stop renders offline status in workflow mode" do
+    Application.put_env(:symphony_elixir, :runtime_mode, :workflow)
+
+    rendered =
+      ExUnit.CaptureIO.capture_io(fn ->
+        assert :ok = SymphonyApplication.stop(:normal)
+      end)
+
+    assert rendered =~ "app_status=offline"
   end
 
   defp child_id(%{id: id}), do: id

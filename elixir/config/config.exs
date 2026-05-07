@@ -2,6 +2,9 @@ import Config
 
 config :phoenix, :json_library, Jason
 
+config :symphony_elixir,
+  disable_runtime_workers_in_tests: config_env() == :test
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],

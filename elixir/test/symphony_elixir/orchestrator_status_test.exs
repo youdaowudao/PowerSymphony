@@ -1141,8 +1141,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     parent = self()
     orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
 
+    orchestrator_child_configured? =
+      SymphonyElixir.Application.child_specs(SymphonyElixir.runtime_mode())
+      |> Enum.any?(fn
+        %{id: SymphonyElixir.Orchestrator} -> true
+        SymphonyElixir.Orchestrator -> true
+        _ -> false
+      end)
+
     on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
+      if orchestrator_child_configured? and is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
         case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok

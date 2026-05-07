@@ -130,6 +130,26 @@ defmodule SymphonyElixir.LiveE2ETest do
     run_live_issue_flow!(:ssh)
   end
 
+  test "restart_orchestrator_if_needed is a no-op when orchestrator is not a configured child" do
+    previous_disable_runtime_workers =
+      Application.get_env(:symphony_elixir, :disable_runtime_workers_in_tests)
+
+    on_exit(fn ->
+      case previous_disable_runtime_workers do
+        nil ->
+          Application.delete_env(:symphony_elixir, :disable_runtime_workers_in_tests)
+
+        value ->
+          Application.put_env(:symphony_elixir, :disable_runtime_workers_in_tests, value)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :disable_runtime_workers_in_tests, true)
+
+    assert :ok = restart_orchestrator_if_needed()
+    assert is_nil(Process.whereis(SymphonyElixir.Orchestrator))
+  end
+
   defp fetch_team!(team_key) do
     @team_query
     |> graphql_data!(%{key: team_key})
@@ -544,12 +564,24 @@ defmodule SymphonyElixir.LiveE2ETest do
   defp cleanup_live_worker_setup(_worker_setup), do: :ok
 
   defp restart_orchestrator_if_needed do
-    if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
+    if orchestrator_child_configured?() and is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
       case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
         {:ok, _pid} -> :ok
         {:error, {:already_started, _pid}} -> :ok
+        {:error, :not_found} -> :ok
       end
+    else
+      :ok
     end
+  end
+
+  defp orchestrator_child_configured? do
+    SymphonyElixir.Application.child_specs(SymphonyElixir.runtime_mode())
+    |> Enum.any?(fn
+      %{id: SymphonyElixir.Orchestrator} -> true
+      SymphonyElixir.Orchestrator -> true
+      _ -> false
+    end)
   end
 
   defp live_ssh_worker_setup!(run_id) when is_binary(run_id) do
