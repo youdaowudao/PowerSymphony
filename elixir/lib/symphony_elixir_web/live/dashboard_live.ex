@@ -79,7 +79,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Projects</h2>
-              <p class="section-copy">Static project config validation and placeholder runtime state.</p>
+              <p class="section-copy">Static config validation with lightweight runtime summary.</p>
             </div>
           </div>
 
@@ -168,7 +168,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Projects</h2>
-              <p class="section-copy">Static project config validation and placeholder runtime state.</p>
+              <p class="section-copy">Static config validation with lightweight runtime summary.</p>
             </div>
           </div>
 
