@@ -183,11 +183,21 @@ Choose the validation command based on the current `git diff`.
 
 - Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a test run.
 - Localized code changes should use targeted validation first.
-- Run the full gate only for core code changes, test/build config changes, startup/execution-flow changes, or final pre-PR revalidation:
+- For ordinary local milestone checks or pre-PR self-checks, prefer:
 
 ```bash
-make all
+cd elixir
+SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover
 ```
+
+- Run the full gate locally only for core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or when reproducing a remote gate failure:
+
+```bash
+cd elixir
+SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all
+```
+
+- GitHub Actions remains the authoritative full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
 
 Run the real external end-to-end test only when you want Symphony to create disposable Linear
 resources and launch a real `codex app-server` session:

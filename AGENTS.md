@@ -30,8 +30,26 @@
 - 如果仓库内容与用户描述不一致，默认先提示用户同步仓库或提供准确路径。
 - 编辑目标文件前，先检查该文件是否已有用户操作而造成的本地改动,避免二次打乱用户已经开始操作的原文件和上下文。
 
+## 本地验证分层规则
+
+- 先看 `git diff`，再选择能证明改动正确性的最轻验证；禁止把本地 `make all` 当成所有 PR 的默认动作。
+- 文档更新、只读排查、Linear 分诊或清理：不要求跑测试。
+- 局部代码改动：先跑定向测试；必要时补 `cd elixir && mise exec -- mix format --check-formatted`、`cd elixir && mise exec -- mix lint` 等局部门禁。
+- 普通功能分支在里程碑点或 PR 前的本地自检：优先使用 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
+- 本地 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all` 仅用于高风险改动，或远端 full gate 失败后需要本地复现。高风险改动包括：`Application child_specs`、`Orchestrator`、`AgentRunner`、`AppServer`、`SSH`、`live_e2e`、启动流程、测试/构建配置、外部进程编排。
+- GitHub / CI 在命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md` 这些路径时继续执行完整 `make all` 作为远端 full gate；不得因为本地分层验证而降低 coverage threshold、删测试或弱化远端门禁。
+
 ## 本地测试并发约定
 
 - 本地运行 `make all` 或 `mix test --cover` 时，如需主动降低测试并发，使用环境变量 `SYMPHONY_TEST_MAX_CASES` 控制 ExUnit `max_cases`。
-- 例如：`SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all`、`SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
+- 例如：`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all`、`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
 - 该约定仅用于本地执行，不得修改 CI 默认行为，不得借此降低 coverage threshold，也不得删测试。
+
+## 测试安全红线
+
+- WSL 被卡死的主要根因是测试隔离失效，真实 runtime worker 与外部进程链路混入测试；这不是 Elixir 语言本身的问题。
+- 测试环境禁止默认启动任何会轮询、起外部进程、开端口、走 SSH、连真实 Linear/Codex 的 child。
+- 这类组件只能在具体测试里显式 `start_link`，并且必须用 `on_exit` 或等效机制彻底回收。
+- 测试不得把仓库真实 `WORKFLOW.md` 当成默认运行配置。
+- 凡是涉及 `Port.open`、`ssh`、`codex app-server`、`docker`、fake worker 的测试，必须显式检查并发度、进程清理和资源回收，不能把全局 supervisor 当成免费启动器。
+- 本地 full gate 期间若出现 CPU 长时间不回落、异常子进程数量持续增长、内存持续上涨或 swap 明显放大，按 blocker 处理，不得继续加大并发硬跑。
