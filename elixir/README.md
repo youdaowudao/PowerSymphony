@@ -98,7 +98,9 @@ Each static project entry now also accepts:
 - `worker_port` to reserve the worker's HTTP port (default: `4101 + project index`)
 
 The control plane records minimal per-project runtime state such as pid, started time, exit status,
-and stdout/stderr log paths. It intentionally does not perform health polling yet.
+stdout/stderr log paths, and lightweight worker reachability derived from periodic
+`GET /api/v1/health` polls. The default poll interval and timeout are configured through the
+`control_plane` section in `WORKFLOW.md`.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.

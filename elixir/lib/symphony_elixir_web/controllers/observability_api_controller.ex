@@ -38,6 +38,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     json(conn, Presenter.projects_payload(project_registry()))
   end
 
+  @spec health(Conn.t(), map()) :: Conn.t()
+  def health(conn, _params) do
+    json(conn, %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      status: "ok",
+      runtime_mode: runtime_mode() |> to_string()
+    })
+  end
+
   @spec project_summary(Conn.t(), map()) :: Conn.t()
   def project_summary(conn, %{"project_id" => project_id}) do
     case Presenter.project_summary_payload(project_id, project_registry()) do
@@ -120,6 +129,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp control_plane_mode? do
     Endpoint.config(:runtime_mode) == :control_plane
+  end
+
+  defp runtime_mode do
+    Endpoint.config(:runtime_mode) || SymphonyElixir.runtime_mode()
   end
 
   defp project_action(conn, project_id, action) do

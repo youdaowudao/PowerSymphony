@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   use GenServer
 
-  alias SymphonyElixir.{ProjectRegistry, ProjectRegistryLoader}
+  alias SymphonyElixir.{Config, ProjectRegistry, ProjectRegistryLoader}
   alias SymphonyElixir.ProjectRegistry.Entry
 
   @startup_grace_ms 1_000
@@ -17,10 +17,23 @@ defmodule SymphonyElixir.ProjectProcessManager do
   @stderr_filename "worker.stderr.log"
 
   @type runtime_status ::
-          :not_started | :starting | :running | :stopping | :stopped | :crashed | :start_failed | :disabled
+          :not_started
+          | :starting
+          | :running
+          | :stopping
+          | :stopped
+          | :crashed
+          | :start_failed
+          | :disabled
+          | :config_invalid
+          | :unreachable
+
+  @type lifecycle_status :: :not_started | :starting | :running | :stopping | :stopped | :crashed | :start_failed
+
+  @type health_status :: :unknown | :healthy | :degraded | :unreachable
 
   @type runtime_state :: %{
-          status: runtime_status(),
+          status: lifecycle_status(),
           pid: integer() | nil,
           worker_port: non_neg_integer() | nil,
           started_at: DateTime.t() | nil,
@@ -28,7 +41,12 @@ defmodule SymphonyElixir.ProjectProcessManager do
           exit_reason: String.t() | nil,
           stdout_path: String.t() | nil,
           stderr_path: String.t() | nil,
-          error_summary: String.t() | nil
+          error_summary: String.t() | nil,
+          health_status: health_status(),
+          last_seen_at: DateTime.t() | nil,
+          last_health_check_at: DateTime.t() | nil,
+          last_error: String.t() | nil,
+          health_check_timeout_ms: pos_integer()
         }
 
   @type state :: %{
@@ -97,6 +115,29 @@ defmodule SymphonyElixir.ProjectProcessManager do
     GenServer.call(server, {:restart_project, project_id}, 15_000)
   end
 
+  @spec health_poll_targets(GenServer.name()) :: [
+          %{
+            project_id: String.t(),
+            worker_port: non_neg_integer(),
+            health_check_timeout_ms: pos_integer()
+          }
+        ]
+  def health_poll_targets(server \\ default_name()) do
+    GenServer.call(server, :health_poll_targets, 15_000)
+  end
+
+  @spec record_health_success(GenServer.name(), String.t(), DateTime.t()) :: :ok
+  def record_health_success(server \\ default_name(), project_id, %DateTime{} = observed_at)
+      when is_binary(project_id) do
+    GenServer.call(server, {:record_health_success, project_id, observed_at}, 15_000)
+  end
+
+  @spec record_health_failure(GenServer.name(), String.t(), DateTime.t(), String.t()) :: :ok
+  def record_health_failure(server \\ default_name(), project_id, %DateTime{} = observed_at, error)
+      when is_binary(project_id) and is_binary(error) do
+    GenServer.call(server, {:record_health_failure, project_id, observed_at, error}, 15_000)
+  end
+
   @impl true
   def init(opts) do
     command_builder = Keyword.get(opts, :command_builder, &default_command_builder/1)
@@ -118,6 +159,41 @@ defmodule SymphonyElixir.ProjectProcessManager do
       |> project_registry_with_runtime(state.runtimes)
 
     {:reply, registry, %{state | runtimes: refresh_runtime_truth(state.runtimes, registry)}}
+  end
+
+  def handle_call(:health_poll_targets, _from, state) do
+    targets =
+      project_static_registry()
+      |> Map.get(:entries, [])
+      |> Enum.flat_map(fn
+        %Entry{project_id: project_id} = entry when is_binary(project_id) ->
+          runtime_state =
+            Map.get(
+              state.runtimes,
+              project_id,
+              default_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
+            )
+            |> hydrate_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
+
+          if runtime_state.status == :running and
+               projected_status(entry, runtime_state) == :running and
+               is_integer(runtime_state.worker_port) do
+            [
+              %{
+                project_id: project_id,
+                worker_port: runtime_state.worker_port,
+                health_check_timeout_ms: runtime_state.health_check_timeout_ms
+              }
+            ]
+          else
+            []
+          end
+
+        _entry ->
+          []
+      end)
+
+    {:reply, targets, state}
   end
 
   def handle_call({:start_project, project_id}, _from, state) do
@@ -172,6 +248,14 @@ defmodule SymphonyElixir.ProjectProcessManager do
             {:reply, {:error, reason}, next_state}
         end
     end
+  end
+
+  def handle_call({:record_health_success, project_id, observed_at}, _from, state) do
+    {:reply, :ok, update_health_runtime(state, project_id, &health_success_state(&1, observed_at))}
+  end
+
+  def handle_call({:record_health_failure, project_id, observed_at, error}, _from, state) do
+    {:reply, :ok, update_health_runtime(state, project_id, &health_failure_state(&1, observed_at, error))}
   end
 
   @impl true
@@ -389,13 +473,16 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   defp runtime_exit_state(runtime_state, exit_status) do
+    runtime_state = hydrate_runtime_state(runtime_state)
+
     base =
       runtime_state
       |> Map.merge(%{
         pid: nil,
         exit_code: exit_status,
         started_at: nil,
-        exit_reason: exit_reason(exit_status)
+        exit_reason: exit_reason(exit_status),
+        health_status: :unknown
       })
 
     case runtime_state.status do
@@ -445,14 +532,13 @@ defmodule SymphonyElixir.ProjectProcessManager do
         nil -> default_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
         state -> state
       end
+      |> hydrate_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
 
     base = Map.put(runtime_state, :worker_port, entry.normalized_config && entry.normalized_config.worker_port)
 
-    case projected_status(entry, base) do
-      :config_invalid -> %{base | status: :config_invalid}
-      :disabled -> %{base | status: :disabled}
-      status -> %{base | status: status}
-    end
+    base
+    |> Map.put(:status, projected_status(entry, base))
+    |> project_health_status()
   end
 
   defp reconcile_project_runtime(runtime_state, %Entry{} = entry) do
@@ -493,6 +579,11 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   defp projected_status(_entry, runtime_state), do: runtime_state.status
+
+  defp project_health_status(%{status: :running, health_status: :unreachable} = runtime_state),
+    do: %{runtime_state | status: :unreachable}
+
+  defp project_health_status(runtime_state), do: runtime_state
 
   defp refresh_runtime_truth(runtime_map, %ProjectRegistry{entries: entries}) do
     Enum.reduce(entries, runtime_map, fn
@@ -571,6 +662,8 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   defp persist_runtime(runtime_state, runtime_dir) do
+    runtime_state = hydrate_runtime_state(runtime_state)
+
     File.mkdir_p!(runtime_dir)
     runtime_path = Path.join(runtime_dir, @runtime_filename)
     pid_path = Path.join(runtime_dir, @pid_filename)
@@ -584,7 +677,12 @@ defmodule SymphonyElixir.ProjectProcessManager do
       exit_reason: runtime_state.exit_reason,
       stdout_path: runtime_state.stdout_path,
       stderr_path: runtime_state.stderr_path,
-      error_summary: runtime_state.error_summary
+      error_summary: runtime_state.error_summary,
+      health_status: to_string(runtime_state.health_status),
+      last_seen_at: format_datetime(runtime_state.last_seen_at),
+      last_health_check_at: format_datetime(runtime_state.last_health_check_at),
+      last_error: runtime_state.last_error,
+      health_check_timeout_ms: runtime_state.health_check_timeout_ms
     }
 
     File.write!(runtime_path, Jason.encode!(payload))
@@ -608,7 +706,15 @@ defmodule SymphonyElixir.ProjectProcessManager do
       exit_reason: loaded_runtime_value(runtime_state, :exit_reason),
       stdout_path: loaded_runtime_value(runtime_state, :stdout_path),
       stderr_path: loaded_runtime_value(runtime_state, :stderr_path),
-      error_summary: loaded_runtime_value(runtime_state, :error_summary)
+      error_summary: loaded_runtime_value(runtime_state, :error_summary),
+      health_status: runtime_state |> loaded_runtime_value(:health_status) |> normalize_health_status(),
+      last_seen_at: runtime_state |> loaded_runtime_value(:last_seen_at) |> parse_datetime(),
+      last_health_check_at: runtime_state |> loaded_runtime_value(:last_health_check_at) |> parse_datetime(),
+      last_error: loaded_runtime_value(runtime_state, :last_error),
+      health_check_timeout_ms:
+        runtime_state
+        |> loaded_runtime_value(:health_check_timeout_ms)
+        |> normalize_health_check_timeout_ms()
     }
   end
 
@@ -626,8 +732,19 @@ defmodule SymphonyElixir.ProjectProcessManager do
       exit_reason: nil,
       stdout_path: nil,
       stderr_path: nil,
-      error_summary: nil
+      error_summary: nil,
+      health_status: :unknown,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil,
+      health_check_timeout_ms: current_health_check_timeout_ms()
     }
+  end
+
+  defp hydrate_runtime_state(runtime_state, worker_port \\ nil) do
+    default_runtime_state(worker_port || Map.get(runtime_state, :worker_port))
+    |> Map.merge(runtime_state)
+    |> Map.update!(:health_check_timeout_ms, &normalize_health_check_timeout_ms/1)
   end
 
   defp project_runtime_dir(%Entry{normalized_config: %{logs_root: logs_root}}), do: Path.join(logs_root, "control-plane")
@@ -754,6 +871,90 @@ defmodule SymphonyElixir.ProjectProcessManager do
   defp normalize_status("disabled"), do: :disabled
   defp normalize_status("config_invalid"), do: :config_invalid
   defp normalize_status(value) when is_binary(value), do: :not_started
+
+  defp normalize_health_status(value) when is_atom(value), do: value
+  defp normalize_health_status("healthy"), do: :healthy
+  defp normalize_health_status("degraded"), do: :degraded
+  defp normalize_health_status("unreachable"), do: :unreachable
+  defp normalize_health_status("unknown"), do: :unknown
+  defp normalize_health_status(_value), do: :unknown
+
+  defp normalize_health_check_timeout_ms(value) when is_integer(value) and value > 0, do: value
+  defp normalize_health_check_timeout_ms(_value), do: current_health_check_timeout_ms()
+
+  defp current_health_check_timeout_ms do
+    Config.settings!().control_plane.health_check_timeout_ms
+  end
+
+  defp update_health_runtime(state, project_id, updater) do
+    registry = project_static_registry()
+
+    case find_entry(registry, project_id) do
+      {:error, _reason} ->
+        state
+
+      {:ok, entry} ->
+        runtime_state =
+          Map.get(
+            state.runtimes,
+            project_id,
+            default_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
+          )
+          |> hydrate_runtime_state(entry.normalized_config && entry.normalized_config.worker_port)
+
+        next_runtime =
+          runtime_state
+          |> updater.()
+          |> persist_runtime(project_runtime_dir(entry))
+
+        %{state | runtimes: Map.put(state.runtimes, project_id, next_runtime)}
+    end
+  end
+
+  defp health_success_state(runtime_state, observed_at) do
+    case runtime_state.status do
+      :running ->
+        runtime_state
+        |> Map.merge(%{
+          health_status: :healthy,
+          last_seen_at: observed_at,
+          last_health_check_at: observed_at,
+          last_error: nil
+        })
+
+      _other ->
+        %{runtime_state | last_health_check_at: observed_at}
+    end
+  end
+
+  defp health_failure_state(runtime_state, observed_at, error) do
+    next_runtime =
+      runtime_state
+      |> Map.merge(%{
+        last_health_check_at: observed_at,
+        last_error: error
+      })
+
+    case runtime_state.status do
+      :running ->
+        reference_time = runtime_state.last_seen_at || runtime_state.started_at
+
+        if timed_out?(reference_time, observed_at, runtime_state.health_check_timeout_ms) do
+          %{next_runtime | health_status: :unreachable}
+        else
+          %{next_runtime | health_status: :degraded}
+        end
+
+      _other ->
+        next_runtime
+    end
+  end
+
+  defp timed_out?(nil, _observed_at, _timeout_ms), do: true
+
+  defp timed_out?(%DateTime{} = reference_time, %DateTime{} = observed_at, timeout_ms) do
+    DateTime.diff(observed_at, reference_time, :millisecond) >= timeout_ms
+  end
 
   defp exit_reason(0), do: "worker exited with status 0"
   defp exit_reason(status), do: "worker exited with status #{status}"

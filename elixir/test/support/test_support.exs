@@ -110,6 +110,7 @@ defmodule SymphonyElixir.TestSupport do
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          control_plane: nil,
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
@@ -147,6 +148,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
+    control_plane = Keyword.get(config, :control_plane)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
@@ -187,6 +189,7 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
+        control_plane_yaml(control_plane),
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
@@ -246,6 +249,20 @@ defmodule SymphonyElixir.TestSupport do
       hook_entry("before_remove", hook_before_remove)
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp control_plane_yaml(nil), do: nil
+
+  defp control_plane_yaml(control_plane) when is_map(control_plane) do
+    [
+      "control_plane:",
+      Map.has_key?(control_plane, :health_poll_interval_ms) &&
+        "  health_poll_interval_ms: #{yaml_value(Map.get(control_plane, :health_poll_interval_ms))}",
+      Map.has_key?(control_plane, :health_check_timeout_ms) &&
+        "  health_check_timeout_ms: #{yaml_value(Map.get(control_plane, :health_check_timeout_ms))}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

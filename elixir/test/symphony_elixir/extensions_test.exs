@@ -565,6 +565,77 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert render(view) =~ "running"
   end
 
+  test "projects api projects unreachable when running worker times out and recovers after health resumes" do
+    test_root = temp_root!("projects-api-unreachable")
+    manager_name = Module.concat(__MODULE__, ProjectsApiUnreachableManager)
+    port = reserve_tcp_port!()
+    request_log = Path.join(test_root, "requests.log")
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 50}
+    )
+
+    start_supervised!(
+      {ProjectProcessManager,
+       [
+         name: manager_name,
+         command_builder: fake_worker_builder(%{"alpha" => {"hang_once", request_log}})
+       ]}
+    )
+
+    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 100})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    assert_eventually(
+      fn ->
+        fetch_project_entry!(manager_name, "alpha").runtime_state.status == :unreachable
+      end,
+      40
+    )
+
+    assert_eventually(
+      fn ->
+        payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+        detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+        [project] = payload["projects"]
+
+        project["runtime_state"]["status"] == "unreachable" and
+          detail["project"]["runtime_state"]["status"] == "unreachable"
+      end,
+      40
+    )
+
+    assert_eventually(
+      fn ->
+        fetch_project_entry!(manager_name, "alpha").runtime_state.status == :running
+      end,
+      40
+    )
+
+    assert_eventually(
+      fn ->
+        payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+        detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+        [project] = payload["projects"]
+
+        project["runtime_state"]["status"] == "running" and
+          detail["project"]["runtime_state"]["status"] == "running"
+      end,
+      40
+    )
+  end
+
   test "project summary projects config_invalid when workflow file is missing" do
     test_root = temp_root!("project-summary-config-invalid")
     manager_name = Module.concat(__MODULE__, MissingWorkflowProjectsManager)
@@ -643,7 +714,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
-    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "crash"})})
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fn _entry -> "printf boom" end})
 
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -714,6 +785,36 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "phoenix observability api exposes a lightweight health endpoint" do
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :HealthOnlyOrchestrator))
+
+    payload = json_response(get(build_conn(), "/api/v1/health"), 200)
+
+    assert payload["status"] == "ok"
+    assert payload["runtime_mode"] == "workflow"
+    assert is_binary(payload["generated_at"])
+  end
+
+  test "phoenix observability api rejects non-get health requests" do
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :HealthMethodOrchestrator))
+
+    assert json_response(post(build_conn(), "/api/v1/health", %{}), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+  end
+
+  test "phoenix observability api exposes health runtime mode in control-plane mode" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    payload = json_response(get(build_conn(), "/api/v1/health"), 200)
+
+    assert payload["status"] == "ok"
+    assert payload["runtime_mode"] == "control_plane"
+    assert is_binary(payload["generated_at"])
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -1293,10 +1394,28 @@ defmodule SymphonyElixir.ExtensionsTest do
     fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
 
     fn entry ->
-      mode = Map.get(modes, entry.project_id, "normal")
+      {mode, request_log} =
+        case Map.get(modes, entry.project_id, "normal") do
+          {mode, request_log} -> {mode, request_log}
+          mode -> {mode, nil}
+        end
 
-      "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+      base =
+        "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+
+      if is_binary(request_log) do
+        base <> " --request-log #{shell_escape(request_log)}"
+      else
+        base
+      end
     end
+  end
+
+  defp fetch_project_entry!(manager_name, project_id) do
+    registry = ProjectProcessManager.project_registry(manager_name)
+    entry = Enum.find(registry.entries, &(&1.project_id == project_id))
+    assert entry != nil
+    entry
   end
 
   defp temp_root!(label) do

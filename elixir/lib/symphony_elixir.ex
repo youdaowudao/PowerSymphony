@@ -93,6 +93,7 @@ defmodule SymphonyElixir.Application do
           [
             SymphonyElixir.ControlPlaneSnapshotServer,
             SymphonyElixir.ProjectProcessManager,
+            SymphonyElixir.WorkerHealthPoller,
             SymphonyElixir.HttpServer
           ]
     end

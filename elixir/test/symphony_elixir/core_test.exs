@@ -11,12 +11,16 @@ defmodule SymphonyElixir.CoreTest do
       codex_command: nil
     )
 
+    refute File.read!(Workflow.workflow_file_path()) =~ "\ncontrol_plane:\n"
+
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.control_plane.health_poll_interval_ms == 3_000
+    assert config.control_plane.health_check_timeout_ms == 1_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -34,8 +38,43 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_turns"
 
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_poll_interval_ms: 0})
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "control_plane.health_poll_interval_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 0})
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "control_plane.health_check_timeout_ms"
+
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_poll_interval_ms: 4_500})
+
+    assert Config.settings!().control_plane.health_poll_interval_ms == 4_500
+    assert Config.settings!().control_plane.health_check_timeout_ms == 1_000
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 1_500})
+    assert Config.settings!().control_plane.health_poll_interval_ms == 3_000
+    assert Config.settings!().control_plane.health_check_timeout_ms == 1_500
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_poll_interval_ms: "invalid"})
+
+    assert_raise ArgumentError, ~r/health_poll_interval_ms/, fn ->
+      Config.settings!().control_plane.health_poll_interval_ms
+    end
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "control_plane.health_poll_interval_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: "invalid"})
+
+    assert_raise ArgumentError, ~r/health_check_timeout_ms/, fn ->
+      Config.settings!().control_plane.health_check_timeout_ms
+    end
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "control_plane.health_check_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
