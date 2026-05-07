@@ -5,7 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixir.HttpServer
+  alias SymphonyElixir.{HttpServer, ProjectProcessManager}
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -18,10 +18,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:payload, load_payload())
       |> assign(:projects_payload, load_projects_payload())
       |> assign(:runtime_mode, runtime_mode)
+      |> assign(:project_action_feedback, nil)
       |> assign(:now, DateTime.utc_now())
 
-    if connected?(socket) and runtime_mode != :control_plane do
-      :ok = ObservabilityPubSub.subscribe()
+    if connected?(socket) do
+      if runtime_mode != :control_plane do
+        :ok = ObservabilityPubSub.subscribe()
+      end
+
       schedule_runtime_tick()
     end
 
@@ -31,6 +35,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   @impl true
   def handle_info(:runtime_tick, socket) do
     schedule_runtime_tick()
+
     {:noreply, assign(socket, :now, DateTime.utc_now())}
   end
 
@@ -40,6 +45,27 @@ defmodule SymphonyElixirWeb.DashboardLive do
      socket
      |> assign(:payload, load_payload())
      |> assign(:projects_payload, load_projects_payload())
+     |> assign(:project_action_feedback, nil)
+     |> assign(:now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("project_action", %{"project_id" => project_id, "action" => action}, socket) do
+    result = run_project_action(socket, action, project_id)
+
+    feedback =
+      case result do
+        {:ok, _runtime_state} ->
+          nil
+
+        {:error, reason} ->
+          "Project action failed: #{format_project_action_error(reason)}"
+      end
+
+    {:noreply,
+     socket
+     |> assign(:projects_payload, load_projects_payload())
+     |> assign(:project_action_feedback, feedback)
      |> assign(:now, DateTime.utc_now())}
   end
 
@@ -83,6 +109,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </div>
 
+          <%= if is_binary(@project_action_feedback) do %>
+            <p class="empty-state"><%= @project_action_feedback %></p>
+          <% end %>
+
           <%= if @projects_payload.projects == [] do %>
             <p class="empty-state">No projects registered.</p>
           <% else %>
@@ -91,9 +121,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <thead>
                   <tr>
                     <th>Project</th>
-                    <th>Validation</th>
-                    <th>Runtime</th>
-                    <th>Errors</th>
+                    <th>Enabled</th>
+                    <th>Worker status</th>
+                    <th>Worker port</th>
+                    <th>Last seen</th>
+                    <th>Last error</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -101,23 +134,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= project.project_name || project.project_id || "n/a" %></span>
+                        <span class="mono">
+                          <%= "project_id: #{blank_to_na(project.project_id)}" %>
+                          ·
+                          <%= "validation: #{blank_to_na(project.validation_result)}" %>
+                        </span>
                         <%= if is_binary(project.project_id) and project.project_id != "" do %>
                           <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
                         <% end %>
                       </div>
                     </td>
                     <td>
-                      <span class={state_badge_class(project.validation_result)}>
-                        <%= project.validation_result %>
+                      <%= format_enabled(project.enabled) %>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(project.worker_status)}>
+                        <%= project.worker_status %>
                       </span>
                     </td>
                     <td>
-                      <span class={state_badge_class(project.runtime_state.status)}>
-                        <%= project.runtime_state.status %>
-                      </span>
+                      <%= project.worker_port || "n/a" %>
+                    </td>
+                    <td class="mono">
+                      <%= blank_to_na(project.last_seen_at) %>
                     </td>
                     <td>
-                      <%= project.validation_errors |> Enum.map(&validation_error_label/1) |> Enum.join(", ") |> blank_to_na() %>
+                      <%= project_runtime_or_validation_error(project) |> blank_to_na() %>
+                    </td>
+                    <td>
+                      <div class="session-stack">
+                        <button
+                          type="button"
+                          class="subtle-button"
+                          phx-click="project_action"
+                          phx-value-project_id={project.project_id}
+                          phx-value-action="start"
+                          disabled={project_action_disabled?(project, "start")}
+                        >
+                          Start
+                        </button>
+                        <button
+                          type="button"
+                          class="subtle-button"
+                          phx-click="project_action"
+                          phx-value-project_id={project.project_id}
+                          phx-value-action="stop"
+                          disabled={project_action_disabled?(project, "stop")}
+                        >
+                          Stop
+                        </button>
+                        <button
+                          type="button"
+                          class="subtle-button"
+                          phx-click="project_action"
+                          phx-value-project_id={project.project_id}
+                          phx-value-action="restart"
+                          disabled={project_action_disabled?(project, "restart")}
+                        >
+                          Restart
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 </tbody>
@@ -168,7 +244,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Projects</h2>
-              <p class="section-copy">Static config validation with lightweight runtime summary.</p>
+              <p class="section-copy">Static config validation overview for the active workflow runtime.</p>
             </div>
           </div>
 
@@ -206,7 +282,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </span>
                     </td>
                     <td>
-                      <%= project.validation_errors |> Enum.map(&validation_error_label/1) |> Enum.join(", ") |> blank_to_na() %>
+                      <%= project.validation_errors |> Enum.map(&project_validation_error_label/1) |> Enum.join(", ") |> blank_to_na() %>
                     </td>
                   </tr>
                 </tbody>
@@ -387,6 +463,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Endpoint.config(:runtime_mode) || :workflow
   end
 
+  defp project_process_manager_name do
+    Application.get_env(
+      :symphony_elixir,
+      :project_process_manager_name,
+      SymphonyElixir.ProjectProcessManager
+    )
+  end
+
   defp completed_runtime_seconds(payload) do
     payload.codex_totals.seconds_running || 0
   end
@@ -451,13 +535,96 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
 
+  defp run_project_action(socket, _action, _project_id)
+       when socket.assigns.runtime_mode != :control_plane,
+       do: {:error, :project_actions_unavailable}
+
+  defp run_project_action(_socket, action, project_id) do
+    manager_name = project_process_manager_name()
+
+    with true <- process_manager_available?(manager_name),
+         {:ok, result} <- safe_project_action_call(manager_name, action, project_id) do
+      result
+    else
+      false ->
+        {:error, :project_manager_unavailable}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp process_manager_available?(manager_name), do: is_pid(GenServer.whereis(manager_name))
+
+  defp safe_project_action_call(manager_name, "start", project_id),
+    do: safe_project_action(fun: fn -> ProjectProcessManager.start_project(manager_name, project_id) end)
+
+  defp safe_project_action_call(manager_name, "stop", project_id),
+    do: safe_project_action(fun: fn -> ProjectProcessManager.stop_project(manager_name, project_id) end)
+
+  defp safe_project_action_call(manager_name, "restart", project_id),
+    do: safe_project_action(fun: fn -> ProjectProcessManager.restart_project(manager_name, project_id) end)
+
+  defp safe_project_action_call(_manager_name, _action, _project_id), do: {:error, :unsupported_action}
+
+  defp safe_project_action(fun: fun) do
+    {:ok, fun.()}
+  catch
+    :exit, {:noproc, _details} -> {:error, :project_manager_unavailable}
+    :exit, {:timeout, _details} -> {:error, :project_action_timeout}
+    :exit, {:normal, _details} -> {:error, :project_manager_unavailable}
+    :exit, _other -> {:error, :project_action_failed}
+  end
+
+  defp format_project_action_error(reason) when is_atom(reason) do
+    reason
+    |> Atom.to_string()
+    |> String.replace("_", " ")
+  end
+
+  defp format_project_action_error(reason), do: to_string(reason)
+
+  defp project_runtime_or_validation_error(project) do
+    project.last_error || project_validation_error_summary(project.validation_errors)
+  end
+
+  defp project_validation_error_summary(errors) when is_list(errors) do
+    errors
+    |> Enum.map(&project_validation_error_label/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(", ")
+    |> case do
+      "" -> nil
+      summary -> summary
+    end
+  end
+
+  defp project_validation_error_summary(_errors), do: nil
+
+  defp project_action_disabled?(project, action) do
+    cond do
+      project.validation_result == "invalid" -> true
+      project.worker_status == "disabled" -> true
+      project.worker_status == "config_invalid" -> true
+      project.worker_status in ["not_started", "stopped"] and action == "stop" -> true
+      project.worker_status == "running" and action == "start" -> true
+      project.worker_status == "unreachable" and action == "start" -> true
+      true -> false
+    end
+  end
+
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
 
-  defp validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
-  defp validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
-  defp validation_error_label(_error), do: "invalid"
+  defp project_validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
+  defp project_validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
+  defp project_validation_error_label(_error), do: "invalid"
+
+  defp format_enabled(true), do: "true"
+  defp format_enabled(false), do: "false"
+  defp format_enabled(value), do: blank_to_na(value)
 
   defp blank_to_na(""), do: "n/a"
+  defp blank_to_na(nil), do: "n/a"
   defp blank_to_na(value), do: value
 end

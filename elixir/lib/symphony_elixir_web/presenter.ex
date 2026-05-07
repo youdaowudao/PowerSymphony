@@ -149,7 +149,7 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_port: project_worker_port(entry, runtime_state),
       last_seen_at: project_runtime_timestamp(runtime_state, :last_seen_at),
       last_health_check_at: project_runtime_timestamp(runtime_state, :last_health_check_at),
-      last_error: project_last_error(entry, runtime_state),
+      last_error: project_last_error(runtime_state),
       runtime_state: project_runtime_payload(runtime_state)
     }
   end
@@ -174,7 +174,7 @@ defmodule SymphonyElixirWeb.Presenter do
       normalized_config_value(entry, :worker_port)
   end
 
-  defp project_last_error(_entry, runtime_state) do
+  defp project_last_error(runtime_state) do
     runtime_state_value(runtime_state, :last_error) ||
       runtime_state_value(runtime_state, :error_summary)
   end
