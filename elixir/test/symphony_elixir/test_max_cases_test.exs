@@ -1,37 +1,40 @@
 defmodule SymphonyElixir.TestMaxCasesTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.TestMaxCases
+  alias SymphonyElixir.TestSupport
 
   test "未设置环境变量时不覆盖 ExUnit 默认并发" do
-    assert TestMaxCases.ex_unit_options(nil) == []
+    assert TestSupport.ex_unit_options(%{}) == []
   end
 
-  test "设置正整数时生成 max_cases 选项" do
-    assert TestMaxCases.ex_unit_options("2") == [max_cases: 2]
-    assert TestMaxCases.ex_unit_options(" 3 ") == [max_cases: 3]
+  test "设置 SYMPHONY_TEST_MAX_CASES 时生成 max_cases 选项" do
+    assert TestSupport.ex_unit_options(%{"SYMPHONY_TEST_MAX_CASES" => "2"}) == [max_cases: 2]
   end
 
-  test "从环境变量读取 max_cases" do
-    previous = System.get_env("SYMPHONY_TEST_MAX_CASES")
-    on_exit(fn -> SymphonyElixir.TestSupport.restore_env("SYMPHONY_TEST_MAX_CASES", previous) end)
+  test "未设置 SYMPHONY_TEST_MAX_CASES 时回退到 MIX_TEST_MAX_CASES" do
+    assert TestSupport.ex_unit_options(%{"MIX_TEST_MAX_CASES" => "3"}) == [max_cases: 3]
+  end
 
-    System.put_env("SYMPHONY_TEST_MAX_CASES", "2")
+  test "默认从系统环境读取并优先使用 SYMPHONY_TEST_MAX_CASES" do
+    previous_symphony = System.get_env("SYMPHONY_TEST_MAX_CASES")
+    previous_mix = System.get_env("MIX_TEST_MAX_CASES")
 
-    assert TestMaxCases.ex_unit_options_from_env() == [max_cases: 2]
+    on_exit(fn ->
+      SymphonyElixir.TestSupport.restore_env("SYMPHONY_TEST_MAX_CASES", previous_symphony)
+      SymphonyElixir.TestSupport.restore_env("MIX_TEST_MAX_CASES", previous_mix)
+    end)
+
+    System.put_env("SYMPHONY_TEST_MAX_CASES", "4")
+    System.put_env("MIX_TEST_MAX_CASES", "2")
+
+    assert TestSupport.ex_unit_options() == [max_cases: 4]
   end
 
   test "非法值时报清晰错误" do
-    assert_raise ArgumentError, ~r/SYMPHONY_TEST_MAX_CASES must be a positive integer/, fn ->
-      TestMaxCases.ex_unit_options("0")
-    end
-
-    assert_raise ArgumentError, ~r/SYMPHONY_TEST_MAX_CASES must be a positive integer/, fn ->
-      TestMaxCases.ex_unit_options("abc")
-    end
-
-    assert_raise ArgumentError, ~r/SYMPHONY_TEST_MAX_CASES must be a positive integer/, fn ->
-      TestMaxCases.ex_unit_options(" ")
+    for value <- ["0", "-1", "abc", " 3 ", " "] do
+      assert_raise ArgumentError, ~r/test max cases must be a positive integer, got:/, fn ->
+        TestSupport.ex_unit_options(%{"SYMPHONY_TEST_MAX_CASES" => value})
+      end
     end
   end
 end

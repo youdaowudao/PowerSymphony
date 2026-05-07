@@ -562,15 +562,17 @@ defmodule SymphonyElixir.CoreTest do
        }}
     )
 
+    down_triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_at_ms = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 100, 1_100)
+    assert_due_from_trigger_window(due_at_ms, down_triggered_at_ms, observed_at_ms, 1_000)
   end
 
   test "normal worker exit without continuation run result does not schedule active-state continuation retry" do
@@ -698,9 +700,11 @@ defmodule SymphonyElixir.CoreTest do
        }}
     )
 
+    down_triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_at_ms = System.monotonic_time(:millisecond)
 
     issue = %Issue{
       id: issue_id,
@@ -716,7 +720,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 100, 1_100)
+    assert_due_from_trigger_window(due_at_ms, down_triggered_at_ms, observed_at_ms, 1_000)
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
@@ -1076,6 +1080,18 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp assert_due_from_trigger_window(
+         due_at_ms,
+         trigger_at_ms,
+         observed_at_ms,
+         expected_delay_ms
+       ) do
+    scheduled_at_ms = due_at_ms - expected_delay_ms
+
+    assert scheduled_at_ms >= trigger_at_ms
+    assert scheduled_at_ms <= observed_at_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

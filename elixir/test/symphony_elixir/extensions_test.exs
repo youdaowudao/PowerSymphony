@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.ProjectProcessManager
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -113,6 +114,24 @@ defmodule SymphonyElixir.ExtensionsTest do
         Application.delete_env(:symphony_elixir, :project_config_path_override)
       else
         Application.put_env(:symphony_elixir, :project_config_path_override, project_config_path)
+      end
+    end)
+
+    :ok
+  end
+
+  setup do
+    project_process_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      if is_nil(project_process_manager_name) do
+        Application.delete_env(:symphony_elixir, :project_process_manager_name)
+      else
+        Application.put_env(
+          :symphony_elixir,
+          :project_process_manager_name,
+          project_process_manager_name
+        )
       end
     end)
 
@@ -485,6 +504,179 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert json_response(get(build_conn(), "/api/v1/projects/missing/summary"), 404) == %{
              "error" => %{"code" => "project_not_found", "message" => "Project not found"}
+           }
+  end
+
+  test "projects api reads dynamic runtime state from project process manager" do
+    test_root = temp_root!("projects-api-dynamic-runtime")
+    manager_name = Module.concat(__MODULE__, DynamicProjectsManager)
+    port = reserve_tcp_port!()
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+
+    assert [
+             %{
+               "project_id" => "alpha",
+               "runtime_state" => %{
+                 "status" => "not_started",
+                 "pid" => nil,
+                 "worker_port" => ^port,
+                 "started_at" => nil,
+                 "exit_code" => nil,
+                 "exit_reason" => nil,
+                 "stdout_path" => nil,
+                 "stderr_path" => nil,
+                 "error_summary" => nil
+               }
+             }
+           ] = payload["projects"]
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert running_state.status == :running
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    [project] = payload["projects"]
+    assert project["runtime_state"]["status"] == "running"
+    assert project["runtime_state"]["pid"] == running_state.pid
+    assert project["runtime_state"]["worker_port"] == port
+    assert is_binary(project["runtime_state"]["started_at"])
+    assert project["runtime_state"]["stdout_path"] == running_state.stdout_path
+    assert project["runtime_state"]["stderr_path"] == running_state.stderr_path
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    assert detail["project"]["runtime_state"]["status"] == "running"
+    assert detail["project"]["runtime_state"]["pid"] == running_state.pid
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+    assert html =~ "running"
+    assert render(view) =~ "running"
+  end
+
+  test "project summary projects config_invalid when workflow file is missing" do
+    test_root = temp_root!("project-summary-config-invalid")
+    manager_name = Module.concat(__MODULE__, MissingWorkflowProjectsManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [project_fixture(test_root, "alpha", port, workflow?: false)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    assert detail["project"]["project_id"] == "alpha"
+    assert detail["project"]["validation_result"] == "valid"
+    assert detail["project"]["runtime_state"]["status"] == "config_invalid"
+    assert detail["project"]["runtime_state"]["worker_port"] == port
+  end
+
+  test "project control api starts stops and restarts a fake worker" do
+    test_root = temp_root!("project-control-api")
+    manager_name = Module.concat(__MODULE__, ProjectControlApiManager)
+    port = reserve_tcp_port!()
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert json_response(post(build_conn(), "/api/v1/projects/missing/start", %{}), 404) == %{
+             "error" => %{"code" => "project_not_found", "message" => "Project not found"}
+           }
+
+    start_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 202)
+    assert start_payload["project"]["runtime_state"]["status"] == "running"
+    first_pid = start_payload["project"]["runtime_state"]["pid"]
+    assert is_integer(first_pid)
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 409) == %{
+             "error" => %{"code" => "already_running", "message" => "Project action is not allowed"}
+           }
+
+    stop_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/stop", %{}), 202)
+    assert stop_payload["project"]["runtime_state"]["status"] == "stopped"
+    assert stop_payload["project"]["runtime_state"]["pid"] == nil
+    assert stop_payload["project"]["runtime_state"]["exit_code"] == 0
+    assert stop_payload["project"]["runtime_state"]["exit_reason"] == "stopped"
+
+    restart_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/restart", %{}), 202)
+    assert restart_payload["project"]["runtime_state"]["status"] == "running"
+    assert is_integer(restart_payload["project"]["runtime_state"]["pid"])
+    refute restart_payload["project"]["runtime_state"]["pid"] == first_pid
+  end
+
+  test "project control api returns 409 when manager reports start_failed" do
+    test_root = temp_root!("project-control-start-failed")
+    manager_name = Module.concat(__MODULE__, ProjectControlStartFailedManager)
+    port = reserve_tcp_port!()
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "crash"})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 409) == %{
+             "error" => %{"code" => "start_failed", "message" => "Project action is not allowed"}
+           }
+  end
+
+  test "project control api is not available in workflow mode" do
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :WorkflowOnlyControlApiOrchestrator))
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 404) == %{
+             "error" => %{
+               "code" => "not_available_in_control_plane",
+               "message" => "Route not available in control-plane mode"
+             }
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/stop", %{}), 404) == %{
+             "error" => %{
+               "code" => "not_available_in_control_plane",
+               "message" => "Route not available in control-plane mode"
+             }
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/restart", %{}), 404) == %{
+             "error" => %{
+               "code" => "not_available_in_control_plane",
+               "message" => "Route not available in control-plane mode"
+             }
            }
   end
 
@@ -1095,6 +1287,91 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp fake_worker_builder(modes) do
+    fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
+
+    fn entry ->
+      mode = Map.get(modes, entry.project_id, "normal")
+
+      "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+    end
+  end
+
+  defp temp_root!(label) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-extensions-#{label}-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    root
+  end
+
+  defp project_fixture(test_root, project_id, worker_port, opts \\ []) do
+    project_root = Path.join(test_root, project_id)
+    workspace_root = Path.join(project_root, "workspace")
+    logs_root = Path.join(project_root, "logs")
+    workflow_path = Path.join(project_root, "generated/WORKFLOW.md")
+
+    File.mkdir_p!(workspace_root)
+    File.mkdir_p!(logs_root)
+
+    if Keyword.get(opts, :workflow?, true) do
+      File.mkdir_p!(Path.dirname(workflow_path))
+      write_workflow_file!(workflow_path)
+    end
+
+    %{
+      id: project_id,
+      name: String.capitalize(project_id),
+      workflow_generated: workflow_path,
+      workspace_root: workspace_root,
+      logs_root: logs_root,
+      enabled: Keyword.get(opts, :enabled, true),
+      worker_port: worker_port
+    }
+  end
+
+  defp write_projects_config!(test_root, projects) do
+    config_path = Path.join(test_root, "symphony.projects.yaml")
+
+    body =
+      [
+        "projects:",
+        Enum.map_join(projects, "\n", &project_yaml/1)
+      ]
+      |> Enum.join("\n")
+      |> Kernel.<>("\n")
+
+    File.write!(config_path, body)
+    config_path
+  end
+
+  defp project_yaml(project) do
+    """
+      - id: "#{project.id}"
+        name: "#{project.name}"
+        workflow_generated: "#{project.workflow_generated}"
+        workspace_root: "#{project.workspace_root}"
+        logs_root: "#{project.logs_root}"
+        enabled: #{if(project.enabled, do: "true", else: "false")}
+        worker_port: #{project.worker_port}
+    """
+  end
+
+  defp reserve_tcp_port! do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp shell_escape(value) do
+    escaped = value |> to_string() |> String.replace("'", "'\"'\"'")
+    "'#{escaped}'"
   end
 
   defp assert_eventually(fun, attempts \\ 20)

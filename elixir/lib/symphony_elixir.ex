@@ -96,6 +96,7 @@ defmodule SymphonyElixir.Application do
         base_children ++
           [
             SymphonyElixir.ControlPlaneSnapshotServer,
+            SymphonyElixir.ProjectProcessManager,
             SymphonyElixir.HttpServer
           ]
     end

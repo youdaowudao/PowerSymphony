@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.HttpServer
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -379,7 +380,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp project_registry do
-    Endpoint.config(:project_registry) || %SymphonyElixir.ProjectRegistry{entries: []}
+    HttpServer.project_registry()
   end
 
   defp runtime_mode do

@@ -86,9 +86,19 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
-The standalone `../bin/symphony_control` entrypoint only reads `symphony.projects.yaml` plus the
-static `ProjectRegistry` snapshot. It does not require a valid `WORKFLOW.md`, does not start the
-worker orchestrator, and only exposes the lightweight project list dashboard/API.
+The standalone `../bin/symphony_control` entrypoint reads `symphony.projects.yaml` and builds a
+control-plane-only `ProjectProcessManager` runtime source of truth per project. It does not require
+a valid repo-root `WORKFLOW.md`, does not start the main orchestrator, and exposes the lightweight
+project dashboard/API plus `start` / `stop` / `restart` control actions for each configured
+project.
+
+Each static project entry now also accepts:
+
+- `enabled` to disable a project without deleting its config entry (default: `true`)
+- `worker_port` to reserve the worker's HTTP port (default: `4101 + project index`)
+
+The control plane records minimal per-project runtime state such as pid, started time, exit status,
+and stdout/stderr log paths. It intentionally does not perform health polling yet.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -183,6 +193,8 @@ Choose the validation command based on the current `git diff`.
 
 - Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a test run.
 - Localized code changes should use targeted validation first.
+- Current repo-level coverage gate is `99%`.
+- Current time-sensitive test baseline is `8000ms`.
 - For ordinary local milestone checks or pre-PR self-checks, prefer:
 
 ```bash
@@ -197,7 +209,7 @@ cd elixir
 SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all
 ```
 
-- GitHub Actions remains the authoritative full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
+- GitHub Actions remains the authoritative remote full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
 
 Run the real external end-to-end test only when you want Symphony to create disposable Linear
 resources and launch a real `codex app-server` session:

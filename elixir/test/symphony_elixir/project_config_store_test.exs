@@ -17,6 +17,8 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert first == %ProjectConfig{
              id: "chatgpt-extension",
              name: "ChatGPT Extension",
+             enabled: true,
+             worker_port: 4101,
              workflow_generated: "/home/user/code/chatgpt-extension/WORKFLOW.generated.md",
              workspace_root: "/home/user/.symphony/workspaces/chatgpt-extension",
              logs_root: "/home/user/.symphony/logs/chatgpt-extension"
@@ -25,10 +27,53 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert second == %ProjectConfig{
              id: "docs-site",
              name: "Docs Site",
+             enabled: true,
+             worker_port: 4102,
              workflow_generated: "/home/user/code/docs-site/WORKFLOW.generated.md",
              workspace_root: "/home/user/.symphony/workspaces/docs-site",
              logs_root: "/home/user/.symphony/logs/docs-site"
            }
+  end
+
+  test "applies enabled and worker_port defaults by project index" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+      - id: beta
+        name: Beta
+        workflow_generated: /tmp/beta/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/beta
+        logs_root: /tmp/logs/beta
+    """
+
+    assert {:ok, [first, second]} = ProjectConfigStore.parse_string(yaml)
+
+    assert first.enabled == true
+    assert first.worker_port == 4101
+    assert second.enabled == true
+    assert second.worker_port == 4102
+  end
+
+  test "preserves explicit enabled and worker_port values" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        enabled: false
+        worker_port: 0
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:ok, [project]} = ProjectConfigStore.parse_string(yaml)
+
+    assert project.enabled == false
+    assert project.worker_port == 0
   end
 
   test "reports yaml parse errors with a stable structured error" do
@@ -220,6 +265,8 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
                normalized_config: %ProjectConfig{
                  id: "alpha",
                  name: "Alpha",
+                 enabled: true,
+                 worker_port: 4101,
                  workflow_generated: "/tmp/alpha/WORKFLOW.generated.md",
                  workspace_root: "/tmp/workspaces/alpha",
                  logs_root: "/tmp/logs/alpha"
@@ -258,6 +305,59 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
 
     assert_error(errors, :invalid_field, 0, "alpha", "workflow_generated")
+  end
+
+  test "reports invalid enabled types" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        enabled: nope
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+
+    assert_error(errors, :invalid_field, 0, "alpha", "enabled")
+  end
+
+  test "reports invalid worker_port values" do
+    invalid_projects = [
+      {"wrong type", "worker_port: nope", :invalid_field},
+      {"negative", "worker_port: -1", :invalid_field}
+    ]
+
+    Enum.each(invalid_projects, fn {_label, worker_port_line, error_type} ->
+      yaml = """
+      projects:
+        - id: alpha
+          name: Alpha
+          #{worker_port_line}
+          workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+          workspace_root: /tmp/workspaces/alpha
+          logs_root: /tmp/logs/alpha
+      """
+
+      assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+      assert_error(errors, error_type, 0, "alpha", "worker_port")
+    end)
+  end
+
+  test "accepts explicit worker_port 4000 as a valid non-negative integer" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        worker_port: 4000
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:ok, [project]} = ProjectConfigStore.parse_string(yaml)
+    assert project.worker_port == 4000
   end
 
   test "reports unsafe path traversal attempts" do
@@ -375,6 +475,8 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
+        enabled: true
+        worker_port: 4201
         unexpected: true
     """
 
@@ -487,6 +589,8 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert {:ok, [project]} = ProjectConfigStore.load(config_path)
     assert project.id == "alpha"
     assert project.name == "Alpha"
+    assert project.enabled == true
+    assert project.worker_port == 4101
   end
 
   defp assert_error(errors, type, project_index, project_id, field) do

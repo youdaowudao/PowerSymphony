@@ -10,6 +10,8 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     projects:
       - id: alpha
         name: Alpha
+        enabled: false
+        worker_port: 4201
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
@@ -29,7 +31,11 @@ defmodule SymphonyElixir.ProjectRegistryTest do
                validation_result: :valid,
                validation_errors: [],
                runtime_state: %{status: :not_started},
-               normalized_config: %ProjectConfig{id: "alpha"}
+               normalized_config: %ProjectConfig{
+                 id: "alpha",
+                 enabled: false,
+                 worker_port: 4201
+               }
              },
              %{
                project_id: "Beta",
@@ -52,6 +58,40 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     assert second.validation_result == :valid
     assert first.runtime_state == %{status: :not_started}
     assert second.runtime_state == %{status: :not_started}
+    assert first.normalized_config.enabled == true
+    assert first.normalized_config.worker_port == 4101
+    assert second.normalized_config.enabled == true
+    assert second.normalized_config.worker_port == 4102
+  end
+
+  test "explicit worker_port zero remains valid and keeps runtime_state not_started" do
+    yaml = """
+    projects:
+      - id: alpha
+        name: Alpha
+        enabled: true
+        worker_port: 0
+        workflow_generated: /tmp/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:ok, registry} = ProjectRegistry.build(yaml)
+
+    assert [
+             %{
+               project_id: "alpha",
+               project_name: "Alpha",
+               normalized_config: %ProjectConfig{
+                 id: "alpha",
+                 enabled: true,
+                 worker_port: 0
+               },
+               validation_result: :valid,
+               validation_errors: [],
+               runtime_state: %{status: :not_started}
+             }
+           ] = ProjectRegistry.entries(registry)
   end
 
   test "loader resolves override path when provided" do
