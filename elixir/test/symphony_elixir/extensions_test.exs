@@ -471,6 +471,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           %{
             project_id: "alpha",
             project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
             validation_result: :valid,
             validation_errors: [],
             runtime_state: %{status: :not_started}
@@ -481,6 +482,23 @@ defmodule SymphonyElixir.ExtensionsTest do
             validation_result: :invalid,
             validation_errors: [%{field: "id", message: "id must match ..."}],
             runtime_state: %{status: :not_started}
+          },
+          %{
+            project_id: "gamma",
+            project_name: "Gamma",
+            normalized_config: %{enabled: true, worker_port: 4202},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, worker_port: 5202}
+          },
+          %{
+            project_id: "delta",
+            project_name: "Delta",
+            normalized_config: %{enabled: true, worker_port: 4303},
+            validation_result: :valid,
+            validation_errors: [],
+            error_summary: "heavy entry error should not leak",
+            runtime_state: %{status: :not_started}
           }
         ]
       },
@@ -488,11 +506,74 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
-    assert Enum.map(payload["projects"], & &1["project_id"]) == ["alpha", "Beta"]
+    assert Enum.map(payload["projects"], & &1["project_id"]) == ["alpha", "Beta", "gamma", "delta"]
+
+    assert_project_summary_shape(Enum.at(payload["projects"], 0),
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: 4101,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert_project_summary_shape(Enum.at(payload["projects"], 1),
+      project_id: "Beta",
+      project_name: "Beta",
+      enabled: true,
+      validation_result: "invalid",
+      validation_errors: [%{"field" => "id", "message" => "id must match ..."}],
+      worker_status: "not_started",
+      worker_port: nil,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert_project_summary_shape(Enum.at(payload["projects"], 2),
+      project_id: "gamma",
+      project_name: "Gamma",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "running",
+      worker_port: 5202,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert_project_summary_shape(Enum.at(payload["projects"], 3),
+      project_id: "delta",
+      project_name: "Delta",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: 4303,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
-    assert detail["project"]["runtime_state"]["status"] == "not_started"
-    assert detail["project"]["validation_result"] == "valid"
+
+    assert_project_summary_shape(detail["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: 4101,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     assert json_response(post(build_conn(), "/api/v1/projects", %{}), 405) == %{
              "error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}
@@ -526,38 +607,54 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
 
-    assert [
-             %{
-               "project_id" => "alpha",
-               "runtime_state" => %{
-                 "status" => "not_started",
-                 "pid" => nil,
-                 "worker_port" => ^port,
-                 "started_at" => nil,
-                 "exit_code" => nil,
-                 "exit_reason" => nil,
-                 "stdout_path" => nil,
-                 "stderr_path" => nil,
-                 "error_summary" => nil
-               }
-             }
-           ] = payload["projects"]
+    assert [project] = payload["projects"]
+
+    assert_project_summary_shape(project,
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
     assert running_state.status == :running
 
     payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
     [project] = payload["projects"]
-    assert project["runtime_state"]["status"] == "running"
-    assert project["runtime_state"]["pid"] == running_state.pid
-    assert project["runtime_state"]["worker_port"] == port
-    assert is_binary(project["runtime_state"]["started_at"])
-    assert project["runtime_state"]["stdout_path"] == running_state.stdout_path
-    assert project["runtime_state"]["stderr_path"] == running_state.stderr_path
+
+    assert_project_summary_shape(project,
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "running",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
-    assert detail["project"]["runtime_state"]["status"] == "running"
-    assert detail["project"]["runtime_state"]["pid"] == running_state.pid
+
+    assert_project_summary_shape(detail["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "running",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Alpha"
@@ -604,16 +701,30 @@ defmodule SymphonyElixir.ExtensionsTest do
       40
     )
 
+    saw_unreachable_api_key = {:saw_project_api_state, manager_name, :unreachable}
+    Process.put(saw_unreachable_api_key, false)
+
     assert_eventually(
       fn ->
         payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
         detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
         [project] = payload["projects"]
 
-        project["runtime_state"]["status"] == "unreachable" and
-          detail["project"]["runtime_state"]["status"] == "unreachable"
+        saw_unreachable_api? =
+          project["worker_status"] == "unreachable" and
+            detail["project"]["worker_status"] == "unreachable" and
+            iso8601_timestamp?(project["last_health_check_at"]) and
+            iso8601_timestamp?(detail["project"]["last_health_check_at"]) and
+            is_binary(project["last_error"]) and
+            is_binary(detail["project"]["last_error"])
+
+        if saw_unreachable_api? do
+          Process.put(saw_unreachable_api_key, true)
+        end
+
+        Process.get(saw_unreachable_api_key)
       end,
-      40
+      120
     )
 
     assert_eventually(
@@ -623,16 +734,32 @@ defmodule SymphonyElixir.ExtensionsTest do
       40
     )
 
+    saw_running_api_key = {:saw_project_api_state, manager_name, :running}
+    Process.put(saw_running_api_key, false)
+
     assert_eventually(
       fn ->
         payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
         detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
         [project] = payload["projects"]
 
-        project["runtime_state"]["status"] == "running" and
-          detail["project"]["runtime_state"]["status"] == "running"
+        saw_running_api? =
+          project["worker_status"] == "running" and
+            detail["project"]["worker_status"] == "running" and
+            iso8601_timestamp?(project["last_seen_at"]) and
+            iso8601_timestamp?(detail["project"]["last_seen_at"]) and
+            iso8601_timestamp?(project["last_health_check_at"]) and
+            iso8601_timestamp?(detail["project"]["last_health_check_at"]) and
+            is_nil(project["last_error"]) and
+            is_nil(detail["project"]["last_error"])
+
+        if saw_running_api? do
+          Process.put(saw_running_api_key, true)
+        end
+
+        Process.get(saw_running_api_key)
       end,
-      40
+      120
     )
   end
 
@@ -656,17 +783,32 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
-    assert detail["project"]["project_id"] == "alpha"
-    assert detail["project"]["validation_result"] == "valid"
-    assert detail["project"]["runtime_state"]["status"] == "config_invalid"
-    assert detail["project"]["runtime_state"]["worker_port"] == port
+
+    assert_project_summary_shape(detail["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "config_invalid",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
   end
 
   test "project control api starts stops and restarts a fake worker" do
     test_root = temp_root!("project-control-api")
     manager_name = Module.concat(__MODULE__, ProjectControlApiManager)
-    port = reserve_tcp_port!()
-    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port, enabled: false)
+      ])
 
     on_exit(fn -> File.rm_rf!(test_root) end)
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
@@ -684,24 +826,72 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
 
     start_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 202)
-    assert start_payload["project"]["runtime_state"]["status"] == "running"
-    first_pid = start_payload["project"]["runtime_state"]["pid"]
-    assert is_integer(first_pid)
+
+    assert_project_summary_shape(start_payload["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "running",
+      worker_port: alpha_port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    beta_detail = json_response(get(build_conn(), "/api/v1/projects/beta/summary"), 200)
+
+    assert_project_summary_shape(beta_detail["project"],
+      project_id: "beta",
+      project_name: "Beta",
+      enabled: false,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "disabled",
+      worker_port: beta_port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert json_response(post(build_conn(), "/api/v1/projects/beta/start", %{}), 409) == %{
+             "error" => %{"code" => "disabled", "message" => "Project action is not allowed"}
+           }
 
     assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 409) == %{
              "error" => %{"code" => "already_running", "message" => "Project action is not allowed"}
            }
 
     stop_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/stop", %{}), 202)
-    assert stop_payload["project"]["runtime_state"]["status"] == "stopped"
-    assert stop_payload["project"]["runtime_state"]["pid"] == nil
-    assert stop_payload["project"]["runtime_state"]["exit_code"] == 0
-    assert stop_payload["project"]["runtime_state"]["exit_reason"] == "stopped"
+
+    assert_project_summary_shape(stop_payload["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "stopped",
+      worker_port: alpha_port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     restart_payload = json_response(post(build_conn(), "/api/v1/projects/alpha/restart", %{}), 202)
-    assert restart_payload["project"]["runtime_state"]["status"] == "running"
-    assert is_integer(restart_payload["project"]["runtime_state"]["pid"])
-    refute restart_payload["project"]["runtime_state"]["pid"] == first_pid
+
+    assert_project_summary_shape(restart_payload["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "running",
+      worker_port: alpha_port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
   end
 
   test "project control api returns 409 when manager reports start_failed" do
@@ -724,6 +914,37 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 409) == %{
              "error" => %{"code" => "start_failed", "message" => "Project action is not allowed"}
            }
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    [project] = payload["projects"]
+
+    assert_project_summary_shape(project,
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "start_failed",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: "worker command exited during startup"
+    )
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+
+    assert_project_summary_shape(detail["project"],
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "start_failed",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: "worker command exited during startup"
+    )
   end
 
   test "project control api is not available in workflow mode" do
@@ -1075,20 +1296,24 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
 
-    assert [
-             %{
-               "project_id" => nil,
-               "project_name" => nil,
-               "validation_result" => "invalid",
-               "runtime_state" => %{"status" => "not_started"},
-               "validation_errors" => [
-                 %{"field" => field, "message" => message}
-               ]
-             }
-           ] = payload["projects"]
+    assert [project] = payload["projects"]
+    [error] = project["validation_errors"]
 
-    assert field == "projects"
-    assert message =~ "yaml"
+    assert_project_summary_shape(project,
+      project_id: nil,
+      project_name: nil,
+      enabled: true,
+      validation_result: "invalid",
+      validation_errors: [error],
+      worker_status: "not_started",
+      worker_port: nil,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert error["field"] == "projects"
+    assert error["message"] =~ "yaml"
 
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "Projects"
@@ -1262,8 +1487,33 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert projects_response.status == 200
 
     assert Enum.map(projects_response.body["projects"], & &1["project_id"]) == ["alpha", "Beta"]
-    assert Enum.map(projects_response.body["projects"], & &1["runtime_state"]["status"]) == ["not_started", "not_started"]
     assert Enum.map(projects_response.body["projects"], & &1["validation_result"]) == ["valid", "invalid"]
+
+    assert_project_summary_shape(Enum.at(projects_response.body["projects"], 0),
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: 4101,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+
+    assert_project_summary_shape(Enum.at(projects_response.body["projects"], 1),
+      project_id: "Beta",
+      project_name: "Beta",
+      enabled: true,
+      validation_result: "invalid",
+      validation_errors: [%{"field" => "id", "message" => "id must match"}],
+      worker_status: "not_started",
+      worker_port: nil,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
 
     dashboard_response = Req.get!("http://127.0.0.1:#{port}/")
     assert dashboard_response.status == 200
@@ -1492,6 +1742,101 @@ defmodule SymphonyElixir.ExtensionsTest do
     escaped = value |> to_string() |> String.replace("'", "'\"'\"'")
     "'#{escaped}'"
   end
+
+  defp assert_project_summary_shape(project, expected) do
+    expected_validation_errors = Keyword.fetch!(expected, :validation_errors)
+
+    expected_keys = [
+      "project_id",
+      "project_name",
+      "enabled",
+      "validation_result",
+      "validation_errors",
+      "worker_status",
+      "worker_port",
+      "last_seen_at",
+      "last_health_check_at",
+      "last_error",
+      "runtime_state"
+    ]
+
+    assert Map.keys(project) |> Enum.sort() == Enum.sort(expected_keys)
+
+    assert Map.take(project, [
+             "project_id",
+             "project_name",
+             "enabled",
+             "validation_result",
+             "worker_status",
+             "worker_port",
+             "last_seen_at",
+             "last_health_check_at",
+             "last_error"
+           ]) == %{
+             "project_id" => Keyword.fetch!(expected, :project_id),
+             "project_name" => Keyword.fetch!(expected, :project_name),
+             "enabled" => Keyword.fetch!(expected, :enabled),
+             "validation_result" => Keyword.fetch!(expected, :validation_result),
+             "worker_status" => Keyword.fetch!(expected, :worker_status),
+             "worker_port" => Keyword.fetch!(expected, :worker_port),
+             "last_seen_at" => Keyword.fetch!(expected, :last_seen_at),
+             "last_health_check_at" => Keyword.fetch!(expected, :last_health_check_at),
+             "last_error" => Keyword.fetch!(expected, :last_error)
+           }
+
+    assert_validation_errors_shape(project["validation_errors"], expected_validation_errors)
+    assert project["runtime_state"] == %{"status" => Keyword.fetch!(expected, :worker_status)}
+    assert_optional_iso8601(project["last_seen_at"], Keyword.fetch!(expected, :last_seen_at))
+
+    assert_optional_iso8601(
+      project["last_health_check_at"],
+      Keyword.fetch!(expected, :last_health_check_at)
+    )
+
+    refute Map.has_key?(project, "pid")
+    refute Map.has_key?(project, "started_at")
+    refute Map.has_key?(project, "exit_code")
+    refute Map.has_key?(project, "exit_reason")
+    refute Map.has_key?(project, "stdout_path")
+    refute Map.has_key?(project, "stderr_path")
+    refute Map.has_key?(project, "error_summary")
+    refute Map.has_key?(project, "prompt_body")
+    refute Map.has_key?(project, "shell_output")
+  end
+
+  defp assert_validation_errors_shape(actual, expected) do
+    assert length(actual) == length(expected)
+
+    Enum.zip(actual, expected)
+    |> Enum.each(fn {actual_error, expected_error} ->
+      assert actual_error["field"] == expected_error["field"]
+      assert_error_message(actual_error["message"], expected_error["message"])
+    end)
+  end
+
+  defp assert_error_message(actual, expected) when is_binary(expected) do
+    if String.ends_with?(expected, "...") do
+      prefix = String.trim_trailing(expected, "...")
+      assert String.starts_with?(actual, prefix)
+    else
+      assert String.contains?(actual, expected)
+    end
+  end
+
+  defp assert_optional_iso8601(actual, nil) do
+    assert is_nil(actual)
+  end
+
+  defp assert_optional_iso8601(actual, expected) when is_binary(expected) do
+    assert actual == expected
+    assert iso8601_timestamp?(actual)
+  end
+
+  defp iso8601_timestamp?(value) when is_binary(value) do
+    match?({:ok, _datetime, 0}, DateTime.from_iso8601(value))
+  end
+
+  defp iso8601_timestamp?(_value), do: false
 
   defp assert_eventually(fun, attempts \\ 20)
 

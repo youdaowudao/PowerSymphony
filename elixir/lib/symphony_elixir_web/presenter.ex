@@ -137,47 +137,69 @@ defmodule SymphonyElixirWeb.Presenter do
   defp project_entries(_registry), do: []
 
   defp project_entry_payload(entry) do
+    runtime_state = Map.get(entry, :runtime_state)
+
     %{
       project_id: entry.project_id,
       project_name: entry.project_name,
+      enabled: project_enabled(entry),
       validation_result: to_string(entry.validation_result),
       validation_errors: Enum.map(entry.validation_errors, &project_validation_error_payload/1),
-      runtime_state: project_runtime_payload(entry.runtime_state)
+      worker_status: runtime_state_status(runtime_state),
+      worker_port: project_worker_port(entry, runtime_state),
+      last_seen_at: project_runtime_timestamp(runtime_state, :last_seen_at),
+      last_health_check_at: project_runtime_timestamp(runtime_state, :last_health_check_at),
+      last_error: project_last_error(entry, runtime_state),
+      runtime_state: project_runtime_payload(runtime_state)
     }
   end
 
   defp project_runtime_payload(runtime_state) when is_map(runtime_state) do
     %{
-      status: runtime_state_status(runtime_state),
-      pid: Map.get(runtime_state, :pid),
-      worker_port: Map.get(runtime_state, :worker_port),
-      started_at: iso8601(Map.get(runtime_state, :started_at)),
-      exit_code: Map.get(runtime_state, :exit_code),
-      exit_reason: Map.get(runtime_state, :exit_reason),
-      stdout_path: Map.get(runtime_state, :stdout_path),
-      stderr_path: Map.get(runtime_state, :stderr_path),
-      error_summary: Map.get(runtime_state, :error_summary)
+      status: runtime_state_status(runtime_state)
     }
   end
 
   defp project_runtime_payload(_runtime_state) do
     %{
-      status: "not_started",
-      pid: nil,
-      worker_port: nil,
-      started_at: nil,
-      exit_code: nil,
-      exit_reason: nil,
-      stdout_path: nil,
-      stderr_path: nil,
-      error_summary: nil
+      status: "not_started"
     }
   end
 
-  defp runtime_state_status(runtime_state) do
+  defp project_enabled(%{normalized_config: %{enabled: enabled}}) when is_boolean(enabled), do: enabled
+  defp project_enabled(_entry), do: true
+
+  defp project_worker_port(entry, runtime_state) do
+    runtime_state_value(runtime_state, :worker_port) ||
+      normalized_config_value(entry, :worker_port)
+  end
+
+  defp project_last_error(_entry, runtime_state) do
+    runtime_state_value(runtime_state, :last_error) ||
+      runtime_state_value(runtime_state, :error_summary)
+  end
+
+  defp project_runtime_timestamp(runtime_state, key) do
+    runtime_state
+    |> runtime_state_value(key)
+    |> iso8601()
+  end
+
+  defp runtime_state_status(%{} = runtime_state) do
     runtime_state
     |> Map.get(:status, :not_started)
     |> to_string()
+  end
+
+  defp runtime_state_status(_runtime_state), do: "not_started"
+
+  defp runtime_state_value(%{} = runtime_state, key), do: Map.get(runtime_state, key)
+  defp runtime_state_value(_runtime_state, _key), do: nil
+
+  defp normalized_config_value(entry, key) do
+    entry
+    |> Map.get(:normalized_config)
+    |> runtime_state_value(key)
   end
 
   defp project_validation_error_payload(%{field: field, message: message}) do
