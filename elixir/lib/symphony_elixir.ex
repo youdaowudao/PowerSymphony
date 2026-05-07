@@ -59,6 +59,12 @@ defmodule SymphonyElixir.Application do
 
   use Application
 
+  @runtime_worker_children [
+    SymphonyElixir.Orchestrator,
+    SymphonyElixir.HttpServer,
+    SymphonyElixir.StatusDashboard
+  ]
+
   @impl true
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
@@ -80,13 +86,11 @@ defmodule SymphonyElixir.Application do
 
     case mode do
       :workflow ->
-        base_children ++
-          [
-            SymphonyElixir.WorkflowStore,
-            SymphonyElixir.Orchestrator,
-            SymphonyElixir.HttpServer,
-            SymphonyElixir.StatusDashboard
-          ]
+        workflow_children =
+          [SymphonyElixir.WorkflowStore] ++
+            if disable_runtime_workers_in_tests?(), do: [], else: @runtime_worker_children
+
+        base_children ++ workflow_children
 
       :control_plane ->
         base_children ++
@@ -96,6 +100,10 @@ defmodule SymphonyElixir.Application do
             SymphonyElixir.HttpServer
           ]
     end
+  end
+
+  defp disable_runtime_workers_in_tests? do
+    Application.get_env(:symphony_elixir, :disable_runtime_workers_in_tests, false)
   end
 
   @impl true

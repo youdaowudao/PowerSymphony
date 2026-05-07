@@ -9,7 +9,9 @@ This directory contains the Elixir agent orchestration service that polls Linear
 - Full validation command: `make all` (format check, lint, coverage, dialyzer).
 - Do not run `make all` by default.
 - First inspect `git diff` and choose a validation level that matches the change scope.
-- Only run `make all` for core code changes, test/build config changes, changes that touch startup/execution flow, or final pre-PR revalidation.
+- For ordinary local milestone checks or pre-PR self-checks, prefer `SYMPHONY_TEST_MAX_CASES=2 mix test --cover`.
+- Only run `SYMPHONY_TEST_MAX_CASES=2 make all` locally for core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or when reproducing a remote full-gate failure.
+- GitHub Actions remains the authoritative full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
 - For docs-only updates, read-only investigation, or Linear triage/cleanup, do not run `make all`.
 
 
@@ -34,10 +36,19 @@ Start by checking `git diff`, then choose the lightest validation that proves th
 
 - Docs-only, read-only investigation, or Linear triage/cleanup: no test run required.
 - Localized code changes: run targeted tests that directly cover the edited behavior.
-- Core code changes, test/build config changes, startup/execution-flow changes, or final pre-PR revalidation: run `make all`.
+- Ordinary local milestone checks or pre-PR self-checks: run `SYMPHONY_TEST_MAX_CASES=2 mix test --cover`.
+- Core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or remote gate reproduction: run `SYMPHONY_TEST_MAX_CASES=2 make all`.
+
+Keep test isolation strict:
+
+- Do not let test boot automatically start polling runtime workers or external process chains.
+- Tests that touch `Port.open`, `ssh`, `codex app-server`, Docker, or fake workers must start them explicitly and clean them up explicitly with `on_exit` or equivalent.
+- Do not treat the repo `WORKFLOW.md` as the default runtime config in tests.
 
 ```bash
-make all
+SYMPHONY_TEST_MAX_CASES=2 mix test --cover
+
+SYMPHONY_TEST_MAX_CASES=2 make all
 ```
 
 ## Required Rules

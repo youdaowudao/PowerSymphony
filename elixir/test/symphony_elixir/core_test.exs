@@ -202,7 +202,7 @@ defmodule SymphonyElixir.CoreTest do
     orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
 
     on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
+      if orchestrator_configured_child?() and is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
         case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
@@ -218,6 +218,15 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.whereis(SymphonyElixir.Orchestrator) == pid
 
     GenServer.stop(pid)
+  end
+
+  defp orchestrator_configured_child? do
+    SymphonyElixir.Application.child_specs(SymphonyElixir.runtime_mode())
+    |> Enum.any?(fn
+      %{id: SymphonyElixir.Orchestrator} -> true
+      SymphonyElixir.Orchestrator -> true
+      _ -> false
+    end)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
