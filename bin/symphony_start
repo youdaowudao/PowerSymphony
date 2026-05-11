@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_PORT="4000"
+LINEAR_TOKEN_RELATIVE_PATH=".config/linear/linear_api_key.token"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_root_dir() {
+  if [[ -n "${POWERSYMPHONY_ROOT:-}" ]]; then
+    printf '%s\n' "$POWERSYMPHONY_ROOT"
+    return 0
+  fi
+
+  local candidate_root
+  candidate_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+  if [[ -f "${candidate_root}/bin/symphony" ]]; then
+    printf '%s\n' "$candidate_root"
+    return 0
+  fi
+
+  die "Unable to determine repository root automatically. Use the repository's bin/symphony_start or set POWERSYMPHONY_ROOT."
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: symphony_start --i-understand-that-this-will-be-running-without-the-usual-guardrails [--logs-root <path>] [--port <port>] [extra-symphony-args...]
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+ARGS=()
+HAS_LOGS_ROOT=0
+HAS_PORT=0
+SHOW_HELP=0
+
+while (($#)); do
+  case "$1" in
+    --help|-h)
+      SHOW_HELP=1
+      ARGS+=("$1")
+      ;;
+    --logs-root)
+      HAS_LOGS_ROOT=1
+      ARGS+=("$1")
+      shift
+      if (($# == 0)) || [[ "$1" == --* ]]; then
+        usage
+        exit 1
+      fi
+      ARGS+=("$1")
+      ;;
+    --logs-root=*)
+      HAS_LOGS_ROOT=1
+      ARGS+=("$1")
+      ;;
+    --port)
+      HAS_PORT=1
+      ARGS+=("$1")
+      shift
+      if (($# == 0)) || [[ "$1" == --* ]]; then
+        usage
+        exit 1
+      fi
+      ARGS+=("$1")
+      ;;
+    --port=*)
+      HAS_PORT=1
+      ARGS+=("$1")
+      ;;
+    *)
+      ARGS+=("$1")
+      ;;
+  esac
+  shift
+done
+
+if [[ "$SHOW_HELP" -eq 1 ]]; then
+  usage
+  exit 0
+fi
+
+ROOT_DIR="$(resolve_root_dir)"
+WORKFLOW_PATH="${ROOT_DIR}/elixir/WORKFLOW.md"
+
+if [[ ! -f "$WORKFLOW_PATH" ]]; then
+  die "Workflow file not found: $WORKFLOW_PATH"
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  die 'codex is required in PATH before starting Symphony.'
+fi
+
+if ! command -v mise >/dev/null 2>&1; then
+  die 'mise is required in PATH before starting Symphony.'
+fi
+
+if [[ -z "${LINEAR_API_KEY+x}" ]]; then
+  if [[ -z "${HOME:-}" ]]; then
+    die "LINEAR_API_KEY is unset and HOME is required to read ${LINEAR_TOKEN_RELATIVE_PATH}."
+  fi
+
+  LINEAR_TOKEN_PATH="${HOME}/${LINEAR_TOKEN_RELATIVE_PATH}"
+
+  if [[ ! -e "$LINEAR_TOKEN_PATH" ]]; then
+    die "LINEAR_API_KEY is unset and token file is missing: ${LINEAR_TOKEN_PATH}"
+  fi
+
+  if [[ ! -r "$LINEAR_TOKEN_PATH" ]]; then
+    die "LINEAR_API_KEY is unset and token file is not readable: ${LINEAR_TOKEN_PATH}"
+  fi
+
+  if [[ ! -f "$LINEAR_TOKEN_PATH" ]]; then
+    die "LINEAR_API_KEY is unset and token path is not a regular file: ${LINEAR_TOKEN_PATH}"
+  fi
+
+  LINEAR_API_KEY="$(<"$LINEAR_TOKEN_PATH")"
+  LINEAR_API_KEY="${LINEAR_API_KEY#"${LINEAR_API_KEY%%[![:space:]]*}"}"
+  LINEAR_API_KEY="${LINEAR_API_KEY%"${LINEAR_API_KEY##*[![:space:]]}"}"
+
+  if [[ -z "$LINEAR_API_KEY" ]]; then
+    die "LINEAR_API_KEY is unset and token file is empty after trimming: ${LINEAR_TOKEN_PATH}"
+  fi
+
+  export LINEAR_API_KEY
+fi
+
+if [[ "$HAS_LOGS_ROOT" -eq 0 ]]; then
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    DEFAULT_LOGS_ROOT="${XDG_STATE_HOME}/powersymphony"
+  elif [[ -n "${HOME:-}" ]]; then
+    DEFAULT_LOGS_ROOT="${HOME}/.local/state/powersymphony"
+  else
+    die 'Either XDG_STATE_HOME or HOME must be set before starting Symphony.'
+  fi
+
+  ARGS=(--logs-root "$DEFAULT_LOGS_ROOT" "${ARGS[@]}")
+fi
+
+if [[ "$HAS_PORT" -eq 0 ]]; then
+  ARGS=(--port "$DEFAULT_PORT" "${ARGS[@]}")
+fi
+
+exec "${ROOT_DIR}/bin/symphony" "${ARGS[@]}" "$WORKFLOW_PATH"

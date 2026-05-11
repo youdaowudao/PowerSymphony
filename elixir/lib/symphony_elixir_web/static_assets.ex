@@ -1,10 +1,21 @@
 defmodule SymphonyElixirWeb.StaticAssets do
   @moduledoc false
 
+  resolve_dependency_asset = fn app, relative_path ->
+    source_path =
+      Path.expand("../../deps/#{Atom.to_string(app)}/#{relative_path}", __DIR__)
+
+    if File.exists?(source_path) do
+      source_path
+    else
+      Application.app_dir(app, relative_path)
+    end
+  end
+
   @dashboard_css_path Path.expand("../../priv/static/dashboard.css", __DIR__)
-  @phoenix_html_js_path Application.app_dir(:phoenix_html, "priv/static/phoenix_html.js")
-  @phoenix_js_path Application.app_dir(:phoenix, "priv/static/phoenix.js")
-  @phoenix_live_view_js_path Application.app_dir(:phoenix_live_view, "priv/static/phoenix_live_view.js")
+  @phoenix_html_js_path resolve_dependency_asset.(:phoenix_html, "priv/static/phoenix_html.js")
+  @phoenix_js_path resolve_dependency_asset.(:phoenix, "priv/static/phoenix.js")
+  @phoenix_live_view_js_path resolve_dependency_asset.(:phoenix_live_view, "priv/static/phoenix_live_view.js")
 
   @external_resource @dashboard_css_path
   @external_resource @phoenix_html_js_path
