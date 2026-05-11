@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_ROOT="/home/ss/data/projects/powersymphony"
+ROOT_DIR="${POWERSYMPHONY_ROOT:-$DEFAULT_ROOT}"
+WORKFLOW_PATH="${ROOT_DIR}/elixir/WORKFLOW.md"
+DEFAULT_PORT="0"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: symphony_start --i-understand-that-this-will-be-running-without-the-usual-guardrails [--logs-root <path>] [--port <port>] [extra-symphony-args...]
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+ARGS=()
+HAS_LOGS_ROOT=0
+HAS_PORT=0
+SHOW_HELP=0
+
+while (($#)); do
+  case "$1" in
+    --help|-h)
+      SHOW_HELP=1
+      ARGS+=("$1")
+      ;;
+    --logs-root)
+      HAS_LOGS_ROOT=1
+      ARGS+=("$1")
+      shift
+      if (($# == 0)) || [[ "$1" == --* ]]; then
+        usage
+        exit 1
+      fi
+      ARGS+=("$1")
+      ;;
+    --logs-root=*)
+      HAS_LOGS_ROOT=1
+      ARGS+=("$1")
+      ;;
+    --port)
+      HAS_PORT=1
+      ARGS+=("$1")
+      shift
+      if (($# == 0)) || [[ "$1" == --* ]]; then
+        usage
+        exit 1
+      fi
+      ARGS+=("$1")
+      ;;
+    --port=*)
+      HAS_PORT=1
+      ARGS+=("$1")
+      ;;
+    *)
+      ARGS+=("$1")
+      ;;
+  esac
+  shift
+done
+
+if [[ "$SHOW_HELP" -eq 1 ]]; then
+  usage
+  exit 0
+fi
+
+if [[ ! -f "$WORKFLOW_PATH" ]]; then
+  die "Workflow file not found: $WORKFLOW_PATH"
+fi
+
+if [[ -z "${LINEAR_API_KEY:-}" ]]; then
+  die 'LINEAR_API_KEY is required. export it before starting Symphony.'
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  die 'codex is required in PATH before starting Symphony.'
+fi
+
+if ! command -v mise >/dev/null 2>&1; then
+  die 'mise is required in PATH before starting Symphony.'
+fi
+
+if [[ "$HAS_LOGS_ROOT" -eq 0 ]]; then
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    DEFAULT_LOGS_ROOT="${XDG_STATE_HOME}/powersymphony"
+  elif [[ -n "${HOME:-}" ]]; then
+    DEFAULT_LOGS_ROOT="${HOME}/.local/state/powersymphony"
+  else
+    die 'Either XDG_STATE_HOME or HOME must be set before starting Symphony.'
+  fi
+
+  ARGS=(--logs-root "$DEFAULT_LOGS_ROOT" "${ARGS[@]}")
+fi
+
+if [[ "$HAS_PORT" -eq 0 ]]; then
+  ARGS=(--port "$DEFAULT_PORT" "${ARGS[@]}")
+fi
+
+exec "${ROOT_DIR}/bin/symphony" "${ARGS[@]}" "$WORKFLOW_PATH"
