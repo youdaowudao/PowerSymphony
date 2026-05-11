@@ -1,273 +1,249 @@
-# Workflow Migration Implementation Plan
+# Workflow Contract Migration Audit Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `PowerSymphony` fully absorb the newer workflow contract already
-checked into `elixir/WORKFLOW.md`, including matching tests, stable local asset
-compilation, and updated startup documentation.
+**Goal:** 把原先基于“新 `WORKFLOW.md` 已复制进来、但配套代码还没补齐”的旧迁移计划，改写成一份与当前仓库状态一致的 workflow 合同迁移审计与验收方案。
 
-**Architecture:** Keep the current workflow loader and prompt renderer intact
-unless tests prove a real behavior gap. First remove the local compilation blocker
-in `StaticAssets`, then update workflow-facing tests to the new contract, then
-sync README instructions and finish with targeted verification plus one bounded
-startup check.
+**Architecture:** 先用旧仓库历史和当前仓库现状确认是否存在真实待迁差异；若没有，就停止虚构代码迁移任务，只保留合同面、验证矩阵、审计结论和可复用的 TASK 卡。整个过程只动文档，不重新打开 control-plane 或其他阶段性范围。
 
-**Tech Stack:** Elixir, Phoenix, ExUnit, mise, Hex/Mix
+**Tech Stack:** Markdown, Git, ExUnit, mise
 
 ---
 
-### Task 1: Stabilize embedded static asset loading for local targeted tests
-
-**Files:**
-- Modify: `elixir/lib/symphony_elixir_web/static_assets.ex`
-- Test: `elixir/test/symphony_elixir/extensions_test.exs`
-
-- [ ] **Step 1: Add a failing or reproducible compile/test signal for the current asset-path bug**
-
-Use the already observed failure as the baseline:
-
-```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix test test/symphony_elixir/core_test.exs:130
-```
-
-Expected: compile failure from `lib/symphony_elixir_web/static_assets.ex`
-trying to read `_build/test/lib/phoenix_html/priv/static/phoenix_html.js`.
-
-- [ ] **Step 2: Implement stable asset path resolution with source-checkout fallback**
-
-Update `StaticAssets` so each vendor asset path is resolved through a helper with
-logic like:
-
-```elixir
-defp dependency_asset_path(app, relative_path) do
-  source_path = Path.expand("../deps/#{app}/#{relative_path}", __DIR__)
-
-  if File.exists?(source_path) do
-    source_path
-  else
-    Application.app_dir(app, relative_path)
-  end
-end
-```
-
-Use this helper for:
-
-```elixir
-@phoenix_html_js_path dependency_asset_path(:phoenix_html, "priv/static/phoenix_html.js")
-@phoenix_js_path dependency_asset_path(:phoenix, "priv/static/phoenix.js")
-@phoenix_live_view_js_path dependency_asset_path(:phoenix_live_view, "priv/static/phoenix_live_view.js")
-```
-
-- [ ] **Step 3: Run the narrowest asset-facing test to verify the compile blocker is gone**
-
-Run:
-
-```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix test test/symphony_elixir/extensions_test.exs
-```
-
-Expected: compile succeeds; any remaining failures should now be real test
-failures, not missing vendor asset files.
-
-### Task 2: Update workflow contract tests to the new `WORKFLOW.md`
-
-**Files:**
-- Modify: `elixir/test/symphony_elixir/core_test.exs`
-
-- [ ] **Step 1: Rewrite the current-workflow validation assertions to the new repo defaults**
-
-In `test "current WORKFLOW.md file is valid and complete"`, replace old
-OpenAI-specific expectations with assertions that match the current workflow:
-
-```elixir
-assert Map.get(hooks, "after_create") =~ "https://github.com/youdaowudao/PowerSymphony.git"
-refute Map.get(hooks, "after_create") =~ "https://github.com/openai/symphony"
-assert Map.get(hooks, "before_remove") =~ "true"
-```
-
-Keep checks that still prove real configuration shape:
-
-```elixir
-assert is_binary(Map.get(tracker, "project_slug"))
-assert String.trim(prompt) != ""
-assert Config.workflow_prompt() == prompt
-```
-
-- [ ] **Step 2: Rewrite the in-repo workflow prompt test around the new contract**
-
-In `test "in-repo WORKFLOW.md renders correctly"`, keep interpolation and retry
-assertions, but replace stale prose checks with assertions like:
-
-```elixir
-assert prompt =~ "## Stable issue-body model"
-assert prompt =~ "## Preflight body gate"
-assert prompt =~ "## Execution Brief"
-assert prompt =~ "## Codex Workpad"
-assert prompt =~ "This is retry attempt #2 because the ticket is still in an active state."
-assert prompt =~ "Do not end the turn while the issue remains in an active state"
-assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-assert prompt =~ "Do not call `gh pr merge` directly"
-```
-
-Remove assertions for:
-
-```elixir
-"This is an unattended orchestration session."
-"Only stop early for a true blocker"
-"Do not include \"next steps for user\""
-```
-
-- [ ] **Step 3: Run just the workflow-facing tests and verify red/green explicitly**
-
-Run:
-
-```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix test \
-  test/symphony_elixir/core_test.exs:130 \
-  test/symphony_elixir/core_test.exs:1339
-```
-
-Expected: both tests pass after the assertion updates.
-
-### Task 3: Sync README startup instructions with the migrated workflow
-
-**Files:**
-- Modify: `elixir/README.md`
-- Test: `elixir/test/symphony_elixir/cli_test.exs` (only if startup semantics are touched)
-
-- [ ] **Step 1: Update the documented clone/bootstrap path to match `PowerSymphony`**
-
-Replace the old run section:
-
-```bash
-git clone https://github.com/openai/symphony
-cd symphony/elixir
-```
-
-with repository-accurate instructions such as:
-
-```bash
-git clone https://github.com/youdaowudao/PowerSymphony.git
-cd PowerSymphony/elixir
-```
-
-Keep the rest aligned with the actual local tooling:
-
-```bash
-mise trust
-mise install
-mise exec -- mix setup
-mise exec -- mix build
-mise exec -- ./bin/symphony ./WORKFLOW.md
-```
-
-- [ ] **Step 2: Ensure README wording matches the current workflow defaults**
-
-Adjust any surrounding prose that still implies the old upstream repo or old
-workflow ownership assumptions, but keep the change minimal and scoped to startup
-accuracy.
-
-- [ ] **Step 3: If README changes imply startup semantics, run the existing CLI tests**
-
-Run:
-
-```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix test test/symphony_elixir/cli_test.exs
-```
-
-Expected: PASS
-
-### Task 4: Perform bounded local verification, including one startup check
+### Task 1: 固定审计证据，证明当前不是“待实施迁移”
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-05-11-workflow-migration-design.md`
 - Modify: `docs/superpowers/plans/2026-05-11-workflow-migration.md`
 
-- [ ] **Step 1: Run the targeted verification bundle**
+- [ ] **Step 1: 记录旧仓库与当前仓库是否仍有 workflow 相关差异**
 
 Run:
 
 ```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix test \
+git status --short
+git rev-parse HEAD
+git --git-dir=/home/ss/projects/powersymphony/.git --work-tree=/home/ss/projects/powersymphony status --short
+git --git-dir=/home/ss/projects/powersymphony/.git --work-tree=/home/ss/projects/powersymphony rev-parse HEAD
+diff -ru --exclude .git --exclude _build --exclude deps \
+  /home/ss/projects/powersymphony/elixir \
+  /home/ss/data/projects/powersymphony/elixir
+```
+
+Expected:
+
+- 两边 `HEAD` 一致
+- 旧仓库 `git status` 不暴露额外 workflow 隐藏改动
+- `elixir/` 目录无 workflow 相关文件级差异
+
+- [ ] **Step 2: 把审计前提写入设计文档，而不是继续沿用旧迁移假设**
+
+在设计文档中明确写入以下结论：
+
+```md
+- 当前任务不是继续补迁 workflow 配套代码，而是确认迁移是否已完成。
+- 旧仓库与当前仓库当前在同一提交点，不存在额外待迁的 workflow 工作树差异。
+- 原旧计划中的“core_test 仍断言旧文案”“README 仍指向 openai/symphony”“StaticAssets 仍是 blocker”等前提已经失效。
+```
+
+- [ ] **Step 3: 用历史提交解释这次迁移真正发生在哪里**
+
+Run:
+
+```bash
+git --git-dir=/home/ss/projects/powersymphony/.git --work-tree=/home/ss/projects/powersymphony \
+  log --oneline --grep=workflow -n 20
+```
+
+Expected: 至少能看到：
+
+```text
+8d5c63f docs(workflow): update elixir workflow file
+7346e79 fix(workflow): 对齐新工作流契约并修复本地资源编译
+```
+
+- [ ] **Step 4: 在设计文档里把证据链收敛成“背景解读 + 判断”**
+
+写入类似下面的结构：
+
+```md
+## Background Interpretation
+## Confirmed Current State
+## Judgement
+```
+
+要求：
+
+- 背景解读解释为什么旧文档会写成“待迁移”。
+- 当前状态只写已验证事实。
+- 判断明确给出“迁移已落地 / 当前应转为审计验收”的结论。
+
+### Task 2: 定义正式 workflow 合同面与最小验证矩阵
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-05-11-workflow-migration-design.md`
+
+- [ ] **Step 1: 把 workflow 合同面列成固定清单**
+
+在设计文档中列出并解释这几个面：
+
+```md
+- elixir/WORKFLOW.md
+- elixir/lib/symphony_elixir/workflow.ex
+- elixir/lib/symphony_elixir/config.ex
+- elixir/lib/symphony_elixir/prompt_builder.ex
+- elixir/test/symphony_elixir/core_test.exs
+- elixir/test/symphony_elixir/cli_test.exs
+- elixir/test/symphony_elixir/extensions_test.exs
+- elixir/README.md
+```
+
+- [ ] **Step 2: 定义默认最小验证集**
+
+把下面命令写进设计文档：
+
+```bash
+cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test \
   test/symphony_elixir/core_test.exs:130 \
-  test/symphony_elixir/core_test.exs:1339 \
+  test/symphony_elixir/core_test.exs:1342 \
   test/symphony_elixir/cli_test.exs
 ```
 
-Expected: PASS
+并注明：适用于 `WORKFLOW.md`、loader、config、prompt builder、README 的小范围合同适配。
 
-- [ ] **Step 2: Run a bounded local startup check without entering a full long-running flow**
+- [ ] **Step 3: 定义按需补充验证**
 
-Use the CLI evaluation/startup path with the repo workflow:
+把下面命令写进设计文档：
 
 ```bash
-cd elixir && \
-HEX_HOME=/home/ss/.local/share/mise/.hex \
-MIX_HOME=/home/ss/.local/share/mise/.mix \
-REBAR_CACHE_DIR=/home/ss/.cache/rebar3 \
-/home/ss/.local/bin/mise exec -- mix run --no-start -e \
-'IO.inspect(SymphonyElixir.CLI.evaluate(["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "WORKFLOW.md"]))'
+cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test \
+  test/symphony_elixir/extensions_test.exs:1056 \
+  test/symphony_elixir/extensions_test.exs:1384
 ```
 
-Expected: `:ok` or a startup-ready result that proves the workflow path and CLI
-evaluation are coherent without running a full indefinite session.
+并注明：仅当本地编译路径、Phoenix 资源装载或静态资源依赖影响合同验证时才需要补跑。
 
-- [ ] **Step 3: Audit scope before handoff**
+- [ ] **Step 4: 增加运行时语义升级触发条件**
+
+在设计文档中明确：
+
+```md
+只有当 WORKFLOW 变更直接触发 turn/run/ticket 边界、retry/continuation、
+merge/human-review 语义变化，或现有 workflow/config/prompt_builder 无法承接
+新配置键时，才升级核查 agent_runner / orchestrator / app_server。
+```
+
+- [ ] **Step 5: 明确 out-of-scope**
+
+在设计文档中明确排除：
+
+```md
+- control-plane 新功能
+- workflow 模块化生成
+- 与当前 WORKFLOW 合同无关的旧仓库改动
+```
+
+### Task 3: 写出可复用的 TASK 执行卡
+
+**Files:**
+- Create: `docs/superpowers/tasks/2026-05-11-workflow-migration-audit-task.md`
+
+- [ ] **Step 1: 给 TASK 卡写清使用场景**
+
+TASK 卡开头必须明确：
+
+```md
+当外部工作树、旧仓库或其他分支里出现一份更新过的 elixir/WORKFLOW.md 时，
+用这张卡判断当前仓库是否真的还需要补迁配套代码、测试或文档。
+```
+
+- [ ] **Step 2: 给 TASK 卡列出 source of truth**
+
+把合同源、承接面、验证面写进去，至少包括：
+
+```md
+- elixir/WORKFLOW.md
+- workflow.ex / config.ex / prompt_builder.ex
+- core_test.exs / cli_test.exs / extensions_test.exs
+- README.md
+- static_assets.ex
+```
+
+- [ ] **Step 3: 给 TASK 卡列出最小执行清单**
+
+至少包含：
+
+```md
+- 记录两边 HEAD 与 git status
+- 比较 elixir/WORKFLOW.md
+- 核查合同承接面
+- 归类差异
+- 只迁最小必需改动
+- 运行最小验证集
+- 无真实差异时停止写代码，改为输出审计结论
+```
+
+- [ ] **Step 4: 给 TASK 卡写 Stop Conditions**
+
+至少包含：
+
+```md
+- 两边已经在同一 HEAD 且没有额外 workflow 相关差异
+- 只剩审计/汇报文档口径差异，而没有合同源、代码、测试、README 的差异
+- 拟迁移内容开始扩散到 control-plane / compiler / trace 等范围外主题
+```
+
+### Task 4: 验证文档与结论一致，并提交
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-05-11-workflow-migration-design.md`
+- Modify: `docs/superpowers/plans/2026-05-11-workflow-migration.md`
+- Create: `docs/superpowers/tasks/2026-05-11-workflow-migration-audit-task.md`
+
+- [ ] **Step 1: 运行本次审计依赖的最小验证集**
+
+Run:
+
+```bash
+cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test \
+  test/symphony_elixir/core_test.exs:130 \
+  test/symphony_elixir/core_test.exs:1342 \
+  test/symphony_elixir/cli_test.exs
+cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test \
+  test/symphony_elixir/extensions_test.exs:1056 \
+  test/symphony_elixir/extensions_test.exs:1384
+```
+
+Expected:
+
+```text
+14 tests, 0 failures
+2 tests, 0 failures
+```
+
+- [ ] **Step 2: 检查本次 diff 只包含审计型文档更新**
 
 Run:
 
 ```bash
 git diff -- \
-  elixir/lib/symphony_elixir_web/static_assets.ex \
-  elixir/test/symphony_elixir/core_test.exs \
-  elixir/README.md \
-  elixir/test/symphony_elixir/extensions_test.exs \
-  elixir/test/symphony_elixir/cli_test.exs \
   docs/superpowers/specs/2026-05-11-workflow-migration-design.md \
-  docs/superpowers/plans/2026-05-11-workflow-migration.md
+  docs/superpowers/plans/2026-05-11-workflow-migration.md \
+  docs/superpowers/tasks/2026-05-11-workflow-migration-audit-task.md
 ```
 
-Expected: diff stays limited to workflow migration, local asset stability, and
-supporting docs/tests.
+Expected: diff 只体现审计结论、验证矩阵和 TASK 卡，不引入无关代码改动。
 
-- [ ] **Step 4: Commit with repo-compliant message once all checks are green**
+- [ ] **Step 3: 用 repo 规则提交这批文档**
 
-Stage only the intended files and commit with a Chinese summary in the subject,
-for example:
+Commit message example:
 
 ```bash
 git add \
-  elixir/lib/symphony_elixir_web/static_assets.ex \
-  elixir/test/symphony_elixir/core_test.exs \
-  elixir/README.md \
   docs/superpowers/specs/2026-05-11-workflow-migration-design.md \
-  docs/superpowers/plans/2026-05-11-workflow-migration.md
-
-git commit -F /tmp/workflow-migration-commit.txt
+  docs/superpowers/plans/2026-05-11-workflow-migration.md \
+  docs/superpowers/tasks/2026-05-11-workflow-migration-audit-task.md
+git commit -F /tmp/workflow-migration-audit-commit.txt
 ```
 
-The final commit message must include:
-
-- a conventional type/scope subject
-- a Simplified Chinese summary
-- validation commands actually run
+其中提交主题应包含中文简介，且准确表达“把旧 workflow 迁移计划改写为审计/验收方案”。
