@@ -402,7 +402,7 @@ printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
       assert trace =~ @ack_flag
       assert trace =~ "--logs-root #{default_logs_root}"
       assert trace =~ "--port 4000"
-      assert trace =~ "#{@repo_root}/elixir/WORKFLOW.md"
+      assert trace =~ Path.join(@repo_root, "elixir/WORKFLOW.md")
       assert trace =~ "SymphonyElixir.CLI.main(System.argv())"
     after
       File.rm_rf(test_root)
@@ -624,11 +624,11 @@ printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
     end
   end
 
-  test "copied script still targets the current repository workflow by default" do
+  test "copied script returns a clear error when repo root is not configured" do
     test_root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-formal-start-copied-script-#{System.unique_integer([:positive])}"
+        "symphony-formal-start-copied-script-missing-root-#{System.unique_integer([:positive])}"
       )
 
     fake_bin = Path.join(test_root, "bin")
@@ -651,20 +651,65 @@ printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
       File.cp!(@script_path, copied_script)
       File.chmod!(copied_script, 0o755)
 
-      {_, status} =
+      {output, status} =
         System.cmd(copied_script, [@ack_flag],
           cd: test_root,
           env: [
             {"PATH", "#{fake_bin}:#{previous_path}"},
             {"TRACE_FILE", trace_file},
             {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "POWERSYMPHONY_ROOT"
+      assert output =~ "repository root"
+      refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "copied script succeeds when POWERSYMPHONY_ROOT is provided" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-copied-script-with-root-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    copied_script = Path.join(fake_bin, "symphony_start")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'args=%s\n' "$*" > "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+      File.cp!(@script_path, copied_script)
+      File.chmod!(copied_script, 0o755)
+
+      {_, status} =
+        System.cmd(copied_script, [@ack_flag],
+          cd: test_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir},
+            {"POWERSYMPHONY_ROOT", @repo_root}
           ]
         )
 
       assert status == 0
-
-      trace = File.read!(trace_file)
-      assert trace =~ "#{@repo_root}/elixir/WORKFLOW.md"
+      assert File.read!(trace_file) =~ Path.join(@repo_root, "elixir/WORKFLOW.md")
     after
       File.rm_rf(test_root)
     end

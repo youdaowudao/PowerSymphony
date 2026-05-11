@@ -1,7 +1,15 @@
 # `bin/symphony_start` 配置说明
 
-`bin/symphony_start` 会固定启动当前仓库 `/home/ss/data/projects/powersymphony` 下的 `elixir/WORKFLOW.md`。
-即使脚本被复制到系统 `bin`，默认目标仍然是这个仓库；如需覆盖，可设置 `POWERSYMPHONY_ROOT`。
+`bin/symphony_start` 支持两种启动方式：
+
+1. 仓库内直接运行：
+   - 如果脚本位于仓库自己的 `bin/` 目录中，会自动把仓库根识别为脚本上一级目录
+   - 然后使用 `<repo>/elixir/WORKFLOW.md`
+2. 脚本复制到系统 `bin` 后运行：
+   - 不再猜测任何固定绝对路径
+   - 这时必须显式设置 `POWERSYMPHONY_ROOT=/path/to/powersymphony`
+
+未能自动发现 root、且未设置 `POWERSYMPHONY_ROOT` 时，脚本会直接报错。
 
 ## Linear token 文件
 

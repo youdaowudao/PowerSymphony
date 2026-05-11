@@ -1,11 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_ROOT="/home/ss/data/projects/powersymphony"
-ROOT_DIR="${POWERSYMPHONY_ROOT:-$DEFAULT_ROOT}"
-WORKFLOW_PATH="${ROOT_DIR}/elixir/WORKFLOW.md"
 DEFAULT_PORT="4000"
 LINEAR_TOKEN_RELATIVE_PATH=".config/linear/linear_api_key.token"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_root_dir() {
+  if [[ -n "${POWERSYMPHONY_ROOT:-}" ]]; then
+    printf '%s\n' "$POWERSYMPHONY_ROOT"
+    return 0
+  fi
+
+  local candidate_root
+  candidate_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+  if [[ -f "${candidate_root}/bin/symphony" && -f "${candidate_root}/elixir/WORKFLOW.md" ]]; then
+    printf '%s\n' "$candidate_root"
+    return 0
+  fi
+
+  die "Unable to determine repository root automatically. Run from the repository bin/ directory or set POWERSYMPHONY_ROOT."
+}
 
 usage() {
   cat >&2 <<'EOF'
@@ -68,6 +83,9 @@ if [[ "$SHOW_HELP" -eq 1 ]]; then
   usage
   exit 0
 fi
+
+ROOT_DIR="$(resolve_root_dir)"
+WORKFLOW_PATH="${ROOT_DIR}/elixir/WORKFLOW.md"
 
 if [[ ! -f "$WORKFLOW_PATH" ]]; then
   die "Workflow file not found: $WORKFLOW_PATH"
