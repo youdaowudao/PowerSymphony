@@ -9,7 +9,7 @@
    - 不再猜测任何固定绝对路径
    - 这时必须显式设置 `POWERSYMPHONY_ROOT=/path/to/powersymphony`
 
-未能自动发现 root、且未设置 `POWERSYMPHONY_ROOT` 时，脚本会直接报错。
+未能自动发现 root、且未设置 `POWERSYMPHONY_ROOT` 时，脚本会直接报错，并提示使用仓库内的 `bin/symphony_start` 或显式设置 `POWERSYMPHONY_ROOT`。
 
 ## Linear token 文件
 

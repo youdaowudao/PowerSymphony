@@ -664,8 +664,58 @@ printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
 
       assert status == 1
       assert output =~ "POWERSYMPHONY_ROOT"
-      assert output =~ "repository root"
+      assert output =~ "bin/symphony_start"
       refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "auto-discovered repo root still reports workflow not found when WORKFLOW.md is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-autodiscovered-root-missing-workflow-#{System.unique_integer([:positive])}"
+      )
+
+    repo_root = Path.join(test_root, "repo")
+    repo_bin = Path.join(repo_root, "bin")
+    repo_elixir = Path.join(repo_root, "elixir")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    fake_mise = Path.join(fake_bin, "mise")
+    copied_script = Path.join(repo_bin, "symphony_start")
+    wrapped_symphony = Path.join(repo_bin, "symphony")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(repo_bin)
+      File.mkdir_p!(repo_elixir)
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      File.cp!(@script_path, copied_script)
+      File.chmod!(copied_script, 0o755)
+      write_fake_command(wrapped_symphony, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+      write_fake_command(fake_mise, "exit 0")
+
+      {output, status} =
+        System.cmd(copied_script, [@ack_flag],
+          cd: repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "Workflow file not found:"
+      assert output =~ Path.join(repo_elixir, "WORKFLOW.md")
     after
       File.rm_rf(test_root)
     end

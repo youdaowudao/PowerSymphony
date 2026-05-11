@@ -14,12 +14,12 @@ resolve_root_dir() {
   local candidate_root
   candidate_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-  if [[ -f "${candidate_root}/bin/symphony" && -f "${candidate_root}/elixir/WORKFLOW.md" ]]; then
+  if [[ -f "${candidate_root}/bin/symphony" ]]; then
     printf '%s\n' "$candidate_root"
     return 0
   fi
 
-  die "Unable to determine repository root automatically. Run from the repository bin/ directory or set POWERSYMPHONY_ROOT."
+  die "Unable to determine repository root automatically. Use the repository's bin/symphony_start or set POWERSYMPHONY_ROOT."
 }
 
 usage() {
