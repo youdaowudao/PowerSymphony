@@ -350,3 +350,838 @@ defmodule SymphonyElixir.CLIScriptTest do
     end
   end
 end
+
+defmodule SymphonyElixir.FormalStartScriptTest do
+  use ExUnit.Case, async: false
+
+  @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
+  @repo_root Path.expand("../../..", __DIR__)
+  @script_path Path.join(@repo_root, "bin/symphony_start")
+
+  test "uses the in-repo workflow and injects default logs root and port" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-defaults-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    xdg_state_home = Path.join(test_root, "xdg-state")
+    previous_path = System.get_env("PATH")
+    default_logs_root = Path.join(xdg_state_home, "powersymphony")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'cwd=%s\n' "$PWD" > "$TRACE_FILE"
+printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      {_, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"XDG_STATE_HOME", xdg_state_home},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+
+      trace = File.read!(trace_file)
+      assert trace =~ "cwd=#{Path.join(@repo_root, "elixir")}"
+      assert trace =~ @ack_flag
+      assert trace =~ "--logs-root #{default_logs_root}"
+      assert trace =~ "--port 4000"
+      assert trace =~ Path.join(@repo_root, "elixir/WORKFLOW.md")
+      assert trace =~ "SymphonyElixir.CLI.main(System.argv())"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "reads LINEAR_API_KEY from the token file, trims surrounding whitespace, and preserves internal whitespace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-token-file-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, " \n  file token value \t\n")
+      write_fake_command(fake_mise, ~S(printf 'cwd=%s\n' "$PWD" > "$TRACE_FILE"
+printf 'args=%s\n' "$*" >> "$TRACE_FILE"
+printf 'linear=%s\n' "$LINEAR_API_KEY" >> "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      {_, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+
+      trace = File.read!(trace_file)
+      assert trace =~ "linear=file token value"
+      assert trace =~ "--port 4000"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "reads the token file successfully without requiring perl in PATH" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-without-perl-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, " trimmed token \n")
+      write_fake_command(fake_mise, ~S(printf 'linear=%s\n' "$LINEAR_API_KEY" > "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      {_, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:/usr/bin:/bin"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+      assert File.read!(trace_file) =~ "linear=trimmed token"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prefers explicit LINEAR_API_KEY over the token file" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-explicit-linear-env-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'linear=%s\n' "$LINEAR_API_KEY" > "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      {_, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"LINEAR_API_KEY", "explicit-env-token"},
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+      assert File.read!(trace_file) =~ "linear=explicit-env-token"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prefers an explicitly empty LINEAR_API_KEY over the token file" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-explicit-empty-linear-env-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'linear=<%s>\n' "$LINEAR_API_KEY" > "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      command =
+        ~s(LINEAR_API_KEY='' "#{@script_path}" #{@ack_flag})
+
+      {_, status} =
+        System.cmd("bash", ["-lc", command],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+      assert File.read!(trace_file) =~ "linear=<>"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "preserves explicit logs root and port overrides while pinning the workflow path" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-overrides-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    explicit_logs_root = Path.join(test_root, "custom-logs")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'cwd=%s\n' "$PWD" > "$TRACE_FILE"
+printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+
+      {_, status} =
+        System.cmd(@script_path, [@ack_flag, "--logs-root", explicit_logs_root, "--port", "4311"],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ]
+        )
+
+      assert status == 0
+
+      trace = File.read!(trace_file)
+      assert trace =~ "--logs-root #{explicit_logs_root}"
+      assert trace =~ "--port 4311"
+      assert trace =~ "#{@repo_root}/elixir/WORKFLOW.md"
+      refute trace =~ "--port 4000"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "copied script returns a clear error when repo root is not configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-copied-script-missing-root-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    copied_script = Path.join(fake_bin, "symphony_start")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'cwd=%s\n' "$PWD" > "$TRACE_FILE"
+printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+      File.cp!(@script_path, copied_script)
+      File.chmod!(copied_script, 0o755)
+
+      {output, status} =
+        System.cmd(copied_script, [@ack_flag],
+          cd: test_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "POWERSYMPHONY_ROOT"
+      assert output =~ "bin/symphony_start"
+      refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "auto-discovered repo root still reports workflow not found when WORKFLOW.md is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-autodiscovered-root-missing-workflow-#{System.unique_integer([:positive])}"
+      )
+
+    repo_root = Path.join(test_root, "repo")
+    repo_bin = Path.join(repo_root, "bin")
+    repo_elixir = Path.join(repo_root, "elixir")
+    fake_bin = Path.join(test_root, "fake-bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    fake_mise = Path.join(fake_bin, "mise")
+    copied_script = Path.join(repo_bin, "symphony_start")
+    wrapped_symphony = Path.join(repo_bin, "symphony")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(repo_bin)
+      File.mkdir_p!(repo_elixir)
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      File.cp!(@script_path, copied_script)
+      File.chmod!(copied_script, 0o755)
+      write_fake_command(wrapped_symphony, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+      write_fake_command(fake_mise, "exit 0")
+
+      {output, status} =
+        System.cmd(copied_script, [@ack_flag],
+          cd: repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "Workflow file not found:"
+      assert output =~ Path.join(repo_elixir, "WORKFLOW.md")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "copied script succeeds when POWERSYMPHONY_ROOT is provided" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-copied-script-with-root-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    copied_script = Path.join(fake_bin, "symphony_start")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_mise, ~S(printf 'args=%s\n' "$*" > "$TRACE_FILE"))
+      write_fake_command(fake_codex, "exit 0")
+      File.cp!(@script_path, copied_script)
+      File.chmod!(copied_script, 0o755)
+
+      {_, status} =
+        System.cmd(copied_script, [@ack_flag],
+          cd: test_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", home_dir},
+            {"POWERSYMPHONY_ROOT", @repo_root}
+          ]
+        )
+
+      assert status == 0
+      assert File.read!(trace_file) =~ Path.join(@repo_root, "elixir/WORKFLOW.md")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when LINEAR_API_KEY is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-missing-linear-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      write_fake_command(fake_mise, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", test_root}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "linear_api_key.token"
+      assert output =~ ".config/linear"
+      refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when the token file is blank after trimming" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-empty-token-file-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, " \n\t \n")
+      write_fake_command(fake_mise, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "linear_api_key.token"
+      assert output =~ "empty"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when the token path exists but is not a regular file" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-token-not-regular-file-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_path = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_path)
+      write_fake_command(fake_mise, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "linear_api_key.token"
+      assert output =~ "regular file"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when the token file is not readable" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-token-not-readable-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_mise = Path.join(fake_bin, "mise")
+    fake_codex = Path.join(fake_bin, "codex")
+    previous_path = System.get_env("PATH")
+    blocked_root = Path.join(test_root, "blocked")
+    blocked_token_dir = Path.join(blocked_root, ".config/linear")
+    blocked_token_file = Path.join(blocked_token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(blocked_token_dir)
+      File.write!(blocked_token_file, "file-token-value\n")
+      File.chmod!(blocked_root, 0o000)
+      write_fake_command(fake_mise, "exit 0")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", blocked_root}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "linear_api_key.token"
+      assert output =~ "readable"
+    after
+      File.chmod(blocked_root, 0o700)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when codex is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-missing-codex-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:/usr/bin:/bin"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "codex"
+      assert output =~ "PATH"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when the fixed workflow file is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-missing-workflow-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    previous_path = System.get_env("PATH")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"POWERSYMPHONY_ROOT", test_root},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "Workflow file not found:"
+      assert output =~ Path.join(test_root, "elixir/WORKFLOW.md")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when neither XDG_STATE_HOME nor HOME is available" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-missing-home-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    fake_mise = Path.join(fake_bin, "mise")
+    previous_path = System.get_env("PATH")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      write_fake_command(fake_codex, "exit 0")
+      write_fake_command(fake_mise, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"LINEAR_API_KEY", "explicit-env-token"},
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"HOME", nil},
+            {"XDG_STATE_HOME", nil}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "HOME"
+      assert output =~ "XDG_STATE_HOME"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns usage when --logs-root is followed by another option" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-logs-root-followed-by-option-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    fake_mise = Path.join(fake_bin, "mise")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      write_fake_command(fake_codex, "exit 0")
+      write_fake_command(fake_mise, ~S(printf 'args=%s\n' "$*" > "$TRACE_FILE"))
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag, "--logs-root", "--port", "4311"],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", test_root}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "Usage: symphony_start"
+      refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns usage when --port is followed by another option" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-port-followed-by-option-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    fake_mise = Path.join(fake_bin, "mise")
+    trace_file = Path.join(test_root, "mise.trace")
+    previous_path = System.get_env("PATH")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      write_fake_command(fake_codex, "exit 0")
+      write_fake_command(fake_mise, ~S(printf 'args=%s\n' "$*" > "$TRACE_FILE"))
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag, "--port", "--logs-root", "/tmp/logs"],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:#{previous_path}"},
+            {"TRACE_FILE", trace_file},
+            {"HOME", test_root}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "Usage: symphony_start"
+      refute File.exists?(trace_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "help works even when runtime prerequisites are missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-help-without-prereqs-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+
+    try do
+      File.mkdir_p!(fake_bin)
+
+      {output, status} =
+        System.cmd(@script_path, ["--help"],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:/usr/bin:/bin"},
+            {"HOME", nil},
+            {"XDG_STATE_HOME", nil},
+            {"LINEAR_API_KEY", nil}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 0
+      assert output =~ "Usage: symphony_start"
+      refute output =~ "LINEAR_API_KEY"
+      refute output =~ "codex"
+      refute output =~ "Workflow file not found"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "returns a clear error when mise is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-formal-start-missing-mise-#{System.unique_integer([:positive])}"
+      )
+
+    fake_bin = Path.join(test_root, "bin")
+    fake_codex = Path.join(fake_bin, "codex")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_file = Path.join(token_dir, "linear_api_key.token")
+
+    try do
+      File.mkdir_p!(fake_bin)
+      File.mkdir_p!(token_dir)
+      File.write!(token_file, "file-token-value\n")
+      write_fake_command(fake_codex, "exit 0")
+
+      {output, status} =
+        System.cmd(@script_path, [@ack_flag],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{fake_bin}:/usr/bin:/bin"},
+            {"HOME", home_dir}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "mise"
+      assert output =~ "PATH"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp write_fake_command(path, body) do
+    File.write!(path, "#!/usr/bin/env bash\nset -euo pipefail\n#{body}\n")
+    File.chmod!(path, 0o755)
+  end
+end

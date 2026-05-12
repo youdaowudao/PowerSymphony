@@ -56,8 +56,8 @@ mise exec -- elixir --version
 ## Run
 
 ```bash
-git clone https://github.com/openai/symphony
-cd symphony/elixir
+git clone https://github.com/youdaowudao/PowerSymphony.git
+cd PowerSymphony/elixir
 mise trust
 mise install
 mise exec -- mix setup
