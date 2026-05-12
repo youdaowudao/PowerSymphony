@@ -347,7 +347,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
 
-    assert issue.blocked_by == [%{id: "issue-2", identifier: "MT-2", state: "In Progress"}]
+    assert issue.blocked_by == [
+             %{id: "issue-2", identifier: "MT-2", state: "In Progress", project_id: nil, project_slug: nil}
+           ]
+
     assert issue.labels == ["backend"]
     assert issue.priority == 2
     assert issue.state == "Todo"
@@ -458,42 +461,42 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
-  test "orchestrator sorts dispatch by priority then oldest created_at" do
-    issue_same_priority_older = %Issue{
-      id: "issue-old-high",
+  test "orchestrator sorts todo dispatch by created_at then identifier" do
+    issue_older = %Issue{
+      id: "issue-old",
       identifier: "MT-200",
-      title: "Old high priority",
+      title: "Old todo",
+      state: "Todo",
+      priority: 4,
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    issue_same_time_lower_identifier = %Issue{
+      id: "issue-same-time-low",
+      identifier: "MT-199",
+      title: "Same time lower identifier",
       state: "Todo",
       priority: 1,
       created_at: ~U[2026-01-01 00:00:00Z]
     }
 
-    issue_same_priority_newer = %Issue{
-      id: "issue-new-high",
+    issue_missing_created_at = %Issue{
+      id: "issue-missing-created-at",
       identifier: "MT-201",
-      title: "New high priority",
+      title: "Missing created_at",
       state: "Todo",
       priority: 1,
-      created_at: ~U[2026-01-02 00:00:00Z]
-    }
-
-    issue_lower_priority_older = %Issue{
-      id: "issue-old-low",
-      identifier: "MT-199",
-      title: "Old lower priority",
-      state: "Todo",
-      priority: 2,
-      created_at: ~U[2025-12-01 00:00:00Z]
+      created_at: nil
     }
 
     sorted =
       Orchestrator.sort_issues_for_dispatch_for_test([
-        issue_lower_priority_older,
-        issue_same_priority_newer,
-        issue_same_priority_older
+        issue_missing_created_at,
+        issue_older,
+        issue_same_time_lower_identifier
       ])
 
-    assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
+    assert Enum.map(sorted, & &1.identifier) == ["MT-199", "MT-200", "MT-201"]
   end
 
   test "todo issue with non-terminal blocker is not dispatch-eligible" do
@@ -539,6 +542,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "todo issue with terminal blockers remains dispatch-eligible" do
+    write_workflow_file!(Workflow.workflow_file_path(), m3_enabled: true)
+
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
       running: %{},
@@ -556,6 +561,91 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     }
 
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "todo issue with cross-project terminal blocker is not dispatch-eligible" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      m3_enabled: true,
+      tracker_project_slug: "alpha"
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "cross-project-ready-1",
+      identifier: "MT-1010",
+      title: "Blocked in another project",
+      state: "Todo",
+      blocked_by: [
+        %{id: "blocker-cross-project", identifier: "OT-100", state: "Done", project_slug: "beta"}
+      ]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "orchestrator preserves global dispatch order across todo and non-todo active issues" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    orchestrator_name = Module.concat(__MODULE__, :MixedOrderOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      max_concurrent_agents: 1,
+      tracker_active_states: ["Todo", "In Progress", "Rework"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: "active-earlier",
+        identifier: "MT-1011",
+        title: "Manual active should keep precedence",
+        state: "In Progress",
+        created_at: ~U[2026-01-01 00:00:00Z]
+      },
+      %Issue{
+        id: "todo-later",
+        identifier: "MT-1012",
+        title: "Todo should not always jump ahead",
+        state: "Todo",
+        created_at: ~U[2026-01-02 00:00:00Z],
+        blocked_by: []
+      }
+    ])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if is_nil(previous_memory_issues) do
+        Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      else
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, previous_memory_issues)
+      end
+
+      if is_nil(previous_memory_recipient) do
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      else
+        Application.put_env(:symphony_elixir, :memory_tracker_recipient, previous_memory_recipient)
+      end
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    send(pid, :tick)
+
+    refute_receive {:memory_tracker_state_update, "todo-later", "In Progress"}, 200
   end
 
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
@@ -968,6 +1058,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
     assert :ok = Config.validate!()
     assert Config.settings!().worker.max_concurrent_agents_per_host == 2
+  end
+
+  test "config exposes project-level m3 settings from workflow front matter" do
+    workflow = """
+    ---
+    m3:
+      enabled: true
+    ---
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+
+    assert Config.settings!().m3.enabled == true
   end
 
   test "schema helpers cover custom type and state limit validation" do

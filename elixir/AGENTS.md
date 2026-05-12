@@ -9,8 +9,11 @@ This directory contains the Elixir agent orchestration service that polls Linear
 - Full validation command: `make all` (format check, lint, coverage, dialyzer).
 - Do not run `make all` by default.
 - First inspect `git diff` and choose a validation level that matches the change scope.
-- For ordinary local milestone checks or pre-PR self-checks, prefer `SYMPHONY_TEST_MAX_CASES=2 mix test --cover`.
-- Only run `SYMPHONY_TEST_MAX_CASES=2 make all` locally for core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or when reproducing a remote full-gate failure.
+- Do not run full local `mix test --cover`, `make all`, or any other whole-suite validation command unless a human explicitly confirms it.
+- For ordinary local milestone checks or pre-PR self-checks, prefer targeted tests first.
+- If a wider local run is explicitly approved by a human, keep `SYMPHONY_TEST_MAX_CASES` at `10` or below.
+- Only run local `make all` after explicit human confirmation, including for core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or remote full-gate reproduction.
+- Keep local ExUnit concurrency explicitly bounded. Default to `SYMPHONY_TEST_MAX_CASES=4` or lower, and drop to `2` or `1` if the machine is under pressure.
 - GitHub Actions remains the authoritative full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
 - For docs-only updates, read-only investigation, or Linear triage/cleanup, do not run `make all`.
 
@@ -34,10 +37,12 @@ This directory contains the Elixir agent orchestration service that polls Linear
 
 Start by checking `git diff`, then choose the lightest validation that proves the change.
 
+- Important local reminder: do not run full local `mix test --cover`, `make all`, or any other whole-suite test command unless a human explicitly confirms it. Start with targeted tests first and let CI carry the full gate.
 - Docs-only, read-only investigation, or Linear triage/cleanup: no test run required.
 - Localized code changes: run targeted tests that directly cover the edited behavior.
-- Ordinary local milestone checks or pre-PR self-checks: run `SYMPHONY_TEST_MAX_CASES=2 mix test --cover`.
-- Core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or remote gate reproduction: run `SYMPHONY_TEST_MAX_CASES=2 make all`.
+- Ordinary local milestone checks or pre-PR self-checks: stay on targeted tests unless a human explicitly asks for broader coverage; if coverage is approved, keep `SYMPHONY_TEST_MAX_CASES` at `10` or below.
+- Core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or remote gate reproduction: do not run local `make all` without explicit human confirmation, and keep `SYMPHONY_TEST_MAX_CASES` at `10` or below when running wider tests.
+- Local ExUnit concurrency must always be explicitly bounded. Default to `SYMPHONY_TEST_MAX_CASES=4` or lower, and drop to `2` or `1` if the machine shows pressure.
 
 Keep test isolation strict:
 
@@ -46,9 +51,11 @@ Keep test isolation strict:
 - Do not treat the repo `WORKFLOW.md` as the default runtime config in tests.
 
 ```bash
-SYMPHONY_TEST_MAX_CASES=2 mix test --cover
+# Only after explicit human confirmation for a broader local run:
+SYMPHONY_TEST_MAX_CASES=4 mix test --cover
 
-SYMPHONY_TEST_MAX_CASES=2 make all
+# Only after explicit human confirmation:
+SYMPHONY_TEST_MAX_CASES=4 make all
 ```
 
 ## Required Rules

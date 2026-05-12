@@ -9,6 +9,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   alias SymphonyElixir.{HttpServer, ProjectProcessManager}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
+  @spec project_m3_precheck_payload(String.t()) ::
+          {:ok, map()} | {:error, :project_not_found | term()}
+  def project_m3_precheck_payload(project_id) when is_binary(project_id) do
+    project_worker_request(project_id, "/api/v1/m3_precheck")
+  end
+
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
     if control_plane_mode?() do
@@ -55,6 +61,31 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, :project_not_found} ->
         error_response(conn, 404, "project_not_found", "Project not found")
+    end
+  end
+
+  @spec m3_precheck(Conn.t(), map()) :: Conn.t()
+  def m3_precheck(conn, _params) do
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case SymphonyElixir.Orchestrator.m3_precheck(orchestrator()) do
+        {:ok, payload} -> json(conn, Presenter.m3_precheck_payload(payload))
+        {:error, reason} -> error_response(conn, 503, "m3_precheck_unavailable", inspect(reason))
+      end
+    end
+  end
+
+  @spec project_m3_precheck(Conn.t(), map()) :: Conn.t()
+  def project_m3_precheck(conn, %{"project_id" => project_id}) do
+    if control_plane_mode?() do
+      case project_m3_precheck_payload(project_id) do
+        {:ok, payload} -> json(conn, payload)
+        {:error, :project_not_found} -> error_response(conn, 404, "project_not_found", "Project not found")
+        {:error, reason} -> error_response(conn, 503, "m3_precheck_proxy_failed", inspect(reason))
+      end
+    else
+      control_plane_not_available(conn)
     end
   end
 
@@ -162,6 +193,25 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       project_action(conn, project_id, action)
     else
       control_plane_not_available(conn)
+    end
+  end
+
+  defp project_worker_request(project_id, path) when is_binary(project_id) and is_binary(path) do
+    manager_name =
+      Application.get_env(
+        :symphony_elixir,
+        :project_process_manager_name,
+        SymphonyElixir.ProjectProcessManager
+      )
+
+    with {:ok, worker_port} <- ProjectProcessManager.worker_port_for_project(manager_name, project_id),
+         {:ok, %Req.Response{status: status, body: body}} when status in 200..299 <-
+           Req.post("http://127.0.0.1:#{worker_port}#{path}", json: %{}, retry: false) do
+      {:ok, body}
+    else
+      {:error, :not_found} -> {:error, :project_not_found}
+      {:ok, %Req.Response{status: status}} -> {:error, {:worker_status, status}}
+      {:error, reason} -> {:error, reason}
     end
   end
 end

@@ -518,6 +518,47 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "todo auto dispatch requires project-level m3 opt-in" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "todo-no-m3",
+      identifier: "MT-1008",
+      title: "Needs manual start",
+      state: "Todo",
+      blocked_by: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "todo dispatch transitions issue to in progress before spawning worker" do
+    issue = %Issue{
+      id: "todo-transition",
+      identifier: "MT-1009",
+      title: "Transition before run",
+      state: "Todo",
+      blocked_by: []
+    }
+
+    assert {:ok, %Issue{state: "In Progress"} = refreshed_issue} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(
+               issue,
+               fn
+                 ["todo-transition"] -> {:ok, [%Issue{issue | state: "In Progress"}]}
+               end,
+               fn "todo-transition", "In Progress" -> :ok end
+             )
+
+    assert refreshed_issue.identifier == "MT-1009"
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
@@ -2704,6 +2745,64 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "todo continuation retry releases claim when m3 auto dispatch is disabled" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-todo-continuation-disabled"
+    orchestrator_name = Module.concat(__MODULE__, :TodoContinuationDisabledOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: false,
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-570",
+        title: "Todo continuation blocked by m3 opt-in",
+        description: "Should release claim instead of implicit redispatch",
+        state: "Todo",
+        labels: []
+      }
+    ])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          identifier: "MT-570",
+          retry_token: make_ref(),
+          due_at_ms: System.monotonic_time(:millisecond)
+        }
+      })
+    end)
+
+    retry_token = :sys.get_state(pid).retry_attempts[issue_id].retry_token
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute Map.has_key?(state.running, issue_id)
+  end
+
   test "blocked premature turn end claim releases once the issue stops being a candidate" do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
     issue_id = "issue-run-failed-release"
@@ -2754,6 +2853,114 @@ defmodule SymphonyElixir.CoreTest do
 
     refute MapSet.member?(state.claimed, issue_id)
     refute Map.has_key?(state.blocked_claims, issue_id)
+  end
+
+  test "blocked todo claim releases when cross-project dependency is the only blocker" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-cross-project-blocked-claim"
+    orchestrator_name = Module.concat(__MODULE__, :CrossProjectBlockedClaimOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      tracker_project_slug: "alpha",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-571",
+        title: "Cross-project blocked claim",
+        description: "Should release claim once structural error is detected",
+        state: "Todo",
+        blocked_by: [
+          %{id: "other-project-done", identifier: "OT-200", state: "Done", project_slug: "beta"}
+        ],
+        labels: []
+      }
+    ])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:blocked_claims, %{
+        issue_id => %{
+          attempt: 3,
+          identifier: "MT-571",
+          reason: :premature_turn_end,
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-571",
+            state: "Todo",
+            title: "Cross-project blocked claim",
+            description: "Should release claim once structural error is detected",
+            blocked_by: [
+              %{id: "other-project-done", identifier: "OT-200", state: "Done", project_slug: "beta"}
+            ],
+            labels: []
+          }
+        }
+      })
+    end)
+
+    send(pid, :tick)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked_claims, issue_id)
+  end
+
+  test "todo revalidation helper rejects multi-node cyclic dependency when given full candidate set" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      m3_enabled: true,
+      tracker_project_slug: "alpha",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue_a = %Issue{
+      id: "issue-cycle-a",
+      identifier: "MT-572",
+      title: "Cycle A",
+      description: "Should not auto dispatch when the Todo graph contains a cycle",
+      state: "Todo",
+      blocked_by: [%{id: "issue-cycle-b", identifier: "MT-573", state: "Done", project_slug: "alpha"}],
+      created_at: ~U[2026-01-01 00:00:00Z],
+      labels: []
+    }
+
+    issue_b = %Issue{
+      id: "issue-cycle-b",
+      identifier: "MT-573",
+      title: "Cycle B",
+      description: "Completes the Todo cycle",
+      state: "Todo",
+      blocked_by: [%{id: "issue-cycle-a", identifier: "MT-572", state: "Done", project_slug: "alpha"}],
+      created_at: ~U[2026-01-02 00:00:00Z],
+      labels: []
+    }
+
+    assert {:skip, %Issue{id: "issue-cycle-a"}} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(
+               issue_a,
+               fn ["issue-cycle-a"] -> {:ok, [issue_a]} end,
+               fn -> {:ok, [issue_a, issue_b]} end
+             )
   end
 
   test "blocked premature turn end claim releases once the issue reaches a terminal state" do

@@ -23,6 +23,10 @@ defmodule SymphonyElixir.Linear.Client do
         }
         branchName
         url
+        project {
+          id
+          slugId
+        }
         assignee {
           id
         }
@@ -37,6 +41,10 @@ defmodule SymphonyElixir.Linear.Client do
             issue {
               id
               identifier
+              project {
+                id
+                slugId
+              }
               state {
                 name
               }
@@ -68,6 +76,10 @@ defmodule SymphonyElixir.Linear.Client do
         }
         branchName
         url
+        project {
+          id
+          slugId
+        }
         assignee {
           id
         }
@@ -82,6 +94,10 @@ defmodule SymphonyElixir.Linear.Client do
             issue {
               id
               identifier
+              project {
+                id
+                slugId
+              }
               state {
                 name
               }
@@ -458,6 +474,8 @@ defmodule SymphonyElixir.Linear.Client do
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      project_id: get_in(issue, ["project", "id"]),
+      project_slug: get_in(issue, ["project", "slugId"]),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
@@ -558,7 +576,9 @@ defmodule SymphonyElixir.Linear.Client do
             %{
               id: blocker_issue["id"],
               identifier: blocker_issue["identifier"],
-              state: get_in(blocker_issue, ["state", "name"])
+              state: get_in(blocker_issue, ["state", "name"]),
+              project_id: get_in(blocker_issue, ["project", "id"]),
+              project_slug: get_in(blocker_issue, ["project", "slugId"])
             }
           ]
         else

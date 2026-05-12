@@ -321,7 +321,46 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
-    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set(), [issue])
+  end
+
+  @doc false
+  @spec prepare_issue_for_dispatch_for_test(
+          Issue.t(),
+          ([String.t()] -> {:ok, [Issue.t()]} | {:error, term()}),
+          (String.t(), String.t() -> :ok | {:error, term()})
+        ) :: {:ok, Issue.t()} | {:error, term()} | {:skip, term()}
+  def prepare_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher, issue_state_updater)
+      when is_function(issue_fetcher, 1) and is_function(issue_state_updater, 2) do
+    prepare_issue_for_dispatch_for_test(
+      issue,
+      issue_fetcher,
+      issue_state_updater,
+      fn -> {:ok, [issue]} end
+    )
+  end
+
+  @spec prepare_issue_for_dispatch_for_test(
+          Issue.t(),
+          ([String.t()] -> {:ok, [Issue.t()]} | {:error, term()}),
+          (String.t(), String.t() -> :ok | {:error, term()}),
+          (-> {:ok, [Issue.t()]} | {:error, term()})
+        ) :: {:ok, Issue.t()} | {:error, term()} | {:skip, term()}
+  def prepare_issue_for_dispatch_for_test(
+        %Issue{} = issue,
+        issue_fetcher,
+        issue_state_updater,
+        candidate_fetcher
+      )
+      when is_function(issue_fetcher, 1) and is_function(issue_state_updater, 2) and
+             is_function(candidate_fetcher, 0) do
+    prepare_issue_for_dispatch(
+      issue,
+      issue_fetcher,
+      issue_state_updater,
+      candidate_fetcher,
+      terminal_state_set()
+    )
   end
 
   @doc false
@@ -329,7 +368,23 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
-    revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+    revalidate_issue_for_dispatch_for_test(issue, issue_fetcher, fn -> {:ok, [issue]} end)
+  end
+
+  @spec revalidate_issue_for_dispatch_for_test(
+          Issue.t(),
+          ([String.t()] -> term()),
+          (-> {:ok, [Issue.t()]} | {:error, term()})
+        ) ::
+          {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
+  def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher, candidate_fetcher)
+      when is_function(issue_fetcher, 1) and is_function(candidate_fetcher, 0) do
+    revalidate_issue_for_dispatch_for_test(
+      issue,
+      issue_fetcher,
+      candidate_fetcher,
+      terminal_state_set()
+    )
   end
 
   @doc false
@@ -535,7 +590,7 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) do
         dispatch_issue(state_acc, issue)
       else
         state_acc
@@ -546,15 +601,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
       %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+        {issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
 
       _ ->
-        {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+        {issue_created_at_sort_key(nil), ""}
     end)
   end
-
-  defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
-  defp priority_rank(_priority), do: 5
 
   defp issue_created_at_sort_key(%Issue{created_at: %DateTime{} = created_at}) do
     DateTime.to_unix(created_at, :microsecond)
@@ -567,9 +619,10 @@ defmodule SymphonyElixir.Orchestrator do
          %Issue{} = issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
-         terminal_states
+         terminal_states,
+         candidate_issues
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    dispatch_candidate_issue?(issue, active_states, terminal_states, candidate_issues) and
       !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -578,7 +631,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_slots_available?(state)
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states, _candidate_issues), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -647,6 +700,28 @@ defmodule SymphonyElixir.Orchestrator do
     MapSet.member?(active_states, normalize_issue_state(state_name))
   end
 
+  defp dispatch_candidate_issue?(%Issue{} = issue, active_states, terminal_states, candidate_issues) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      todo_issue_dispatch_allowed?(issue, candidate_issues)
+  end
+
+  defp todo_issue_dispatch_allowed?(%Issue{state: state_name} = issue, candidate_issues)
+       when is_binary(state_name) and is_list(candidate_issues) do
+    case normalize_issue_state(state_name) do
+      "todo" -> Config.m3_enabled?() and not todo_issue_has_structural_errors?(issue, candidate_issues)
+      _other -> true
+    end
+  end
+
+  defp todo_issue_has_structural_errors?(%Issue{} = issue, issues) when is_list(issues) do
+    SymphonyElixir.M3Precheck.structural_errors_for_issue(issue, issues, %{
+      current_project_slug: Config.settings!().tracker.project_slug,
+      current_project_id: nil
+    }) != []
+  end
+
+  defp todo_issue_has_structural_errors?(_issue, _issues), do: false
+
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
   end
@@ -666,7 +741,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+    case prepare_issue_for_dispatch(
+           issue,
+           &Tracker.fetch_issue_states_by_ids/1,
+           &Tracker.update_issue_state/2,
+           &Tracker.fetch_candidate_issues/0,
+           terminal_state_set()
+         ) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
@@ -685,6 +766,107 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp prepare_issue_for_dispatch(
+         %Issue{} = issue,
+         issue_fetcher,
+         issue_state_updater,
+         candidate_fetcher,
+         terminal_states
+       )
+       when is_function(issue_fetcher, 1) and is_function(issue_state_updater, 2) and
+              is_function(candidate_fetcher, 0) do
+    with {:ok, %Issue{} = refreshed_issue} <-
+           prepare_issue_candidate(issue, issue_fetcher, candidate_fetcher, terminal_states),
+         {:ok, %Issue{} = dispatch_issue} <-
+           maybe_transition_todo_to_in_progress(
+             refreshed_issue,
+             issue_fetcher,
+             issue_state_updater,
+             candidate_fetcher,
+             terminal_states
+           ) do
+      {:ok, dispatch_issue}
+    end
+  end
+
+  defp prepare_issue_candidate(%Issue{} = issue, issue_fetcher, candidate_fetcher, terminal_states) do
+    case revalidate_issue_for_dispatch(issue, issue_fetcher, candidate_fetcher, terminal_states) do
+      {:ok, %Issue{} = refreshed_issue} -> {:ok, refreshed_issue}
+      {:skip, reason} -> {:skip, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_transition_todo_to_in_progress(
+         %Issue{state: state_name} = issue,
+         issue_fetcher,
+         issue_state_updater,
+         candidate_fetcher,
+         terminal_states
+       )
+       when is_binary(state_name) do
+    if normalize_issue_state(state_name) == "todo" do
+      with :ok <- issue_state_updater.(issue.id, "In Progress"),
+           {:ok, [%Issue{} = refreshed_issue | _]} <- issue_fetcher.([issue.id]),
+           true <- normalize_issue_state(refreshed_issue.state) == "in progress",
+           {:ok, candidate_issues} <- candidate_fetcher.(),
+           true <- retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
+        {:ok, refreshed_issue}
+      else
+        false -> {:error, :issue_not_in_progress_after_update}
+        {:ok, []} -> {:error, :issue_missing_after_update}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, other}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp maybe_transition_todo_to_in_progress(
+         issue,
+         _issue_fetcher,
+         _issue_state_updater,
+         _candidate_fetcher,
+         _terminal_states
+       ),
+       do: {:ok, issue}
+
+  @spec m3_precheck() :: {:ok, map()} | {:error, term()}
+  def m3_precheck, do: m3_precheck(__MODULE__)
+
+  @spec m3_precheck(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  def m3_precheck(orchestrator_name) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, issues} ->
+        {:ok,
+         SymphonyElixir.M3Precheck.run(issues, %{
+           current_project_slug: Config.settings!().tracker.project_slug,
+           current_project_id: nil,
+           m3_enabled: Config.m3_enabled?(),
+           max_concurrent_agents: Config.settings!().agent.max_concurrent_agents,
+           active_running_count: map_size(snapshot_running_map(orchestrator_name)),
+           terminal_states: Config.settings!().tracker.terminal_states
+         })}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp snapshot_running_map(orchestrator_name) do
+    case Process.whereis(orchestrator_name) do
+      pid when is_pid(pid) ->
+        case :sys.get_state(pid) do
+          %State{running: running} when is_map(running) -> running
+          _ -> %{}
+        end
+
+      _ ->
+        %{}
+    end
+  end
+
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
@@ -694,11 +876,17 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        retry_workspace_path =
+          case Map.get(state.retry_attempts, issue.id) do
+            %{workspace_path: workspace_path} -> workspace_path
+            _ -> nil
+          end
+
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, retry_workspace_path)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, retry_workspace_path) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -714,7 +902,7 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: issue.identifier,
             issue: issue,
             worker_host: worker_host,
-            workspace_path: nil,
+            workspace_path: retry_workspace_path,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -752,25 +940,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
-       when is_binary(issue_id) and is_function(issue_fetcher, 1) do
-    case issue_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
-          {:ok, refreshed_issue}
-        else
-          {:skip, refreshed_issue}
-        end
-
-      {:ok, []} ->
-        {:skip, :missing}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, candidate_fetcher, terminal_states)
+       when is_binary(issue_id) and is_function(issue_fetcher, 1) and is_function(candidate_fetcher, 0) do
+    do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states)
   end
 
-  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _candidate_fetcher, _terminal_states),
+    do: {:ok, issue}
+
+  defp revalidate_issue_for_dispatch_for_test(
+         %Issue{id: issue_id},
+         issue_fetcher,
+         candidate_fetcher,
+         terminal_states
+       )
+       when is_binary(issue_id) and is_function(issue_fetcher, 1) and is_function(candidate_fetcher, 0) do
+    do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states)
+  end
+
+  defp revalidate_issue_for_dispatch_for_test(issue, _issue_fetcher, _candidate_fetcher, _terminal_states),
+    do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id, opts \\ []) do
     state = %{
@@ -869,20 +1058,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
 
-    cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
-
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
-
-      retry_candidate_issue?(issue, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata)
-
-      true ->
-        Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
-
-        {:noreply, release_issue_claim(state, issue_id)}
+    if terminal_issue_state?(issue.state, terminal_states) do
+      handle_terminal_retry_issue(state, issue, issue_id, metadata)
+    else
+      handle_non_terminal_retry_issue(state, issue, issue_id, attempt, metadata, terminal_states)
     end
   end
 
@@ -949,24 +1128,7 @@ defmodule SymphonyElixir.Orchestrator do
          )}
       end
     else
-      if retry_candidate_issue?(issue, terminal_state_set()) and
-           dispatch_slots_available?(issue, state) and
-           worker_slots_available?(state, metadata[:worker_host]) do
-        {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
-      else
-        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
-
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue.id,
-           attempt + 1,
-           Map.merge(metadata, %{
-             identifier: issue.identifier,
-             error: "no available orchestrator slots"
-           })
-         )}
-      end
+      retry_or_reschedule_active_issue(state, issue, attempt, metadata)
     end
   end
 
@@ -1194,23 +1356,124 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_blocked_claim_issue_state(%State{} = state, %Issue{} = issue, terminal_states) do
     if Map.has_key?(state.blocked_claims, issue.id) do
-      cond do
-        terminal_issue_state?(issue.state, terminal_states) ->
-          Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
+      reconcile_existing_blocked_claim_issue(state, issue, terminal_states)
+    else
+      state
+    end
+  end
 
-          cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
-          release_issue_claim(state, issue.id)
+  defp do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        revalidate_refreshed_issue(refreshed_issue, candidate_fetcher, terminal_states)
 
-        retry_candidate_issue?(issue, terminal_states) ->
+      {:ok, []} ->
+        {:skip, :missing}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp revalidate_refreshed_issue(refreshed_issue, candidate_fetcher, terminal_states) do
+    case candidate_fetcher.() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
+          {:ok, refreshed_issue}
+        else
+          {:skip, refreshed_issue}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp handle_terminal_retry_issue(state, issue, issue_id, metadata) do
+    Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
+
+    cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+    {:noreply, release_issue_claim(state, issue_id)}
+  end
+
+  defp handle_non_terminal_retry_issue(state, issue, issue_id, attempt, metadata, terminal_states) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
+          handle_active_retry(state, issue, attempt, metadata)
+        else
+          Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+          {:noreply, release_issue_claim(state, issue_id)}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues during retry evaluation for #{issue_context(issue)}: #{inspect(reason)}")
+        {:noreply, release_issue_claim(state, issue_id)}
+    end
+  end
+
+  defp retry_or_reschedule_active_issue(state, issue, attempt, metadata) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if can_dispatch_retried_issue?(issue, state, metadata, candidate_issues) do
+          {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+        else
+          Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue.id,
+             attempt + 1,
+             Map.merge(metadata, %{
+               identifier: issue.identifier,
+               error: "no available orchestrator slots"
+             })
+           )}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues before retry dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+        {:noreply, release_issue_claim(state, issue.id)}
+    end
+  end
+
+  defp can_dispatch_retried_issue?(issue, state, metadata, candidate_issues) do
+    retry_candidate_issue?(issue, terminal_state_set(), candidate_issues) and
+      dispatch_slots_available?(issue, state) and
+      worker_slots_available?(state, metadata[:worker_host])
+  end
+
+  defp reconcile_existing_blocked_claim_issue(state, issue, terminal_states) do
+    if terminal_issue_state?(issue.state, terminal_states) do
+      release_terminal_blocked_claim_issue(state, issue)
+    else
+      reconcile_active_blocked_claim_issue(state, issue, terminal_states)
+    end
+  end
+
+  defp release_terminal_blocked_claim_issue(state, issue) do
+    Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
+
+    cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
+    release_issue_claim(state, issue.id)
+  end
+
+  defp reconcile_active_blocked_claim_issue(state, issue, terminal_states) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
           put_blocked_claim_issue(state, issue.id, issue)
-
-        true ->
+        else
           Logger.info("Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim")
 
           release_issue_claim(state, issue.id)
-      end
-    else
-      state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues for blocked claim reconciliation #{issue_context(issue)}: #{inspect(reason)}")
+
+        release_issue_claim(state, issue.id)
     end
   end
 
@@ -1544,10 +1807,12 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) and
+  defp retry_candidate_issue?(%Issue{} = issue, terminal_states, candidate_issues) when is_list(candidate_issues) do
+    dispatch_candidate_issue?(issue, active_state_set(), terminal_states, candidate_issues) and
       !issue_blocked_by_non_terminal?(issue, terminal_states)
   end
+
+  defp retry_candidate_issue?(_issue, _terminal_states, _candidate_issues), do: false
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)

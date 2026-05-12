@@ -138,6 +138,11 @@ defmodule SymphonyElixir.ProjectProcessManager do
     GenServer.call(server, {:record_health_failure, project_id, observed_at, error}, 15_000)
   end
 
+  @spec worker_port_for_project(GenServer.name(), String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def worker_port_for_project(server \\ default_name(), project_id) when is_binary(project_id) do
+    GenServer.call(server, {:worker_port_for_project, project_id}, 15_000)
+  end
+
   @impl true
   def init(opts) do
     command_builder = Keyword.get(opts, :command_builder, &default_command_builder/1)
@@ -256,6 +261,30 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   def handle_call({:record_health_failure, project_id, observed_at, error}, _from, state) do
     {:reply, :ok, update_health_runtime(state, project_id, &health_failure_state(&1, observed_at, error))}
+  end
+
+  def handle_call({:worker_port_for_project, project_id}, _from, state) do
+    registry =
+      project_static_registry()
+      |> project_registry_with_runtime(state.runtimes)
+
+    reply =
+      case find_entry(registry, project_id) do
+        {:ok, entry} ->
+          runtime_state = Map.get(entry, :runtime_state, %{})
+          worker_port = Map.get(runtime_state, :worker_port) || (entry.normalized_config && entry.normalized_config.worker_port)
+
+          if is_integer(worker_port) do
+            {:ok, worker_port}
+          else
+            {:error, :worker_port_unavailable}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+
+    {:reply, reply, state}
   end
 
   @impl true

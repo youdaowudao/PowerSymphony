@@ -113,6 +113,7 @@ defmodule SymphonyElixir.TestSupport do
           control_plane: nil,
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          m3_enabled: false,
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
@@ -151,6 +152,7 @@ defmodule SymphonyElixir.TestSupport do
     control_plane = Keyword.get(config, :control_plane)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    m3_enabled = Keyword.get(config, :m3_enabled)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
@@ -191,6 +193,8 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         control_plane_yaml(control_plane),
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        "m3:",
+        "  enabled: #{yaml_value(m3_enabled)}",
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
