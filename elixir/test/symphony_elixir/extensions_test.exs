@@ -78,6 +78,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule M3PrecheckOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts) do
+      running = Keyword.get(opts, :running, %{})
+
+      state = %SymphonyElixir.Orchestrator.State{
+        running: running,
+        claimed: MapSet.new(),
+        blocked_claims: %{},
+        retry_attempts: %{},
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: Keyword.get(opts, :max_concurrent_agents, 10)
+      }
+
+      {:ok, state}
+    end
+  end
+
   defmodule StaticProjectRegistry do
     defstruct entries: []
   end
@@ -1647,6 +1671,101 @@ defmodule SymphonyElixir.ExtensionsTest do
       rendered = render(view)
       rendered =~ "Gamma" and rendered =~ "running"
     end)
+  end
+
+  test "workflow m3 precheck endpoint explains disabled auto dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", m3_enabled: false)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [%Issue{id: "issue-1", identifier: "MT-1", title: "Todo", state: "Todo"}])
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :WorkflowM3PrecheckOrchestrator))
+
+    payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)
+
+    assert payload["m3_enabled"] == false
+    assert payload["eligible"] == []
+    assert payload["text"] =~ "M3 is disabled"
+  end
+
+  test "workflow m3 precheck endpoint uses current orchestrator instance running state" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", m3_enabled: true, max_concurrent_agents: 2)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-1", identifier: "MT-1", title: "Todo 1", state: "Todo"},
+      %Issue{id: "issue-2", identifier: "MT-2", title: "Todo 2", state: "Todo"}
+    ])
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkflowM3PrecheckRunningOrchestrator)
+
+    start_supervised!(
+      {M3PrecheckOrchestrator,
+       name: orchestrator_name,
+       max_concurrent_agents: 2,
+       running: %{
+         "running-1" => %{issue: %Issue{id: "running-1", identifier: "RUN-1", state: "In Progress"}}
+       }}
+    )
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)
+
+    assert Enum.map(payload["dispatch"], & &1["issue_identifier"]) == ["MT-1"]
+    assert payload["text"] =~ "Eligible Todo waiting for free capacity: MT-2"
+  end
+
+  test "control-plane project m3 precheck route proxies worker result" do
+    test_root = temp_root!("project-precheck")
+    manager_name = Module.concat(__MODULE__, ProjectPrecheckManager)
+    port = reserve_tcp_port!()
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    register_project_cleanup(manager_name, ["alpha"], [port])
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    payload = json_response(post(build_conn(), "/api/v1/projects/alpha/m3_precheck", %{}), 200)
+
+    assert payload["text"] =~ "fake worker m3 precheck"
+  end
+
+  test "control-plane dashboard renders m3 precheck result on demand" do
+    test_root = temp_root!("project-precheck-live")
+    manager_name = Module.concat(__MODULE__, ProjectPrecheckLiveManager)
+    port = reserve_tcp_port!()
+    config_path = write_projects_config!(test_root, [project_fixture(test_root, "alpha", port)])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    register_project_cleanup(manager_name, ["alpha"], [port])
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "运行预检"
+
+    view
+    |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='alpha']")
+    |> render_click()
+
+    assert render(view) =~ "fake worker m3 precheck"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do

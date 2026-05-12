@@ -6,7 +6,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixir.{HttpServer, ProjectProcessManager}
-  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixirWeb.{Endpoint, ObservabilityApiController, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
   @impl true
@@ -19,6 +19,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:projects_payload, load_projects_payload())
       |> assign(:runtime_mode, runtime_mode)
       |> assign(:project_action_feedback, nil)
+      |> assign(:m3_precheck_results, %{})
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -67,6 +68,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
      |> assign(:projects_payload, load_projects_payload())
      |> assign(:project_action_feedback, feedback)
      |> assign(:now, DateTime.utc_now())}
+  end
+
+  def handle_event("run_m3_precheck", %{"project_id" => project_id}, socket) do
+    result =
+      if socket.assigns.runtime_mode == :control_plane do
+        case ObservabilityApiController.project_m3_precheck_payload(project_id) do
+          {:ok, body} -> body
+          _ -> %{"text" => "m3 precheck request failed"}
+        end
+      else
+        case SymphonyElixir.Orchestrator.m3_precheck() do
+          {:ok, payload} -> Presenter.m3_precheck_payload(payload)
+          _ -> %{"text" => "m3 precheck request failed"}
+        end
+      end
+
+    {:noreply, assign(socket, :m3_precheck_results, Map.put(socket.assigns.m3_precheck_results, project_id, result))}
   end
 
   @impl true
@@ -193,7 +211,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         >
                           Restart
                         </button>
+                        <button
+                          type="button"
+                          class="subtle-button"
+                          phx-click="run_m3_precheck"
+                          phx-value-project_id={project.project_id}
+                          disabled={project.worker_status != "running"}
+                        >
+                          运行预检
+                        </button>
                       </div>
+                      <details class="session-stack">
+                        <summary>M3-0 预检</summary>
+                        <pre class="code-panel"><%= get_in(@m3_precheck_results, [project.project_id, "text"]) || "" %></pre>
+                      </details>
                     </td>
                   </tr>
                 </tbody>

@@ -33,15 +33,17 @@
 ## 本地验证分层规则
 
 - 先看 `git diff`，再选择能证明改动正确性的最轻验证；禁止把本地 `make all` 当成所有 PR 的默认动作。
+- 重要提醒：未经人类明确确认，禁止在本地直接跑全量 `mix test --cover`、`make all` 或其他会扫完整测试集的命令；本地先从定向测试开始，full gate 留给 CI。
 - 文档更新、只读排查、Linear 分诊或清理：不要求跑测试。
 - 局部代码改动：先跑定向测试；必要时补 `cd elixir && mise exec -- mix format --check-formatted`、`cd elixir && mise exec -- mix lint` 等局部门禁。
-- 普通功能分支在里程碑点或 PR 前的本地自检：优先使用 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
-- 本地 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all` 仅用于高风险改动，或远端 full gate 失败后需要本地复现。高风险改动包括：`Application child_specs`、`Orchestrator`、`AgentRunner`、`AppServer`、`SSH`、`live_e2e`、启动流程、测试/构建配置、外部进程编排。
+- 普通功能分支在里程碑点或 PR 前的本地自检：优先使用定向测试；如需扩大范围，先获得人类确认，并把 `SYMPHONY_TEST_MAX_CASES` 控制在 `10` 以内。
+- 本地 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all` 仅用于高风险改动，或远端 full gate 失败后需要本地复现，且同样需要人类明确确认。高风险改动包括：`Application child_specs`、`Orchestrator`、`AgentRunner`、`AppServer`、`SSH`、`live_e2e`、启动流程、测试/构建配置、外部进程编排。
 - GitHub / CI 在命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md` 这些路径时继续执行完整 `make all` 作为远端 full gate；不得因为本地分层验证而降低 coverage threshold、删测试或弱化远端门禁。
 
 ## 本地测试并发约定
 
 - 本地运行 `make all` 或 `mix test --cover` 时，如需主动降低测试并发，使用环境变量 `SYMPHONY_TEST_MAX_CASES` 控制 ExUnit `max_cases`。
+- 本地 ExUnit 并发必须显式受控；`SYMPHONY_TEST_MAX_CASES` 不得超过 `10`，默认先用 `4` 或更低，机器吃紧时优先降到 `2` 或 `1`。
 - 例如：`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all`、`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
 - 该约定仅用于本地执行，不得修改 CI 默认行为，不得借此降低 coverage threshold，也不得删测试。
 

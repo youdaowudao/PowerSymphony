@@ -84,6 +84,21 @@ defmodule SymphonyElixirWeb.Presenter do
      }}
   end
 
+  @spec m3_precheck_payload(map()) :: map()
+  def m3_precheck_payload(payload) when is_map(payload) do
+    %{
+      generated_at: generated_at(),
+      m3_enabled: Map.get(payload, :m3_enabled),
+      eligible: Enum.map(Map.get(payload, :eligible, []), &issue_precheck_entry/1),
+      dispatch: Enum.map(Map.get(payload, :dispatch, []), &issue_precheck_entry/1),
+      blocked: Map.get(payload, :blocked, %{}),
+      structural_errors: Map.get(payload, :structural_errors, []),
+      warnings: Map.get(payload, :warnings, []),
+      convergence_points: Map.get(payload, :convergence_points, []),
+      text: Map.get(payload, :text, "")
+    }
+  end
+
   @spec projects_payload(ProjectRegistry.t() | %{entries: [map()]}) :: map()
   def projects_payload(registry) do
     %{
@@ -277,6 +292,10 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }
+  end
+
+  defp issue_precheck_entry(%{identifier: identifier, id: issue_id, state: state}) do
+    %{"issue_identifier" => identifier, "issue_id" => issue_id, "state" => state}
   end
 
   defp workspace_path(issue_identifier, running, retry) do

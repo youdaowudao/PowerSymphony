@@ -54,7 +54,16 @@ case mode do
         :ok =
           :gen_tcp.send(
             socket,
-            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            case request_path.(request) do
+              "/api/v1/m3_precheck" ->
+                body =
+                  ~s({"generated_at":"2026-05-12T00:00:00Z","m3_enabled":true,"eligible":[],"dispatch":[],"blocked":{},"structural_errors":[],"warnings":[],"convergence_points":[],"text":"fake worker m3 precheck"})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
           )
 
         :gen_tcp.close(socket)
