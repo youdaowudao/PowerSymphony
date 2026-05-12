@@ -1675,7 +1675,11 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   test "workflow m3 precheck endpoint explains disabled auto dispatch" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", m3_enabled: false)
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [%Issue{id: "issue-1", identifier: "MT-1", title: "Todo", state: "Todo"}])
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-1", identifier: "MT-1", title: "Todo", state: "Todo"}
+    ])
+
     start_test_endpoint(orchestrator: Module.concat(__MODULE__, :WorkflowM3PrecheckOrchestrator))
 
     payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)

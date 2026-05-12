@@ -101,15 +101,7 @@ defmodule SymphonyElixir.M3Precheck do
 
     blocker_analysis =
       Enum.reduce(issue.blocked_by || [], %{terminal: [], non_terminal: []}, fn blocker, acc ->
-        if blocker_terminal?(blocker, terminal_states) do
-          %{acc | terminal: [blocker | acc.terminal]}
-        else
-          if blocker_self_reference?(issue, blocker) do
-            acc
-          else
-            %{acc | non_terminal: [blocker | acc.non_terminal]}
-          end
-        end
+        classify_blocker(acc, issue, blocker, terminal_states)
       end)
 
     reasons =
@@ -137,7 +129,11 @@ defmodule SymphonyElixir.M3Precheck do
     []
     |> maybe_add_structural_error(self_dependency, issue, :self_dependency)
     |> maybe_add_structural_error(cross_project_dependency, issue, :cross_project_dependency)
-    |> maybe_add_structural_error(!self_dependency and !cross_project_dependency and cyclic_dependency?(issue, todo_issues), issue, :cyclic_dependency)
+    |> maybe_add_structural_error(
+      !self_dependency and !cross_project_dependency and cyclic_dependency?(issue, todo_issues),
+      issue,
+      :cyclic_dependency
+    )
   end
 
   defp self_dependency?(%Issue{id: id, identifier: identifier, blocked_by: blockers}) when is_list(blockers) do
@@ -174,7 +170,8 @@ defmodule SymphonyElixir.M3Precheck do
     todo_identifiers = Map.new(todo_issues, fn candidate -> {candidate.identifier, candidate} end)
 
     Enum.any?(issue.blocked_by || [], fn blocker ->
-      blocker_issue = Map.get(todo_ids, Map.get(blocker, :id)) || Map.get(todo_identifiers, Map.get(blocker, :identifier))
+      blocker_issue = find_blocker_issue(blocker, todo_ids, todo_identifiers)
+
       blocker_issue && depends_on?(blocker_issue, issue, todo_ids, todo_identifiers, MapSet.new())
     end)
   end
@@ -193,16 +190,36 @@ defmodule SymphonyElixir.M3Precheck do
         next_visited = MapSet.put(visited, current_key)
 
         Enum.any?(current.blocked_by || [], fn blocker ->
-          blocker_issue = Map.get(todo_ids, Map.get(blocker, :id)) || Map.get(todo_identifiers, Map.get(blocker, :identifier))
-
-          cond do
-            Map.get(blocker, :id) == target.id -> true
-            Map.get(blocker, :identifier) == target.identifier -> true
-            blocker_issue -> depends_on?(blocker_issue, target, todo_ids, todo_identifiers, next_visited)
-            true -> false
-          end
+          depends_on_blocker?(blocker, target, todo_ids, todo_identifiers, next_visited)
         end)
     end
+  end
+
+  defp classify_blocker(acc, issue, blocker, terminal_states) do
+    cond do
+      blocker_terminal?(blocker, terminal_states) ->
+        %{acc | terminal: [blocker | acc.terminal]}
+
+      blocker_self_reference?(issue, blocker) ->
+        acc
+
+      true ->
+        %{acc | non_terminal: [blocker | acc.non_terminal]}
+    end
+  end
+
+  defp find_blocker_issue(blocker, todo_ids, todo_identifiers) do
+    Map.get(todo_ids, Map.get(blocker, :id)) ||
+      Map.get(todo_identifiers, Map.get(blocker, :identifier))
+  end
+
+  defp depends_on_blocker?(blocker, target, todo_ids, todo_identifiers, next_visited) do
+    blocker_issue = find_blocker_issue(blocker, todo_ids, todo_identifiers)
+
+    Map.get(blocker, :id) == target.id ||
+      Map.get(blocker, :identifier) == target.identifier ||
+      (blocker_issue &&
+         depends_on?(blocker_issue, target, todo_ids, todo_identifiers, next_visited))
   end
 
   defp blocker_terminal?(%{state: state}, terminal_states) when is_binary(state) do

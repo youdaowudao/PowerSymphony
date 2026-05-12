@@ -946,26 +946,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, candidate_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) and is_function(candidate_fetcher, 0) do
-    case issue_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        case candidate_fetcher.() do
-          {:ok, candidate_issues} ->
-            if retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
-              {:ok, refreshed_issue}
-            else
-              {:skip, refreshed_issue}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:ok, []} ->
-        {:skip, :missing}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states)
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _candidate_fetcher, _terminal_states),
@@ -978,26 +959,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        )
        when is_binary(issue_id) and is_function(issue_fetcher, 1) and is_function(candidate_fetcher, 0) do
-    case issue_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        case candidate_fetcher.() do
-          {:ok, candidate_issues} ->
-            if retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
-              {:ok, refreshed_issue}
-            else
-              {:skip, refreshed_issue}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:ok, []} ->
-        {:skip, :missing}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states)
   end
 
   defp revalidate_issue_for_dispatch_for_test(issue, _issue_fetcher, _candidate_fetcher, _terminal_states),
@@ -1100,28 +1062,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
 
-    cond do
-      terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
-
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
-
-      true ->
-        case Tracker.fetch_candidate_issues() do
-          {:ok, candidate_issues} ->
-            if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
-              handle_active_retry(state, issue, attempt, metadata)
-            else
-              Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
-
-              {:noreply, release_issue_claim(state, issue_id)}
-            end
-
-          {:error, reason} ->
-            Logger.warning("Failed to fetch candidate issues during retry evaluation for #{issue_context(issue)}: #{inspect(reason)}")
-            {:noreply, release_issue_claim(state, issue_id)}
-        end
+    if terminal_issue_state?(issue.state, terminal_states) do
+      handle_terminal_retry_issue(state, issue, issue_id, metadata)
+    else
+      handle_non_terminal_retry_issue(state, issue, issue_id, attempt, metadata, terminal_states)
     end
   end
 
@@ -1188,31 +1132,7 @@ defmodule SymphonyElixir.Orchestrator do
          )}
       end
     else
-      case Tracker.fetch_candidate_issues() do
-        {:ok, candidate_issues} ->
-          if retry_candidate_issue?(issue, terminal_state_set(), candidate_issues) and
-               dispatch_slots_available?(issue, state) and
-               worker_slots_available?(state, metadata[:worker_host]) do
-            {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
-          else
-            Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
-
-            {:noreply,
-             schedule_issue_retry(
-               state,
-               issue.id,
-               attempt + 1,
-               Map.merge(metadata, %{
-                 identifier: issue.identifier,
-                 error: "no available orchestrator slots"
-               })
-             )}
-          end
-
-        {:error, reason} ->
-          Logger.warning("Failed to fetch candidate issues before retry dispatch for #{issue_context(issue)}: #{inspect(reason)}")
-          {:noreply, release_issue_claim(state, issue.id)}
-      end
+      retry_or_reschedule_active_issue(state, issue, attempt, metadata)
     end
   end
 
@@ -1440,30 +1360,124 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_blocked_claim_issue_state(%State{} = state, %Issue{} = issue, terminal_states) do
     if Map.has_key?(state.blocked_claims, issue.id) do
-      cond do
-        terminal_issue_state?(issue.state, terminal_states) ->
-          Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
-
-          cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
-          release_issue_claim(state, issue.id)
-
-        true ->
-          case Tracker.fetch_candidate_issues() do
-            {:ok, candidate_issues} ->
-              if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
-                put_blocked_claim_issue(state, issue.id, issue)
-              else
-                Logger.info("Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim")
-                release_issue_claim(state, issue.id)
-              end
-
-            {:error, reason} ->
-              Logger.warning("Failed to fetch candidate issues for blocked claim reconciliation #{issue_context(issue)}: #{inspect(reason)}")
-              release_issue_claim(state, issue.id)
-          end
-      end
+      reconcile_existing_blocked_claim_issue(state, issue, terminal_states)
     else
       state
+    end
+  end
+
+  defp do_revalidate_issue_for_dispatch(issue_id, issue_fetcher, candidate_fetcher, terminal_states) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        revalidate_refreshed_issue(refreshed_issue, candidate_fetcher, terminal_states)
+
+      {:ok, []} ->
+        {:skip, :missing}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp revalidate_refreshed_issue(refreshed_issue, candidate_fetcher, terminal_states) do
+    case candidate_fetcher.() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
+          {:ok, refreshed_issue}
+        else
+          {:skip, refreshed_issue}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp handle_terminal_retry_issue(state, issue, issue_id, metadata) do
+    Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
+
+    cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+    {:noreply, release_issue_claim(state, issue_id)}
+  end
+
+  defp handle_non_terminal_retry_issue(state, issue, issue_id, attempt, metadata, terminal_states) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
+          handle_active_retry(state, issue, attempt, metadata)
+        else
+          Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+          {:noreply, release_issue_claim(state, issue_id)}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues during retry evaluation for #{issue_context(issue)}: #{inspect(reason)}")
+        {:noreply, release_issue_claim(state, issue_id)}
+    end
+  end
+
+  defp retry_or_reschedule_active_issue(state, issue, attempt, metadata) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if can_dispatch_retried_issue?(issue, state, metadata, candidate_issues) do
+          {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+        else
+          Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue.id,
+             attempt + 1,
+             Map.merge(metadata, %{
+               identifier: issue.identifier,
+               error: "no available orchestrator slots"
+             })
+           )}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues before retry dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+        {:noreply, release_issue_claim(state, issue.id)}
+    end
+  end
+
+  defp can_dispatch_retried_issue?(issue, state, metadata, candidate_issues) do
+    retry_candidate_issue?(issue, terminal_state_set(), candidate_issues) and
+      dispatch_slots_available?(issue, state) and
+      worker_slots_available?(state, metadata[:worker_host])
+  end
+
+  defp reconcile_existing_blocked_claim_issue(state, issue, terminal_states) do
+    if terminal_issue_state?(issue.state, terminal_states) do
+      release_terminal_blocked_claim_issue(state, issue)
+    else
+      reconcile_active_blocked_claim_issue(state, issue, terminal_states)
+    end
+  end
+
+  defp release_terminal_blocked_claim_issue(state, issue) do
+    Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
+
+    cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
+    release_issue_claim(state, issue.id)
+  end
+
+  defp reconcile_active_blocked_claim_issue(state, issue, terminal_states) do
+    case Tracker.fetch_candidate_issues() do
+      {:ok, candidate_issues} ->
+        if retry_candidate_issue?(issue, terminal_states, candidate_issues) do
+          put_blocked_claim_issue(state, issue.id, issue)
+        else
+          Logger.info("Blocked claim issue is no longer a retry candidate: #{issue_context(issue)} state=#{issue.state}; releasing claim")
+
+          release_issue_claim(state, issue.id)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch candidate issues for blocked claim reconciliation #{issue_context(issue)}: #{inspect(reason)}")
+
+        release_issue_claim(state, issue.id)
     end
   end
 
