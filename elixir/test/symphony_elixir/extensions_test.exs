@@ -203,7 +203,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive :poll, 1_100
 
     Workflow.set_workflow_file_path(manual_path)
-    File.rm!(manual_path)
+    File.rm(manual_path)
     assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
     assert removed_state.workflow.prompt == "Manual workflow prompt"
     assert_receive :poll, 1_100
@@ -599,6 +599,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
     start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+    register_project_cleanup(manager_name, ["alpha"], [port])
 
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -685,6 +686,8 @@ defmodule SymphonyElixir.ExtensionsTest do
        ]}
     )
 
+    register_project_cleanup(manager_name, ["alpha"], [port])
+
     start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 100})
 
     start_test_endpoint(
@@ -694,37 +697,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
-    assert_eventually(
-      fn ->
-        fetch_project_entry!(manager_name, "alpha").runtime_state.status == :unreachable
-      end,
-      40
-    )
-
-    saw_unreachable_api_key = {:saw_project_api_state, manager_name, :unreachable}
-    Process.put(saw_unreachable_api_key, false)
-
-    assert_eventually(
-      fn ->
-        payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
-        detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
-        [project] = payload["projects"]
-
-        saw_unreachable_api? =
-          project["worker_status"] == "unreachable" and
-            detail["project"]["worker_status"] == "unreachable" and
-            iso8601_timestamp?(project["last_health_check_at"]) and
-            iso8601_timestamp?(detail["project"]["last_health_check_at"]) and
-            is_binary(project["last_error"]) and
-            is_binary(detail["project"]["last_error"])
-
-        if saw_unreachable_api? do
-          Process.put(saw_unreachable_api_key, true)
-        end
-
-        Process.get(saw_unreachable_api_key)
-      end,
-      120
+    assert_runtime_eventually_reaches_status_with_details(
+      manager_name,
+      "alpha",
+      :unreachable,
+      require_last_error?: true,
+      extra_check: fn -> project_api_state_visible_with_burst?("alpha", :unreachable) end,
+      attempts: 80
     )
 
     assert_eventually(
@@ -815,6 +794,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
     start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+    register_project_cleanup(manager_name, ["alpha", "beta"], [alpha_port, beta_port])
 
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -1237,7 +1217,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "snapshot_unavailable"
   end
 
-  test "control-plane dashboard stays lightweight and only shows static project snapshot" do
+  test "control-plane dashboard stays lightweight and shows runtime overview columns" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -1246,16 +1226,26 @@ defmodule SymphonyElixir.ExtensionsTest do
           %{
             project_id: "alpha",
             project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
             validation_result: :valid,
             validation_errors: [],
-            runtime_state: %{status: :not_started}
+            runtime_state: %{status: :running, worker_port: 5101, last_seen_at: ~U[2026-05-07 01:02:03Z]}
           },
           %{
             project_id: "beta",
             project_name: "Beta",
+            normalized_config: %{enabled: false, worker_port: 4202},
             validation_result: :invalid,
             validation_errors: [%{field: "workspace_root", message: "workspace_root is required"}],
-            runtime_state: %{status: :not_started}
+            runtime_state: %{status: :disabled}
+          },
+          %{
+            project_id: "gamma",
+            project_name: "Beta",
+            normalized_config: %{enabled: true, worker_port: 4303},
+            validation_result: :invalid,
+            validation_errors: [%{field: "workspace_root", message: "workspace_root is required"}],
+            runtime_state: %{status: :unreachable, last_error: "request timed out"}
           }
         ]
       }
@@ -1265,13 +1255,250 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Projects"
     assert html =~ "Alpha"
     assert html =~ "Beta"
-    assert html =~ "not_started"
-    assert html =~ "invalid"
+    assert html =~ "gamma"
+    assert html =~ "project_id: alpha"
+    assert html =~ "project_id: beta"
+    assert html =~ "validation: valid"
+    assert html =~ "validation: invalid"
+    assert html =~ "Enabled"
+    assert html =~ "Worker status"
+    assert html =~ "Worker port"
+    assert html =~ "Last seen"
+    assert html =~ "Last error"
+    assert html =~ "Actions"
+    assert html =~ "running"
+    assert html =~ "disabled"
+    assert html =~ "unreachable"
+    assert html =~ "5101"
+    assert html =~ "2026-05-07T01:02:03Z"
+    assert html =~ "workspace_root: workspace_root is required"
+    assert html =~ "request timed out"
+    assert html =~ "/api/v1/projects/alpha/summary"
+    assert html =~ "true"
+    assert html =~ "false"
+    refute html =~ "Validation"
+    refute html =~ "Runtime"
+    refute html =~ "Errors"
     refute html =~ "Running sessions"
     refute html =~ "Retry queue"
     refute html =~ "Rate limits"
     refute html =~ "Copy ID"
     refute html =~ "MT-HTTP"
+  end
+
+  test "control-plane dashboard falls back to validation errors in UI and disables invalid actions" do
+    test_root = temp_root!("control-plane-dashboard-disabled-actions")
+    manager_name = Module.concat(__MODULE__, DashboardDisabledActionsManager)
+    invalid_port = reserve_tcp_port!()
+    disabled_port = reserve_tcp_port!()
+    running_port = reserve_tcp_port!()
+    stopped_port = reserve_tcp_port!()
+    unreachable_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "invalid-config", invalid_port, omit_workspace_root?: true),
+        project_fixture(test_root, "disabled-project", disabled_port, enabled: false),
+        project_fixture(test_root, "running-project", running_port),
+        project_fixture(test_root, "stopped-project", stopped_port),
+        project_fixture(test_root, "unreachable-project", unreachable_port)
+      ])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 50}
+    )
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder:
+         fake_worker_builder(%{
+           "running-project" => "normal",
+           "stopped-project" => "normal",
+           "unreachable-project" => "hang_once"
+         })}
+    )
+
+    register_project_cleanup(manager_name, ["running-project", "stopped-project", "unreachable-project"], [
+      running_port,
+      stopped_port,
+      unreachable_port
+    ])
+
+    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 100})
+
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "running-project")
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "unreachable-project")
+
+    assert_runtime_eventually_reaches_status_with_details(
+      manager_name,
+      "unreachable-project",
+      :unreachable,
+      attempts: 20
+    )
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: ProjectProcessManager.project_registry(manager_name)
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+
+    assert html =~ "Projects"
+
+    assert_eventually(fn ->
+      rendered_html = render(view)
+
+      rendered_html =~ "workspace_root: workspace_root is required" and
+        rendered_html =~ "button" and
+        rendered_html =~ "phx-value-project_id=\"invalid-config\"" and
+        rendered_html =~ "phx-value-project_id=\"disabled-project\"" and
+        rendered_html =~ "phx-value-project_id=\"running-project\"" and
+        rendered_html =~ "phx-value-project_id=\"stopped-project\"" and
+        rendered_html =~ "phx-value-project_id=\"unreachable-project\"" and
+        rendered_html =~ "phx-value-project_id=\"invalid-config\" phx-value-action=\"start\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"invalid-config\" phx-value-action=\"stop\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"invalid-config\" phx-value-action=\"restart\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"disabled-project\" phx-value-action=\"start\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"disabled-project\" phx-value-action=\"stop\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"disabled-project\" phx-value-action=\"restart\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"running-project\" phx-value-action=\"start\" disabled" and
+        rendered_html =~ "phx-value-project_id=\"stopped-project\" phx-value-action=\"stop\" disabled" and
+        rendered_html =~ "unreachable" and
+        rendered_html =~ "phx-value-project_id=\"unreachable-project\" phx-value-action=\"start\" disabled"
+    end)
+
+    feedback_html =
+      render_click(view, "project_action", %{"project_id" => "disabled-project", "action" => "start"})
+
+    assert feedback_html =~ "Project action failed"
+    assert feedback_html =~ "disabled"
+  end
+
+  test "control-plane dashboard project actions refresh only the targeted row" do
+    test_root = temp_root!("control-plane-dashboard-project-actions")
+    manager_name = Module.concat(__MODULE__, DashboardProjectActionsManager)
+    alpha_port = reserve_tcp_port!()
+    beta_port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", alpha_port),
+        project_fixture(test_root, "beta", beta_port)
+      ])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    command_builder = fake_worker_builder(%{"alpha" => "normal", "beta" => "normal"})
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: command_builder})
+    register_project_cleanup(manager_name, ["alpha", "beta"], [alpha_port, beta_port])
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "alpha"
+    assert html =~ "beta"
+    assert html =~ "not_started"
+
+    view
+    |> element("button[phx-click='project_action'][phx-value-project_id='alpha'][phx-value-action='start']")
+    |> render_click()
+
+    assert_eventually(fn ->
+      alpha = fetch_project_entry!(manager_name, "alpha")
+      beta = fetch_project_entry!(manager_name, "beta")
+
+      alpha.runtime_state.status == :running and
+        alpha.runtime_state.worker_port == alpha_port and
+        beta.runtime_state.status == :not_started and
+        beta.runtime_state.worker_port == beta_port
+    end)
+
+    running_html = render(view)
+    assert running_html =~ "running"
+    assert running_html =~ "not_started"
+    assert running_html =~ "#{alpha_port}"
+    assert running_html =~ "#{beta_port}"
+
+    view
+    |> element("button[phx-click='project_action'][phx-value-project_id='alpha'][phx-value-action='restart']")
+    |> render_click()
+
+    assert_eventually(fn ->
+      alpha = fetch_project_entry!(manager_name, "alpha")
+      beta = fetch_project_entry!(manager_name, "beta")
+
+      alpha.runtime_state.status == :running and
+        beta.runtime_state.status == :not_started
+    end)
+
+    restarted_html = render(view)
+    assert restarted_html =~ "running"
+    assert restarted_html =~ "not_started"
+
+    view
+    |> element("button[phx-click='project_action'][phx-value-project_id='alpha'][phx-value-action='stop']")
+    |> render_click()
+
+    assert_eventually(fn ->
+      alpha = fetch_project_entry!(manager_name, "alpha")
+      beta = fetch_project_entry!(manager_name, "beta")
+
+      alpha.runtime_state.status == :stopped and
+        alpha.runtime_state.worker_port == alpha_port and
+        beta.runtime_state.status == :not_started and
+        beta.runtime_state.worker_port == beta_port
+    end)
+
+    stopped_html = render(view)
+    assert stopped_html =~ "stopped"
+    assert stopped_html =~ "not_started"
+    assert stopped_html =~ "#{alpha_port}"
+    assert stopped_html =~ "#{beta_port}"
+  end
+
+  test "control-plane dashboard shows feedback instead of crashing when project manager is unavailable" do
+    missing_manager = Module.concat(__MODULE__, MissingDashboardProjectManager)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started, worker_port: 4101}
+          }
+        ]
+      }
+    )
+
+    Application.put_env(:symphony_elixir, :project_process_manager_name, missing_manager)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+
+    feedback_html =
+      render_click(view, "project_action", %{"project_id" => "alpha", "action" => "start"})
+
+    assert feedback_html =~ "Project action failed"
+    assert feedback_html =~ "project manager unavailable"
+    assert Process.alive?(view.pid)
   end
 
   test "control-plane startup loads invalid project registry as visible validation error instead of an empty list" do
@@ -1317,7 +1544,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "Projects"
-    assert html =~ "invalid"
+    assert html =~ "projects: "
+    assert html =~ "malformed yaml"
     assert html =~ "projects: "
     refute html =~ "No projects registered."
   end
@@ -1366,6 +1594,59 @@ defmodule SymphonyElixir.ExtensionsTest do
     Process.sleep(50)
 
     refute render(view) =~ "Gamma"
+  end
+
+  test "control-plane dashboard tick refreshes project payload automatically" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :not_started}
+          }
+        ]
+      }
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+    refute render(view) =~ "Gamma"
+
+    endpoint_config =
+      Keyword.merge(
+        Application.fetch_env!(:symphony_elixir, SymphonyElixirWeb.Endpoint),
+        project_registry: %StaticProjectRegistry{
+          entries: [
+            %{
+              project_id: "gamma",
+              project_name: "Gamma",
+              validation_result: :valid,
+              validation_errors: [],
+              runtime_state: %{status: :running}
+            }
+          ]
+        }
+      )
+
+    Application.put_env(
+      :symphony_elixir,
+      SymphonyElixirWeb.Endpoint,
+      endpoint_config
+    )
+
+    :ok = SymphonyElixirWeb.Endpoint.config_change(%{SymphonyElixirWeb.Endpoint => endpoint_config}, [])
+
+    send(view.pid, :runtime_tick)
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "Gamma" and rendered =~ "running"
+    end)
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
@@ -1668,6 +1949,135 @@ defmodule SymphonyElixir.ExtensionsTest do
     entry
   end
 
+  defp register_project_cleanup(manager_name, project_ids, worker_ports)
+       when is_list(project_ids) and is_list(worker_ports) do
+    on_exit(fn ->
+      if GenServer.whereis(manager_name) do
+        Enum.each(project_ids, &stop_project_for_cleanup(manager_name, &1))
+      end
+
+      Enum.each(worker_ports, &kill_fake_worker_port/1)
+    end)
+  end
+
+  defp stop_project_for_cleanup(manager_name, project_id) do
+    case ProjectProcessManager.stop_project(manager_name, project_id) do
+      {:ok, _runtime_state} ->
+        :ok
+
+      {:error, :not_running} ->
+        manager_name
+        |> project_runtime_pid(project_id)
+        |> kill_pid_if_alive()
+
+      {:error, reason} when reason in [:not_found, :disabled, :config_invalid] ->
+        :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp project_runtime_pid(manager_name, project_id) do
+    registry = ProjectProcessManager.project_registry(manager_name)
+
+    case Enum.find(registry.entries, &(&1.project_id == project_id)) do
+      %{runtime_state: %{pid: pid}} when is_integer(pid) -> pid
+      _entry -> nil
+    end
+  end
+
+  defp kill_pid_if_alive(pid) when is_integer(pid) do
+    if process_alive?(pid) do
+      _ = System.cmd("kill", ["-TERM", Integer.to_string(pid)])
+      Process.sleep(100)
+
+      if process_alive?(pid) do
+        _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)])
+        Process.sleep(100)
+      end
+    end
+
+    :ok
+  end
+
+  defp kill_pid_if_alive(_pid), do: :ok
+
+  defp process_alive?(pid) when is_integer(pid) do
+    case System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      _other -> false
+    end
+  end
+
+  defp process_alive?(_pid), do: false
+
+  defp kill_fake_worker_port(port) when is_integer(port) do
+    kill_fake_worker_port(port, 3)
+    wait_for_fake_worker_port_exit(port, 10)
+  end
+
+  defp kill_fake_worker_port(_port), do: :ok
+
+  defp kill_fake_worker_port(port, attempts_left) when is_integer(port) and attempts_left > 0 do
+    case fake_worker_pids_for_port(port) do
+      [] ->
+        :ok
+
+      pids ->
+        Enum.each(pids, fn pid ->
+          _ = System.cmd("kill", ["-TERM", Integer.to_string(pid)])
+        end)
+
+        Process.sleep(100)
+
+        remaining_pids = fake_worker_pids_for_port(port)
+
+        Enum.each(remaining_pids, fn pid ->
+          _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)])
+        end)
+
+        Process.sleep(100)
+        kill_fake_worker_port(port, attempts_left - 1)
+    end
+  end
+
+  defp kill_fake_worker_port(_port, _attempts_left), do: :ok
+
+  defp wait_for_fake_worker_port_exit(port, attempts_left) when is_integer(port) and attempts_left > 0 do
+    case fake_worker_pids_for_port(port) do
+      [] ->
+        :ok
+
+      _pids ->
+        Process.sleep(100)
+        wait_for_fake_worker_port_exit(port, attempts_left - 1)
+    end
+  end
+
+  defp wait_for_fake_worker_port_exit(_port, _attempts_left), do: :ok
+
+  defp fake_worker_pids_for_port(port) do
+    fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
+    port_fragment = "--port #{port}"
+
+    case System.cmd("ps", ["-eo", "pid,args"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&(String.contains?(&1, fake_worker_path) and String.contains?(&1, port_fragment)))
+        |> Enum.map(&String.trim_leading/1)
+        |> Enum.map(&Integer.parse/1)
+        |> Enum.flat_map(fn
+          {pid, _rest} -> [pid]
+          :error -> []
+        end)
+
+      _other ->
+        []
+    end
+  end
+
   defp temp_root!(label) do
     root =
       Path.join(
@@ -1697,7 +2107,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       id: project_id,
       name: String.capitalize(project_id),
       workflow_generated: workflow_path,
-      workspace_root: workspace_root,
+      workspace_root: if(Keyword.get(opts, :omit_workspace_root?, false), do: nil, else: workspace_root),
       logs_root: logs_root,
       enabled: Keyword.get(opts, :enabled, true),
       worker_port: worker_port
@@ -1724,11 +2134,13 @@ defmodule SymphonyElixir.ExtensionsTest do
       - id: "#{project.id}"
         name: "#{project.name}"
         workflow_generated: "#{project.workflow_generated}"
-        workspace_root: "#{project.workspace_root}"
-        logs_root: "#{project.logs_root}"
-        enabled: #{if(project.enabled, do: "true", else: "false")}
-        worker_port: #{project.worker_port}
-    """
+    """ <>
+      if(project.workspace_root, do: "    workspace_root: \"#{project.workspace_root}\"\n", else: "") <>
+      """
+          logs_root: "#{project.logs_root}"
+          enabled: #{if(project.enabled, do: "true", else: "false")}
+          worker_port: #{project.worker_port}
+      """
   end
 
   defp reserve_tcp_port! do
@@ -1837,6 +2249,73 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp iso8601_timestamp?(_value), do: false
+
+  defp project_api_state_visible?(project_id, :unreachable) do
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    detail = json_response(get(build_conn(), "/api/v1/projects/#{project_id}/summary"), 200)
+    [project] = Enum.filter(payload["projects"], &(&1["project_id"] == project_id))
+
+    project["worker_status"] == "unreachable" and
+      detail["project"]["worker_status"] == "unreachable" and
+      iso8601_timestamp?(project["last_health_check_at"]) and
+      iso8601_timestamp?(detail["project"]["last_health_check_at"]) and
+      is_binary(project["last_error"]) and
+      is_binary(detail["project"]["last_error"])
+  rescue
+    _error -> false
+  end
+
+  defp project_api_state_visible?(_project_id, _expected_state), do: false
+
+  defp project_api_state_visible_with_burst?(project_id, expected_state, attempts \\ 12)
+
+  defp project_api_state_visible_with_burst?(project_id, expected_state, attempts)
+       when attempts > 0 do
+    if project_api_state_visible?(project_id, expected_state) do
+      true
+    else
+      Process.sleep(10)
+      project_api_state_visible_with_burst?(project_id, expected_state, attempts - 1)
+    end
+  end
+
+  defp project_api_state_visible_with_burst?(_project_id, _expected_state, 0), do: false
+
+  defp assert_runtime_eventually_reaches_status_with_details(manager_name, project_id, expected_status, opts) do
+    saw_status_key = {:saw_project_runtime_state, manager_name, project_id, expected_status}
+    saw_details_key = {:saw_project_runtime_details, manager_name, project_id, expected_status}
+    require_last_error? = Keyword.get(opts, :require_last_error?, false)
+    extra_check = Keyword.get(opts, :extra_check, fn -> true end)
+    attempts = Keyword.get(opts, :attempts, 20)
+    extra_attempts = Keyword.get(opts, :extra_attempts, attempts)
+
+    Process.put(saw_status_key, false)
+    Process.put(saw_details_key, false)
+
+    assert_eventually(
+      fn ->
+        runtime_state = fetch_project_entry!(manager_name, project_id).runtime_state
+
+        if runtime_state.status == expected_status do
+          Process.put(saw_status_key, true)
+        end
+
+        details_ready? =
+          not is_nil(runtime_state.last_health_check_at) and
+            (not require_last_error? or is_binary(runtime_state.last_error))
+
+        if details_ready? do
+          Process.put(saw_details_key, true)
+        end
+
+        Process.get(saw_status_key) and
+          Process.get(saw_details_key)
+      end,
+      attempts
+    )
+
+    assert_eventually(extra_check, extra_attempts)
+  end
 
   defp assert_eventually(fun, attempts \\ 20)
 
