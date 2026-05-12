@@ -1416,6 +1416,48 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not end the turn while the issue remains in an active state"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
+    assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
+    assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
+    assert prompt =~ "Checks from an older head SHA do not satisfy the closeout requirement for the latest commit."
+    assert prompt =~ "Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed."
+
+    assert prompt =~
+             "If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure."
+
+    assert prompt =~ "If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA."
+
+    assert prompt =~
+             "In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue."
+
+    assert prompt =~
+             "First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable."
+
+    assert prompt =~
+             "Escalation comments must minimally include the failure reason, current PR identifier, current head SHA, affected checks or gate, and the recommended human action, with deduplication for repeated identical causes."
+
+    assert prompt =~ "## Step 2: Execution phase (Todo -> In Progress -> Checking -> Human Review)"
+
+    assert prompt =~
+             "Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists."
+
+    assert prompt =~
+             "Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff."
+
+    assert prompt =~
+             "When normal execution ends, do not force the issue to `Human Review` unless `Checking` has closed successfully or a documented escalation path requires a human handoff."
+
+    refute prompt =~ "Then move to `Human Review`."
+
+    refute prompt =~
+             "When normal execution ends for any reason other than immediate continuation in another active execution step, confirm that the issue state has been updated to `Human Review` before stopping."
+
+    refute prompt =~
+             "If it is not, update it to `Human Review` first unless the issue has legitimately entered a terminal state."
+
+    refute prompt =~
+             "When stopping work, ending the run, or yielding because of a blocker, the agent must ensure the issue state is `Human Review` before exiting."
+
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
   end
