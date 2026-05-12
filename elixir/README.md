@@ -68,8 +68,12 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 Standalone control plane:
 
 ```bash
-../bin/symphony_control --config ../symphony.projects.example.yaml --port 4000
+../bin/symphony_control --config ../symphony.projects.example.yaml --port 4100
 ```
+
+For local development or test runs, do not reuse `4000` if your long-running local production
+thread already owns it. Pick another free port such as `4100`, `4123`, or `4311` to avoid
+collisions.
 
 ## Configuration
 
@@ -85,6 +89,8 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+  - Reserve `4000` for the long-running local production thread; local development and test runs
+    should use another free port.
 
 The standalone `../bin/symphony_control` entrypoint reads `symphony.projects.yaml` and builds a
 control-plane-only `ProjectProcessManager` runtime source of truth per project. It does not require
@@ -195,6 +201,8 @@ Choose the validation command based on the current `git diff`.
 
 - Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a test run.
 - Localized code changes should use targeted validation first.
+- Any local development or test run that enables the dashboard or control plane should avoid
+  `4000`; use another free port such as `4100`, `4123`, or `4311`.
 - Current repo-level coverage gate is `99%`.
 - Current time-sensitive test baseline is `8000ms`.
 - For ordinary local milestone checks or pre-PR self-checks, prefer:

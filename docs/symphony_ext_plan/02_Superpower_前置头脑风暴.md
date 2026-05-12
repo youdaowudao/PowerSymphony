@@ -125,7 +125,7 @@ Issue | Linear 状态 | 当前阶段 | 当前动作 | 健康状态 | Codex threa
 
 - 改动不破坏单项目原有启动方式。
 - 原有 `./bin/symphony ./WORKFLOW.md` 仍可用。
-- 新增 `./bin/symphony_control --config symphony.projects.yaml --port 4000`。
+- 新增 `./bin/symphony_control --config symphony.projects.yaml --port 4100`，作为本地开发/测试示例端口；`4000` 保留给本地常驻生产线程。
 - 增加 fake worker / fake Codex / fake Linear 测试。
 - 每个阶段可回滚。
 
