@@ -1396,11 +1396,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
-    start_supervised!(
-      {ProjectProcessManager,
-       name: manager_name,
-       command_builder: fake_worker_builder(%{"alpha" => "normal", "beta" => "normal"})}
-    )
+    command_builder = fake_worker_builder(%{"alpha" => "normal", "beta" => "normal"})
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: command_builder})
     register_project_cleanup(manager_name, ["alpha", "beta"], [alpha_port, beta_port])
 
     start_test_endpoint(
@@ -1640,6 +1638,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       SymphonyElixirWeb.Endpoint,
       endpoint_config
     )
+
     :ok = SymphonyElixirWeb.Endpoint.config_change(%{SymphonyElixirWeb.Endpoint => endpoint_config}, [])
 
     send(view.pid, :runtime_tick)
