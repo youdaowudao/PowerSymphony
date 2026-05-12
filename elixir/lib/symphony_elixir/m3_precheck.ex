@@ -17,6 +17,9 @@ defmodule SymphonyElixir.M3Precheck do
           convergence_points: [String.t()],
           text: String.t()
         }
+  @type issue_key :: String.t()
+  @type issue_lookup :: %{optional(issue_key()) => Issue.t()}
+  @type visited_issue_keys :: %{optional(issue_key()) => true}
 
   @spec structural_errors_for_issue(Issue.t(), [Issue.t()], map()) :: [map()]
   def structural_errors_for_issue(%Issue{} = issue, issues, opts \\ %{})
@@ -166,16 +169,32 @@ defmodule SymphonyElixir.M3Precheck do
   defp cross_project_dependency?(_issue, _current_project_slug, _current_project_id), do: false
 
   defp cyclic_dependency?(%Issue{} = issue, todo_issues) do
-    todo_ids = Map.new(todo_issues, fn candidate -> {candidate.id, candidate} end)
-    todo_identifiers = Map.new(todo_issues, fn candidate -> {candidate.identifier, candidate} end)
+    todo_ids = build_issue_lookup(todo_issues, :id)
+    todo_identifiers = build_issue_lookup(todo_issues, :identifier)
 
     Enum.any?(issue.blocked_by || [], fn blocker ->
-      blocker_issue = find_blocker_issue(blocker, todo_ids, todo_identifiers)
+      case find_blocker_issue(blocker, todo_ids, todo_identifiers) do
+        %Issue{} = blocker_issue ->
+          depends_on?(blocker_issue, issue, todo_ids, todo_identifiers, %{})
 
-      blocker_issue && depends_on?(blocker_issue, issue, todo_ids, todo_identifiers, MapSet.new())
+        nil ->
+          false
+      end
     end)
   end
 
+  @spec build_issue_lookup([Issue.t()], :id | :identifier) :: issue_lookup()
+  defp build_issue_lookup(issues, field) when field in [:id, :identifier] do
+    Enum.reduce(issues, %{}, fn %Issue{} = candidate, acc ->
+      case Map.get(candidate, field) do
+        key when is_binary(key) -> Map.put(acc, key, candidate)
+        _ -> acc
+      end
+    end)
+  end
+
+  @spec depends_on?(Issue.t(), Issue.t(), issue_lookup(), issue_lookup(), visited_issue_keys()) ::
+          boolean()
   defp depends_on?(%Issue{} = current, %Issue{} = target, todo_ids, todo_identifiers, visited) do
     current_key = current.id || current.identifier
 
@@ -183,11 +202,11 @@ defmodule SymphonyElixir.M3Precheck do
       is_nil(current_key) ->
         false
 
-      MapSet.member?(visited, current_key) ->
+      Map.has_key?(visited, current_key) ->
         false
 
       true ->
-        next_visited = MapSet.put(visited, current_key)
+        next_visited = Map.put(visited, current_key, true)
 
         Enum.any?(current.blocked_by || [], fn blocker ->
           depends_on_blocker?(blocker, target, todo_ids, todo_identifiers, next_visited)
@@ -208,18 +227,26 @@ defmodule SymphonyElixir.M3Precheck do
     end
   end
 
+  @spec find_blocker_issue(map(), issue_lookup(), issue_lookup()) :: Issue.t() | nil
   defp find_blocker_issue(blocker, todo_ids, todo_identifiers) do
     Map.get(todo_ids, Map.get(blocker, :id)) ||
       Map.get(todo_identifiers, Map.get(blocker, :identifier))
   end
 
+  @spec depends_on_blocker?(map(), Issue.t(), issue_lookup(), issue_lookup(), visited_issue_keys()) ::
+          boolean()
   defp depends_on_blocker?(blocker, target, todo_ids, todo_identifiers, next_visited) do
     blocker_issue = find_blocker_issue(blocker, todo_ids, todo_identifiers)
+    direct_match? = Map.get(blocker, :id) == target.id || Map.get(blocker, :identifier) == target.identifier
 
-    Map.get(blocker, :id) == target.id ||
-      Map.get(blocker, :identifier) == target.identifier ||
-      (blocker_issue &&
-         depends_on?(blocker_issue, target, todo_ids, todo_identifiers, next_visited))
+    direct_match? ||
+      case blocker_issue do
+        %Issue{} ->
+          depends_on?(blocker_issue, target, todo_ids, todo_identifiers, next_visited)
+
+        nil ->
+          false
+      end
   end
 
   defp blocker_terminal?(%{state: state}, terminal_states) when is_binary(state) do

@@ -705,8 +705,6 @@ defmodule SymphonyElixir.Orchestrator do
       todo_issue_dispatch_allowed?(issue, candidate_issues)
   end
 
-  defp dispatch_candidate_issue?(_issue, _active_states, _terminal_states, _candidate_issues), do: false
-
   defp todo_issue_dispatch_allowed?(%Issue{state: state_name} = issue, candidate_issues)
        when is_binary(state_name) and is_list(candidate_issues) do
     case normalize_issue_state(state_name) do
@@ -714,8 +712,6 @@ defmodule SymphonyElixir.Orchestrator do
       _other -> true
     end
   end
-
-  defp todo_issue_dispatch_allowed?(_issue, _candidate_issues), do: true
 
   defp todo_issue_has_structural_errors?(%Issue{} = issue, issues) when is_list(issues) do
     SymphonyElixir.M3Precheck.structural_errors_for_issue(issue, issues, %{
@@ -836,10 +832,10 @@ defmodule SymphonyElixir.Orchestrator do
        ),
        do: {:ok, issue}
 
-  @spec m3_precheck() :: map() | {:error, term()}
+  @spec m3_precheck() :: {:ok, map()} | {:error, term()}
   def m3_precheck, do: m3_precheck(__MODULE__)
 
-  @spec m3_precheck(GenServer.server()) :: map() | {:error, term()}
+  @spec m3_precheck(GenServer.server()) :: {:ok, map()} | {:error, term()}
   def m3_precheck(orchestrator_name) do
     case Tracker.fetch_candidate_issues() do
       {:ok, issues} ->

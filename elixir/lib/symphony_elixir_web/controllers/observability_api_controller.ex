@@ -9,7 +9,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   alias SymphonyElixir.{HttpServer, ProjectProcessManager}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
-  @spec project_m3_precheck_payload(String.t()) :: {:ok, map()} | {:error, term()}
+  @spec project_m3_precheck_payload(String.t()) ::
+          {:ok, map()} | {:error, :project_not_found | term()}
   def project_m3_precheck_payload(project_id) when is_binary(project_id) do
     project_worker_request(project_id, "/api/v1/m3_precheck")
   end
@@ -208,6 +209,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
            Req.post("http://127.0.0.1:#{worker_port}#{path}", json: %{}, retry: false) do
       {:ok, body}
     else
+      {:error, :not_found} -> {:error, :project_not_found}
       {:ok, %Req.Response{status: status}} -> {:error, {:worker_status, status}}
       {:error, reason} -> {:error, reason}
     end
