@@ -647,6 +647,48 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert restarted_state.pid != started_state.pid
   end
 
+  test "worker_port_for_project default wrapper uses configured manager and falls back to config when not started" do
+    test_root = temp_root!("worker-port-default-wrapper")
+    configured_name = Module.concat(__MODULE__, WorkerPortDefaultApiManager)
+    port = reserve_tcp_port!()
+    previous_manager_name = Application.get_env(:symphony_elixir, :project_process_manager_name)
+
+    on_exit(fn ->
+      restore_app_env(:project_process_manager_name, previous_manager_name)
+    end)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, configured_name)
+
+    start_supervised!({ProjectProcessManager, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    assert {:ok, ^port} = ProjectProcessManager.worker_port_for_project("alpha")
+    assert {:error, :not_found} = ProjectProcessManager.worker_port_for_project("missing")
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project("alpha")
+    assert runtime_state.status == :running
+    assert runtime_state.worker_port == port
+
+    assert {:ok, ^port} = ProjectProcessManager.worker_port_for_project("alpha")
+  end
+
+  test "worker_port_for_project returns worker_port_unavailable when config exists but port is invalid" do
+    test_root = temp_root!("worker-port-unavailable")
+    manager_name = Module.concat(__MODULE__, WorkerPortUnavailableManager)
+    config_path = write_invalid_projects_config!(test_root)
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    assert {:error, :worker_port_unavailable} =
+             ProjectProcessManager.worker_port_for_project(manager_name, "alpha")
+  end
+
   test "running worker health success keeps lifecycle running and records timestamps" do
     test_root = temp_root!("health-success")
     manager_name = Module.concat(__MODULE__, HealthSuccessManager)
