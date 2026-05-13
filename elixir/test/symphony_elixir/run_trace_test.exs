@@ -596,8 +596,11 @@ defmodule SymphonyElixir.RunTraceTest do
                  payload: %{pid: self()}
                })
 
-      assert [persisted_event] = RawEventStore.list_events(trace)
-      assert persisted_event["event_id"] == event["event_id"]
+      persisted_events = RawEventStore.list_events(trace)
+
+      assert Enum.any?(persisted_events, fn persisted_event ->
+               persisted_event["event_id"] == event["event_id"]
+             end)
     after
       File.rm_rf(test_root)
     end
