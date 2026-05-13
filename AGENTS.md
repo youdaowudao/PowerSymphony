@@ -5,6 +5,10 @@
  - 禁止直接在主线上操作，禁止直接向远端推送主线
  - 在 Symphony 工作流中，默认起手先开启开发分支；如果已经在开发分支上，则直接继续，不需要额外说明。
 
+## Linear
+
+- 更新 Linear 前，必须确认 required checks 全绿；如 PR 已存在 review/comment，则需确认无未处理的 review delta。未通过时禁止推进 Linear 状态。
+
 ## 多 Agent 协作与复核
 
 - 非代码变更默认不要求 reviewer subagent，但提交前仍需完成与改动范围相称的独立验证。

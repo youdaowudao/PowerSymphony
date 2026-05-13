@@ -1559,6 +1559,9 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
     assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
     assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
+    assert prompt =~
+             "If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`."
+
     assert prompt =~ "Checks from an older head SHA do not satisfy the closeout requirement for the latest commit."
     assert prompt =~ "Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed."
 
@@ -1580,6 +1583,9 @@ defmodule SymphonyElixir.CoreTest do
 
     assert prompt =~
              "Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists."
+
+    assert prompt =~
+             "If the PR already has review comments, top-level PR comments, or review threads, no actionable comments remain and `## Review Summary` accurately reflects that there is no unresolved review delta."
 
     assert prompt =~
              "Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff."

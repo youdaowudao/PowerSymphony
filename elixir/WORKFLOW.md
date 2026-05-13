@@ -402,6 +402,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
+   - If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`.
    - Do not treat checks on an older head SHA as sufficient for closeout after newer commits land.
    - Confirm every required ticket-provided validation or test-plan item is explicitly marked complete in the issue body.
    - If checks fail, keep working in the same branch and PR by default; do not open a new ticket, do not open a new PR, and do not move to `Human Review` after a single failed run.
@@ -455,8 +456,8 @@ Use this only when completion is blocked by missing required tools or missing au
 - Step 1 and Step 2 execution checklist is fully complete.
 - `## Acceptance Criteria` and required ticket-provided validation items are complete.
 - Validation or tests are green for the latest commit.
-- PR feedback sweep is complete and no actionable comments remain.
-- `## Review Summary` accurately reflects the current review state and contains no unresolved review delta.
+- PR feedback sweep is complete.
+- If the PR already has review comments, top-level PR comments, or review threads, no actionable comments remain and `## Review Summary` accurately reflects that there is no unresolved review delta.
 - PR is still valid, the latest head SHA required checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation or media requirements are complete.
