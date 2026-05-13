@@ -370,16 +370,7 @@ defmodule SymphonyElixirWeb.Presenter do
         blocked
         |> Enum.reduce(%{}, fn
           {issue_identifier, reasons}, acc when is_binary(issue_identifier) ->
-            normalized_reasons =
-              reasons
-              |> m3_list_value()
-              |> Enum.filter(&is_binary/1)
-
-            if normalized_reasons == [] do
-              acc
-            else
-              Map.put(acc, issue_identifier, normalized_reasons)
-            end
+            m3_put_blocked_todo_entry(acc, issue_identifier, reasons)
 
           _entry, acc ->
             acc
@@ -387,6 +378,18 @@ defmodule SymphonyElixirWeb.Presenter do
 
       _other ->
         %{}
+    end
+  end
+
+  defp m3_put_blocked_todo_entry(acc, issue_identifier, reasons) do
+    normalized_reasons =
+      reasons
+      |> m3_list_value()
+      |> Enum.filter(&is_binary/1)
+
+    case normalized_reasons do
+      [] -> acc
+      _ -> Map.put(acc, issue_identifier, normalized_reasons)
     end
   end
 
