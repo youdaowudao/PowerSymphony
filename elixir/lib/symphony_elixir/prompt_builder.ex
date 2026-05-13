@@ -6,23 +6,53 @@ defmodule SymphonyElixir.PromptBuilder do
   alias SymphonyElixir.{Config, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
+  @checking_recheck_prompt """
+  Checking recheck only:
+
+  - This is a bounded `Checking` recheck thread, not a normal implementation run.
+  - Read and act on only three signal classes:
+    1. latest PR merge status
+    2. latest head SHA required checks
+    3. the newest human review delta
+  - Do not resume broad implementation, planning, or repository-wide execution beyond what is required to evaluate those three signals safely.
+  - If merge is complete, move to `Done`.
+  - If latest head SHA required checks reached a non-success terminal state, move to `In Progress`.
+  - If automation cannot safely continue, move to `Human Review`.
+  - Otherwise keep the issue in `Checking` and end this short recheck.
+  """
 
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
-    template =
-      Workflow.current()
-      |> prompt_template!()
-      |> parse_template!()
+    if Keyword.get(opts, :run_mode) == :checking_recheck do
+      build_checking_recheck_prompt(issue)
+    else
+      template =
+        Workflow.current()
+        |> prompt_template!()
+        |> parse_template!()
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.iodata_to_binary()
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+    end
+  end
+
+  defp build_checking_recheck_prompt(issue) do
+    """
+    #{@checking_recheck_prompt}
+
+    Issue context:
+    Identifier: #{issue.identifier}
+    Title: #{issue.title}
+    Current status: #{issue.state}
+    URL: #{issue.url}
+    """
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
