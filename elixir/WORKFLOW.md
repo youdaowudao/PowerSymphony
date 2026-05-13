@@ -180,7 +180,7 @@ Instructions:
 1. This is an unattended orchestration session only after the preflight body gate has classified the run as `execute`. Never ask a human to perform follow-up actions during normal execution.
 2. The agent may stop early for either a true blocker during normal execution or a valid preflight override before normal execution. If blocked during normal execution, record the blocker in the issue body, update the state to `Human Review` before stopping, and make the required human action explicit. If the gate classifies the run as `reply-only`, `no-op`, or `read-only`, perform only the allowed output or inspection and stop. If the gate classifies the run as `unclear`, ask one concise clarification question and stop without changing issue state or the workpad.
 3. Final message must report completed actions and blockers only during normal execution. In `reply-only`, `no-op`, `read-only`, or `unclear` mode, follow the output boundary defined by the gate.
-4. When normal execution ends for any reason other than immediate continuation in another active execution step, confirm that the issue state has been updated to `Human Review` before stopping. This is mandatory and higher priority than any body-summary cleanup.
+4. When normal execution ends, do not force the issue to `Human Review` unless `Checking` has closed successfully or a documented escalation path requires a human handoff. This rule is higher priority than any body-summary cleanup.
 
 Work only in the provided repository copy. Do not touch any other path.
 
@@ -264,6 +264,8 @@ If command output is in English, keep the original output first, then add a brie
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop and run a PR feedback sweep before new feature work.
 - `In Progress` -> implementation actively underway.
+  - PR created / updated is only the entry signal into `Checking`, not the completion signal.
+  - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue.
 - `Human Review` -> validated work is waiting on human approval unless a new clear human delta or a new unresolved review delta exists, in which case immediately move to `Rework` and run the incremental rework flow.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer or human requested changes; execute the requested delta by reusing the existing branch, PR, and body workpad when safe.
@@ -354,7 +356,18 @@ Use this only when completion is blocked by missing required tools or missing au
   - exact human action needed to unblock.
 - Keep blocker text concise and action-oriented.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+## Checking closeout and escalation rules
+
+- Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing.
+- Checks from an older head SHA do not satisfy the closeout requirement for the latest commit.
+- If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA.
+- Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed.
+- When an attached PR already exists, do not move to `Human Review` merely because the PR exists.
+- If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure.
+- First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable.
+- Escalation comments must minimally include the failure reason, current PR identifier, current head SHA, affected checks or gate, and the recommended human action, with deduplication for repeated identical causes.
+
+## Step 2: Execution phase (Todo -> In Progress -> Checking -> Human Review)
 
 1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff pull result is already recorded in `## Codex Workpad`.
 2. If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
@@ -385,11 +398,14 @@ Use this only when completion is blocked by missing required tools or missing au
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
-11. Before moving to `Human Review`, perform one bounded PR feedback and checks pass:
+11. Before moving to `Human Review`, perform one bounded PR feedback and `Checking` closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
-   - Confirm PR checks are passing (green) after the latest changes when such results are already available during this run.
+   - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
+   - Do not treat checks on an older head SHA as sufficient for closeout after newer commits land.
    - Confirm every required ticket-provided validation or test-plan item is explicitly marked complete in the issue body.
+   - If checks fail, keep working in the same branch and PR by default; do not open a new ticket, do not open a new PR, and do not move to `Human Review` after a single failed run.
+   - If a new commit lands during `Checking`, restart the closeout decision using only the new head SHA.
    - If new unresolved feedback or failing checks are discovered, handle only the bounded delta for this run or stop with an explicit blocker or handoff; do not remain in an open-ended same-run polling loop.
    - Refresh `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, `## Blockers`, and `## Codex Workpad` so they reflect the completed work accurately.
 12. Only then move issue to `Human Review`.
@@ -397,14 +413,14 @@ Use this only when completion is blocked by missing required tools or missing au
 13. For `Todo` tickets that already had a PR attached at kickoff:
    - Ensure all existing PR feedback was reviewed and resolved, including inline review comments.
    - Ensure branch was pushed with any required updates.
-   - Then move to `Human Review`.
+   - Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists.
 14. Add a short issue comment only at a significant external checkpoint:
    - entering `Human Review`,
    - a true blocker requiring human action,
    - a completed rework pass after review feedback,
    - or final completion when a short thread-visible note is useful.
    Keep these comments brief and never use them as the sole source of current instructions or progress state.
-15. Before stopping this run from normal execution, confirm that the issue state is already `Human Review`. If it is not, update it to `Human Review` first unless the issue has legitimately entered a terminal state.
+15. Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff.
 
 ## Step 3: Human Review and merge handling
 
@@ -441,7 +457,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Validation or tests are green for the latest commit.
 - PR feedback sweep is complete and no actionable comments remain.
 - `## Review Summary` accurately reflects the current review state and contains no unresolved review delta.
-- PR checks are green, branch is pushed, and PR is linked on the issue.
+- PR is still valid, the latest head SHA required checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation or media requirements are complete.
 - High-level handoff facts are accurately reflected in `## Execution Brief`, and detailed execution evidence is present in `## Codex Workpad`.
@@ -463,7 +479,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep agent-authored issue text concise, specific, and reviewer-oriented.
 - Comments are allowed for short status pings, but they must never be the sole source of long-term task definition or progress state.
-- When stopping work, ending the run, or yielding because of a blocker, the agent must ensure the issue state is `Human Review` before exiting.
+- When stopping work, ending the run, or yielding because of a blocker, do not force the issue to `Human Review` unless `Checking` has closed successfully or a documented escalation path requires a human handoff.
 
 ## Issue body template
 
