@@ -642,16 +642,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(
-         _issue,
-         _state,
-         _active_states,
-         _terminal_states,
-         _candidate_issues
-       ) do
-    false
-  end
-
-  defp should_dispatch_issue?(
          %Issue{} = issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
@@ -798,9 +788,6 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatchable_issue_ids(_candidate_issues, _state, _active_states, _terminal_states),
-    do: MapSet.new()
-
   defp dispatchable_issues_for_state(candidate_issues, %State{} = state, active_states, terminal_states)
        when is_list(candidate_issues) do
     dispatched_todos = dispatched_todo_lookup(candidate_issues, state)
@@ -833,8 +820,6 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp dispatchable_issues_for_state(_candidate_issues, _state, _active_states, _terminal_states), do: []
-
   defp dispatched_todo_lookup(candidate_issues, %State{} = state) when is_list(candidate_issues) do
     SymphonyElixir.M3Precheck.run(candidate_issues, %{
       current_project_slug: Config.settings!().tracker.project_slug,
@@ -850,8 +835,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp todo_issue_selected_for_dispatch?(%Issue{} = issue, %MapSet{} = dispatched_todos),
     do: MapSet.member?(dispatched_todos, issue_dispatch_key(issue))
-
-  defp todo_issue_selected_for_dispatch?(_issue, _dispatched_todos), do: false
 
   defp todo_issue_selected_for_dispatch?(%Issue{} = issue, candidate_issues, %State{} = state)
        when is_list(candidate_issues) do
