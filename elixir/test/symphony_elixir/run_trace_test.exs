@@ -940,6 +940,500 @@ defmodule SymphonyElixir.RunTraceTest do
     end
   end
 
+  test "state reducer covers event fallback branches and payload helpers" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    summary =
+      StateReducer.initial_summary(%{
+        "current_phase" => "seed",
+        "current_action" => "seed action",
+        "health" => "seed health",
+        "linear_state" => "In Progress",
+        "last_event_at" => DateTime.to_iso8601(now),
+        "last_event_type" => "seed_event",
+        "thread_id" => "thread-seed",
+        "turn_id" => "turn-seed",
+        "session_id" => "thread-seed-turn-seed",
+        "turn_count" => 2,
+        "last_error" => "seed error",
+        "fallback_reason" => "seed fallback",
+        "retry_delay_type" => "seed delay",
+        "approval_pending" => true,
+        "tool_failure" => true,
+        "run_status" => "running"
+      })
+
+    assert summary.current_phase == "seed"
+    assert summary.current_action == "seed action"
+    assert summary.health == "seed health"
+    assert summary.last_event_at == now
+    assert summary.approval_pending == true
+    assert summary.tool_failure == true
+
+    malformed =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => []
+      })
+
+    assert malformed.current_phase == "unknown"
+    assert malformed.current_action == "unknown event"
+
+    rescued =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "payload" => :bad_payload
+      })
+
+    assert rescued.current_phase == "unknown"
+  end
+
+  test "state reducer covers phase and action routing across codex and runner events" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+    base = StateReducer.initial_summary(%{linear_state: "In Progress"})
+
+    worker_attempt =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "worker_attempt_started",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"status" => "starting"}
+      })
+
+    assert worker_attempt.current_phase == "starting_codex_turn"
+    assert worker_attempt.current_action == "unknown event"
+
+    worker_runtime =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "worker_runtime_info",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"worker_host" => "worker-a"}
+      })
+
+    assert worker_runtime.current_phase == "starting_codex_turn"
+
+    run_result_failed =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "run_result",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"status" => "failed", "reason" => "turn_timeout"}
+      })
+
+    assert run_result_failed.current_phase == "failed"
+    assert run_result_failed.run_status == "failed"
+    assert run_result_failed.last_error == "turn_timeout"
+
+    run_result_unknown =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "run_result",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"status" => "mystery"}
+      })
+
+    assert run_result_unknown.current_phase == "unknown"
+
+    approval_auto_approved =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "approval_auto_approved",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{
+          "method" => "item/commandExecution/requestApproval",
+          "params" => %{"parsedCmd" => "mix test"}
+        }
+      })
+
+    assert approval_auto_approved.current_phase == "codex_waiting_approval_resolution"
+    assert approval_auto_approved.approval_pending == false
+
+    unsupported_tool =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "unsupported_tool_call",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "unknown_tool"}}
+      })
+
+    assert unsupported_tool.current_phase == "codex_waiting_tool"
+    assert unsupported_tool.tool_failure == true
+    assert unsupported_tool.health == "normal"
+  end
+
+  test "state reducer covers notification and item completion method dispatches" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+    base = StateReducer.initial_summary(%{linear_state: "In Progress"})
+
+    file_change_approval =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/fileChange/requestApproval"}
+      })
+
+    assert file_change_approval.current_phase == "codex_waiting_approval_resolution"
+
+    command_output =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/commandExecution/outputDelta"}
+      })
+
+    assert command_output.current_phase == "codex_running_shell"
+
+    turn_started =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "turn/started"}
+      })
+
+    assert turn_started.current_phase == "starting_codex_turn"
+
+    command_completed =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/completed", "params" => %{"item" => %{"type" => "command_execution"}}}
+      })
+
+    assert command_completed.current_phase == "codex_running_shell"
+
+    reasoning_completed =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/completed", "params" => %{"item" => %{"type" => "reasoning"}}}
+      })
+
+    assert reasoning_completed.current_phase == "codex_reasoning"
+
+    unknown_completed =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/completed", "params" => %{"item" => %{"type" => "mystery"}}}
+      })
+
+    assert unknown_completed.current_phase == "codex_waiting_next_event"
+
+    request_user_input =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/tool/requestUserInput"}
+      })
+
+    assert request_user_input.current_phase == "codex_waiting_user_input_policy"
+  end
+
+  test "state reducer health branches cover unknown blocked failed checking and elapsed thresholds" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    unknown = StateReducer.initial_summary(%{current_phase: "unknown", fallback_reason: "unknown_event"})
+
+    assert StateReducer.health_for_summary(unknown,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "unknown"
+
+    blocked =
+      StateReducer.initial_summary(%{
+        current_phase: "codex_waiting_tool",
+        tool_failure: true,
+        last_event_at: now
+      })
+
+    assert StateReducer.health_for_summary(blocked,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "tool_blocked"
+
+    failed =
+      StateReducer.initial_summary(%{
+        current_phase: "failed",
+        run_status: "failed",
+        last_event_at: now
+      })
+
+    assert StateReducer.health_for_summary(failed,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "codex_error"
+
+    checking =
+      StateReducer.initial_summary(%{
+        current_phase: "checking_tracker_state",
+        linear_state: "Checking",
+        last_event_at: DateTime.add(now, -30, :second)
+      })
+
+    assert StateReducer.health_for_summary(checking,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "normal"
+
+    fallback_without_reason =
+      StateReducer.initial_summary(%{
+        current_phase: "unknown",
+        last_event_at: DateTime.add(now, -60, :second)
+      })
+
+    assert StateReducer.health_for_summary(fallback_without_reason,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "slow"
+  end
+
+  test "run state store covers no-trace fallback merging payload hydration and helper branches" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-helpers-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-state-7", identifier: "MT-STATE-7", title: "Helper coverage", state: "Checking"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      payload_file = Path.join(trace.payload_dir, "evt-helper.json")
+
+      File.write!(
+        payload_file,
+        Jason.encode!(%{
+          "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}
+        })
+      )
+
+      event = %{
+        "event_id" => "evt-helper",
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now()),
+        "payload_ref" => "payloads/evt-helper.json"
+      }
+
+      summary =
+        RunStateStore.summary_from_events([event],
+          trace: trace,
+          base_summary: %{linear_state: "In Progress"}
+        )
+
+      assert summary.current_phase == "codex_running_shell"
+
+      fallback_running =
+        RunStateStore.summary_for_running_entry(%{
+          issue: issue,
+          last_codex_timestamp: "not-a-datetime",
+          last_codex_event: 123,
+          last_codex_message: :bad_message
+        })
+
+      assert fallback_running.current_phase == "checking_tracker_state"
+      assert fallback_running.current_action == "unknown event"
+      assert fallback_running.last_event_type == nil
+
+      no_event_summary = RunStateStore.summary_from_events([], base_summary: %{current_phase: "unknown"})
+      assert no_event_summary.current_phase == "unknown"
+
+      missing_trace_summary =
+        RunStateStore.summary_for_trace(%{trace | trace_file: Path.join(trace.run_dir, "missing.jsonl")})
+
+      assert missing_trace_summary.current_phase == "unknown"
+      assert missing_trace_summary.current_action == "unknown event"
+      assert missing_trace_summary.linear_state == "In Progress"
+      assert missing_trace_summary.health == "unknown"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run state store helper branches cover rescues datetime parsing and fallback summary merging" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-rescue-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-state-8", identifier: "MT-STATE-8", title: "Rescue coverage", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      File.rm_rf!(trace.payload_dir)
+      File.write!(trace.payload_dir, "blocked")
+
+      File.write!(
+        trace.trace_file,
+        Jason.encode!(%{
+          "event_id" => "evt-bad",
+          "source" => "codex",
+          "event_type" => "notification",
+          "timestamp" => "not-a-datetime",
+          "payload_ref" => "payloads/evt-bad.json"
+        }) <> "\n"
+      )
+
+      summary = RunStateStore.summary_for_trace(trace)
+      assert summary.current_phase == "unknown"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "state reducer covers remaining helper and method dispatch branches" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+    base = StateReducer.initial_summary(%{linear_state: "In Progress"})
+
+    checking_completed =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "run_result",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"status" => "completed", "reason" => "issue_entered_checking"}
+      })
+
+    assert checking_completed.current_phase == "checking_tracker_state"
+
+    file_change_output =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/fileChange/outputDelta"}
+      })
+
+    assert file_change_output.current_phase == "codex_editing_files"
+
+    turn_completed_notification =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "turn/completed"}
+      })
+
+    assert turn_completed_notification.current_phase == "turn_completed"
+
+    params_type_completed =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/completed", "params" => %{"type" => "reasoning"}}
+      })
+
+    assert params_type_completed.current_phase == "codex_waiting_next_event"
+
+    ordinary_retry =
+      StateReducer.reduce_event(base, %{
+        "source" => "orchestrator",
+        "event_type" => "retry_scheduled",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"delay_type" => "continuation"}
+      })
+
+    assert ordinary_retry.current_phase == "retry_scheduled"
+    assert ordinary_retry.current_action == "retry scheduled"
+
+    default_turn_count =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "session_id" => 123,
+        "payload" => %{"method" => "item/reasoning/textDelta"}
+      })
+
+    assert default_turn_count.turn_count == 0
+
+    nil_elapsed_health =
+      StateReducer.initial_summary(%{
+        current_phase: "codex_reasoning",
+        fallback_reason: nil,
+        last_event_at: nil
+      })
+
+    assert StateReducer.health_for_summary(nil_elapsed_health,
+             now: now,
+             stall_timeout_ms: "bad",
+             checking_interval_ms: 600_000
+           ) == "normal"
+  end
+
+  test "state reducer helper branches cover payload roots and nested lookup" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+    base = StateReducer.initial_summary(%{current_phase: "", linear_state: "In Progress"})
+
+    atom_payload_event =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{payload: %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}}
+      })
+
+    assert atom_payload_event.current_phase == "codex_running_shell"
+
+    no_map_nested =
+      StateReducer.reduce_event(base, %{
+        "source" => "orchestrator",
+        "event_type" => "retry_scheduled",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => "not-a-map"
+      })
+
+    assert no_map_nested.current_phase == "retry_scheduled"
+
+    bad_key_payload =
+      StateReducer.reduce_event(base, %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => :bad_atom}
+      })
+
+    assert bad_key_payload.current_phase == "unknown"
+  end
+
+  test "run state store covers remaining helper branches without trace hydration" do
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    no_trace_summary =
+      RunStateStore.summary_for_running_entry(%{
+        last_codex_message: %{event: :notification, message: %{method: "item/reasoning/textDelta"}},
+        last_codex_timestamp: now,
+        last_codex_event: "notification",
+        run_result: %{status: :failed, reason: :turn_timeout}
+      })
+
+    assert no_trace_summary.last_error == "turn_timeout"
+    assert no_trace_summary.last_event_at == now
+    assert no_trace_summary.last_event_type == "notification"
+
+    binary_timestamp_summary =
+      RunStateStore.summary_from_events([],
+        base_summary: %{last_event_at: DateTime.to_iso8601(now), current_phase: "codex_reasoning"}
+      )
+
+    assert binary_timestamp_summary.last_event_at == now
+
+    unknown_fallback_summary =
+      RunStateStore.summary_from_events([],
+        base_summary: %{current_phase: "unknown", last_event_type: "unknown"}
+      )
+
+    assert unknown_fallback_summary.last_event_type == "unknown"
+  end
+
   defp health_for_elapsed_ms(trace, elapsed_ms, now) do
     RunTrace.record(trace, :codex, %{
       event: :notification,
