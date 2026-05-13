@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, RunTrace, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RunStateStore, RunTrace, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -1950,10 +1950,19 @@ defmodule SymphonyElixir.Orchestrator do
     running =
       state.running
       |> Enum.map(fn {issue_id, metadata} ->
+        summary =
+          metadata
+          |> Map.put(:issue_id, issue_id)
+          |> RunStateStore.summary_for_running_entry(now: now)
+
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
           state: metadata.issue.state,
+          linear_state: summary.linear_state,
+          current_phase: summary.current_phase,
+          current_action: summary.current_action,
+          health: summary.health,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
@@ -1963,9 +1972,9 @@ defmodule SymphonyElixir.Orchestrator do
           codex_total_tokens: metadata.codex_total_tokens,
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
-          last_codex_timestamp: metadata.last_codex_timestamp,
+          last_codex_timestamp: summary.last_event_at || metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
-          last_codex_event: metadata.last_codex_event,
+          last_codex_event: summary.last_event_type || metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)

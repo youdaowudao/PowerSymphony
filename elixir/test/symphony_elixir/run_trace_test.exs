@@ -1,7 +1,18 @@
 defmodule SymphonyElixir.RunTraceTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AgentRunner, EventNormalizer, LogFile, RawEventStore, RunTrace, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    EventNormalizer,
+    LogFile,
+    RawEventStore,
+    RunStateStore,
+    RunTrace,
+    StateReducer,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   setup do
@@ -604,5 +615,332 @@ defmodule SymphonyElixir.RunTraceTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "run state store reduces canonical codex lifecycle into the state triplet" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-state-1", identifier: "MT-STATE-1", title: "State triplet", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      base_time = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+      RunTrace.record(trace, :agent_runner, %{
+        event: :workspace_prepared,
+        summary: "agent_runner:workspace_prepared",
+        timestamp: base_time
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "preparing_workspace"
+      assert state.current_action == "agent_runner:workspace_prepared"
+      assert state.health == "normal"
+      assert state.linear_state == "In Progress"
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        session_id: "thread-state-1-turn-state-1",
+        thread_id: "thread-state-1",
+        turn_id: "turn-state-1",
+        timestamp: DateTime.add(base_time, 1, :second)
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "starting_codex_thread"
+      assert state.current_action =~ "session started"
+      assert state.health == "normal"
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        payload: %{
+          "method" => "item/reasoning/summaryTextDelta",
+          "params" => %{"summaryText" => "comparing retry paths"}
+        },
+        timestamp: DateTime.add(base_time, 2, :second)
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "codex_reasoning"
+      assert state.current_action =~ "reasoning"
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        payload: %{
+          "method" => "item/completed",
+          "params" => %{
+            "item" => %{
+              "type" => "file_change",
+              "status" => "completed",
+              "path" => "lib/example.ex"
+            }
+          }
+        },
+        timestamp: DateTime.add(base_time, 3, :second)
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "codex_editing_files"
+      assert state.current_phase != "unknown"
+
+      RunTrace.record(trace, :codex, %{
+        event: :tool_call_completed,
+        payload: %{
+          "method" => "item/tool/call",
+          "params" => %{"tool" => "shell"}
+        },
+        timestamp: DateTime.add(base_time, 4, :second)
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "codex_running_shell"
+      assert state.current_action =~ "dynamic tool call completed"
+
+      RunTrace.record(trace, :codex, %{
+        event: :turn_completed,
+        payload: %{
+          "method" => "turn/completed",
+          "params" => %{
+            "turn" => %{"status" => "completed"},
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 2, "total_tokens" => 7}
+          }
+        },
+        timestamp: DateTime.add(base_time, 5, :second)
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "turn_completed"
+      assert state.current_action =~ "turn completed"
+      assert state.linear_state == "In Progress"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "state reduction degrades unknown or malformed events to fallback summary" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-unknown-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-state-2", identifier: "MT-STATE-2", title: "Unknown event", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :custom_source, %{
+        event_type: "mystery_event",
+        summary: "custom_source:mystery_event"
+      })
+
+      state = RunStateStore.summary_for_trace(trace)
+      assert state.current_phase == "unknown"
+      assert state.health == "unknown"
+      assert state.current_action == "unknown event"
+
+      malformed_state =
+        StateReducer.reduce_event(StateReducer.initial_summary(%{linear_state: "In Progress"}), %{
+          "source" => "codex",
+          "event_type" => nil
+        })
+
+      assert malformed_state.current_phase == "unknown"
+      assert malformed_state.health == "unknown"
+      assert malformed_state.current_action == "unknown event"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run state store aligns health thresholds with stall timeout and preserves checking cooldown semantics" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-health-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: 300_000)
+      Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+      File.mkdir_p!(logs_root)
+
+      issue = %Issue{id: "issue-state-3", identifier: "MT-STATE-3", title: "Health thresholds", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+      assert health_for_elapsed_ms(trace, 10_000, now) == "normal"
+      assert health_for_elapsed_ms(trace, 60_000, now) == "slow"
+      assert health_for_elapsed_ms(trace, 180_000, now) == "quiet"
+      assert health_for_elapsed_ms(trace, 270_000, now) == "possibly_stalled"
+      assert health_for_elapsed_ms(trace, 300_000, now) == "stalled"
+
+      checking_issue = %{issue | state: "Checking", updated_at: DateTime.add(now, -120, :second)}
+      checking_trace = RunTrace.start!(checking_issue, logs_root: logs_root)
+
+      RunTrace.record(checking_trace, :orchestrator, %{
+        event: :retry_scheduled,
+        summary: "orchestrator:retry_scheduled",
+        payload: %{issue_id: checking_issue.id, delay_type: "checking_recheck"},
+        timestamp: DateTime.add(now, -120, :second)
+      })
+
+      checking_state =
+        RunStateStore.summary_for_trace(checking_trace,
+          running_entry: %{issue: checking_issue},
+          now: now
+        )
+
+      assert checking_state.linear_state == "Checking"
+      assert checking_state.current_phase == "checking_tracker_state"
+      assert checking_state.health == "normal"
+    after
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run state store prefers trace-derived checking state over stale codex metadata" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-checking-stale-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{
+        id: "issue-state-4",
+        identifier: "MT-STATE-4",
+        title: "Checking stale metadata",
+        state: "Checking",
+        updated_at: DateTime.utc_now()
+      }
+
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :orchestrator, %{
+        event: :retry_scheduled,
+        summary: "orchestrator:retry_scheduled",
+        payload: %{issue_id: issue.id, delay_type: "checking_recheck"}
+      })
+
+      summary =
+        RunStateStore.summary_for_trace(trace,
+          running_entry: %{
+            issue: issue,
+            session_id: "thread-stale-turn-stale",
+            turn_count: 3,
+            last_codex_message: %{event: :notification, message: %{method: "item/reasoning/summaryTextDelta"}},
+            last_codex_timestamp: DateTime.add(DateTime.utc_now(), -60, :second),
+            last_codex_event: :notification
+          }
+        )
+
+      assert summary.current_phase == "checking_tracker_state"
+      assert summary.current_action =~ "retry"
+      assert summary.last_event_type == "retry_scheduled"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "approval and tool failure flags clear after later normal events" do
+    issue = %Issue{id: "issue-state-5", identifier: "MT-STATE-5", title: "Health clears", state: "In Progress"}
+    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+    approval_summary =
+      StateReducer.initial_summary(%{linear_state: issue.state})
+      |> StateReducer.reduce_event(%{
+        "source" => "codex",
+        "event_type" => "turn_input_required",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/tool/requestUserInput"}
+      })
+
+    assert StateReducer.health_for_summary(approval_summary, now: now, stall_timeout_ms: 300_000, checking_interval_ms: 600_000) ==
+             "needs_attention"
+
+    cleared_approval =
+      StateReducer.reduce_event(approval_summary, %{
+        "source" => "codex",
+        "event_type" => "turn_completed",
+        "timestamp" => DateTime.to_iso8601(DateTime.add(now, 1, :second)),
+        "payload" => %{"method" => "turn/completed"}
+      })
+
+    assert StateReducer.health_for_summary(cleared_approval,
+             now: DateTime.add(now, 1, :second),
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "normal"
+
+    tool_failure_summary =
+      StateReducer.initial_summary(%{linear_state: issue.state})
+      |> StateReducer.reduce_event(%{
+        "source" => "codex",
+        "event_type" => "tool_call_failed",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}
+      })
+
+    assert StateReducer.health_for_summary(tool_failure_summary, now: now, stall_timeout_ms: 300_000, checking_interval_ms: 600_000) ==
+             "tool_blocked"
+
+    cleared_tool_failure =
+      StateReducer.reduce_event(tool_failure_summary, %{
+        "source" => "codex",
+        "event_type" => "tool_call_completed",
+        "timestamp" => DateTime.to_iso8601(DateTime.add(now, 1, :second)),
+        "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}
+      })
+
+    assert StateReducer.health_for_summary(cleared_tool_failure,
+             now: DateTime.add(now, 1, :second),
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "normal"
+  end
+
+  test "run state store computes health from the finalized summary" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-state-final-health-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-state-6", identifier: "MT-STATE-6", title: "Final health", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+      stale_at = DateTime.add(now, -400, :second)
+
+      RunTrace.record(trace, :orchestrator, %{
+        event: :retry_scheduled,
+        summary: "orchestrator:retry_scheduled",
+        payload: %{issue_id: issue.id, delay_type: "checking_recheck"},
+        timestamp: now
+      })
+
+      summary =
+        RunStateStore.summary_for_trace(trace,
+          running_entry: %{
+            issue: %{issue | state: "Checking", updated_at: DateTime.add(now, -60, :second)},
+            last_codex_timestamp: stale_at,
+            last_codex_event: :notification,
+            last_codex_message: %{event: :notification, message: %{method: "item/reasoning/summaryTextDelta"}}
+          },
+          now: now
+        )
+
+      assert summary.current_phase == "checking_tracker_state"
+      assert summary.last_event_at == now
+      assert summary.health == "normal"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp health_for_elapsed_ms(trace, elapsed_ms, now) do
+    RunTrace.record(trace, :codex, %{
+      event: :notification,
+      payload: %{"method" => "item/reasoning/summaryTextDelta", "params" => %{"summaryText" => "still thinking"}},
+      timestamp: DateTime.add(now, -div(elapsed_ms, 1_000), :second)
+    })
+
+    RunStateStore.summary_for_trace(trace, now: now).health
   end
 end

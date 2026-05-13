@@ -607,12 +607,96 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
+    assert snapshot_entry.linear_state == "In Progress"
+    assert snapshot_entry.current_phase == "unknown"
+    assert snapshot_entry.current_action == "unknown event"
+    assert snapshot_entry.health == "normal"
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
              message: %{method: "some-event"},
              timestamp: now
            }
+  end
+
+  test "orchestrator snapshot includes reduced run summary fields for checking issues" do
+    issue_id = "issue-checking-snapshot"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CHECKING",
+      title: "Checking snapshot",
+      description: "Preserve linear state and checking phase",
+      state: "Checking",
+      updated_at: DateTime.utc_now(),
+      url: "https://example.org/issues/MT-CHECKING"
+    }
+
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-checking-snapshot-#{System.unique_integer([:positive])}"
+      )
+
+    Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    File.mkdir_p!(logs_root)
+    trace = RunTrace.start!(issue, logs_root: logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :CheckingSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    started_at = DateTime.utc_now()
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-checking-turn-checking",
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at,
+      run_trace: trace
+    }
+
+    RunTrace.record(trace, :orchestrator, %{
+      event: :retry_scheduled,
+      summary: "orchestrator:retry_scheduled",
+      payload: %{issue_id: issue_id, delay_type: "checking_recheck"}
+    })
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:next_poll_due_at_ms, System.monotonic_time(:millisecond) + 60_000)
+      |> Map.put(:poll_check_in_progress, false)
+    end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.linear_state == "Checking"
+    assert snapshot_entry.current_phase == "checking_tracker_state"
+    assert snapshot_entry.health == "normal"
+    assert snapshot_entry.current_action =~ "retry"
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
