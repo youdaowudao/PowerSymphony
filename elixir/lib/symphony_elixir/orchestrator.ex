@@ -1042,60 +1042,21 @@ defmodule SymphonyElixir.Orchestrator do
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        transition_result = maybe_transition_spawned_todo_to_in_progress(issue, transition_context)
 
-        case maybe_transition_spawned_todo_to_in_progress(issue, transition_context) do
-          {:ok, running_issue} ->
-            Logger.info("Dispatching issue to agent: #{issue_context(running_issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
-
-            running =
-              Map.put(state.running, running_issue.id, %{
-                pid: pid,
-                ref: ref,
-                identifier: running_issue.identifier,
-                issue: running_issue,
-                worker_host: worker_host,
-                workspace_path: retry_workspace_path,
-                session_id: nil,
-                last_codex_message: nil,
-                last_codex_timestamp: nil,
-                last_codex_event: nil,
-                codex_app_server_pid: nil,
-                codex_input_tokens: 0,
-                codex_output_tokens: 0,
-                codex_total_tokens: 0,
-                codex_last_reported_input_tokens: 0,
-                codex_last_reported_output_tokens: 0,
-                codex_last_reported_total_tokens: 0,
-                turn_count: 0,
-                run_result: nil,
-                retry_attempt: normalize_retry_attempt(attempt),
-                started_at: DateTime.utc_now()
-              })
-
-            %{
-              state
-              | running: running,
-                claimed: MapSet.put(state.claimed, running_issue.id),
-                blocked_claims: Map.delete(state.blocked_claims, running_issue.id),
-                retry_attempts: Map.delete(state.retry_attempts, running_issue.id)
-            }
-
-          {:error, reason} ->
-            Process.demonitor(ref, [:flush])
-            terminate_task(pid)
-            rollback_result = rollback_spawned_todo_transition(issue, transition_context)
-
-            Logger.warning("Rolling back spawned dispatch for #{issue_context(issue)}: #{inspect(reason)} rollback=#{inspect(rollback_result)}")
-
-            next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
-
-            schedule_issue_retry(state, issue.id, next_attempt, %{
-              identifier: issue.identifier,
-              error: "failed to transition spawned issue: #{inspect(reason)}; rollback=#{inspect(rollback_result)}",
-              worker_host: worker_host,
-              workspace_path: retry_workspace_path
-            })
-        end
+        handle_spawned_issue_transition_result(
+          transition_result,
+          state,
+          %{
+            issue: issue,
+            attempt: attempt,
+            pid: pid,
+            ref: ref,
+            worker_host: worker_host,
+            retry_workspace_path: retry_workspace_path,
+            transition_context: transition_context
+          }
+        )
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1107,6 +1068,82 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp handle_spawned_issue_transition_result(
+         {:ok, running_issue},
+         %State{} = state,
+         %{
+           attempt: attempt,
+           pid: pid,
+           ref: ref,
+           worker_host: worker_host,
+           retry_workspace_path: retry_workspace_path
+         }
+       ) do
+    Logger.info("Dispatching issue to agent: #{issue_context(running_issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+
+    running =
+      Map.put(state.running, running_issue.id, %{
+        pid: pid,
+        ref: ref,
+        identifier: running_issue.identifier,
+        issue: running_issue,
+        worker_host: worker_host,
+        workspace_path: retry_workspace_path,
+        session_id: nil,
+        last_codex_message: nil,
+        last_codex_timestamp: nil,
+        last_codex_event: nil,
+        codex_app_server_pid: nil,
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0,
+        turn_count: 0,
+        run_result: nil,
+        retry_attempt: normalize_retry_attempt(attempt),
+        started_at: DateTime.utc_now()
+      })
+
+    %{
+      state
+      | running: running,
+        claimed: MapSet.put(state.claimed, running_issue.id),
+        blocked_claims: Map.delete(state.blocked_claims, running_issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, running_issue.id)
+    }
+  end
+
+  defp handle_spawned_issue_transition_result(
+         {:error, reason},
+         %State{} = state,
+         %{
+           issue: issue,
+           attempt: attempt,
+           pid: pid,
+           ref: ref,
+           worker_host: worker_host,
+           retry_workspace_path: retry_workspace_path,
+           transition_context: transition_context
+         }
+       ) do
+    Process.demonitor(ref, [:flush])
+    terminate_task(pid)
+    rollback_result = rollback_spawned_todo_transition(issue, transition_context)
+
+    Logger.warning("Rolling back spawned dispatch for #{issue_context(issue)}: #{inspect(reason)} rollback=#{inspect(rollback_result)}")
+
+    next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+    schedule_issue_retry(state, issue.id, next_attempt, %{
+      identifier: issue.identifier,
+      error: "failed to transition spawned issue: #{inspect(reason)}; rollback=#{inspect(rollback_result)}",
+      worker_host: worker_host,
+      workspace_path: retry_workspace_path
+    })
   end
 
   defp maybe_transition_spawned_todo_to_in_progress(
