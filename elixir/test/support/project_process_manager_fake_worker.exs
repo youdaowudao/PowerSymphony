@@ -57,7 +57,7 @@ case mode do
             case request_path.(request) do
               "/api/v1/m3_precheck" ->
                 body =
-                  ~s({"generated_at":"2026-05-12T00:00:00Z","m3_enabled":true,"eligible":[],"dispatch":[],"blocked":{},"structural_errors":[],"warnings":[],"convergence_points":[],"text":"fake worker m3 precheck"})
+                  ~s({"generated_at":"2026-05-12T00:00:00Z","m3_enabled":true,"eligible":[{"issue_identifier":"MT-CP-1","issue_id":"cp-1","state":"Todo"}],"dispatch":[],"blocked":{"MT-CP-2":["waiting on non-terminal blockers: MT-CP-9"]},"eligible_todos":[{"issue_identifier":"MT-CP-1","issue_id":"cp-1","state":"Todo"}],"dispatched_todos":[],"capacity_queued_todos":[{"issue_identifier":"MT-CP-1","issue_id":"cp-1","state":"Todo"}],"blocked_todos":{"MT-CP-2":["waiting on non-terminal blockers: MT-CP-9"]},"current_work":{"count":1,"entries":[{"issue_id":"cp-running","issue_identifier":"RUN-CP-1","state":"In Progress","worker_host":"worker-alpha"}]},"anomalies":[{"type":"blocked_but_in_progress","issue_identifier":"MT-CP-3","issue_id":"cp-3","state":"In Progress","blocking_identifiers":["MT-CP-10"]}],"structural_errors":[],"warnings":[],"convergence_points":[],"text":"fake worker m3 precheck"})
 
                 "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
 

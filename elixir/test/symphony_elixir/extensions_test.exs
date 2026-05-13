@@ -1686,6 +1686,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert payload["m3_enabled"] == false
     assert payload["eligible"] == []
+    assert payload["eligible_todos"] == []
+    assert payload["dispatched_todos"] == []
+    assert payload["capacity_queued_todos"] == []
+    assert payload["blocked_todos"] == %{"MT-1" => ["m3 disabled for project"]}
+    assert payload["current_work"] == %{"count" => 0, "entries" => []}
+    assert payload["anomalies"] == []
     assert payload["text"] =~ "M3 is disabled"
   end
 
@@ -1713,6 +1719,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)
 
     assert Enum.map(payload["dispatch"], & &1["issue_identifier"]) == ["MT-1"]
+    assert Enum.map(payload["eligible_todos"], & &1["issue_identifier"]) == ["MT-1", "MT-2"]
+    assert Enum.map(payload["dispatched_todos"], & &1["issue_identifier"]) == ["MT-1"]
+    assert Enum.map(payload["capacity_queued_todos"], & &1["issue_identifier"]) == ["MT-2"]
+    assert payload["blocked_todos"] == %{}
+
+    assert payload["current_work"] == %{
+             "count" => 1,
+             "entries" => [
+               %{
+                 "issue_id" => "running-1",
+                 "issue_identifier" => "RUN-1",
+                 "state" => "In Progress"
+               }
+             ]
+           }
+
+    assert payload["anomalies"] == []
     assert payload["text"] =~ "Eligible Todo waiting for free capacity: MT-2"
   end
 
@@ -1737,6 +1760,42 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
     payload = json_response(post(build_conn(), "/api/v1/projects/alpha/m3_precheck", %{}), 200)
+
+    assert payload["m3_enabled"] == true
+
+    assert payload["eligible_todos"] == [
+             %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
+           ]
+
+    assert payload["dispatched_todos"] == []
+
+    assert payload["capacity_queued_todos"] == [
+             %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
+           ]
+
+    assert payload["blocked_todos"] == %{"MT-CP-2" => ["waiting on non-terminal blockers: MT-CP-9"]}
+
+    assert payload["current_work"] == %{
+             "count" => 1,
+             "entries" => [
+               %{
+                 "issue_id" => "cp-running",
+                 "issue_identifier" => "RUN-CP-1",
+                 "state" => "In Progress",
+                 "worker_host" => "worker-alpha"
+               }
+             ]
+           }
+
+    assert payload["anomalies"] == [
+             %{
+               "type" => "blocked_but_in_progress",
+               "issue_identifier" => "MT-CP-3",
+               "issue_id" => "cp-3",
+               "state" => "In Progress",
+               "blocking_identifiers" => ["MT-CP-10"]
+             }
+           ]
 
     assert payload["text"] =~ "fake worker m3 precheck"
   end

@@ -538,7 +538,9 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
-  test "todo dispatch transitions issue to in progress before spawning worker" do
+  test "prepare_issue_for_dispatch keeps todo state until worker startup succeeds" do
+    write_workflow_file!(Workflow.workflow_file_path(), m3_enabled: true)
+
     issue = %Issue{
       id: "todo-transition",
       identifier: "MT-1009",
@@ -547,16 +549,154 @@ defmodule SymphonyElixir.CoreTest do
       blocked_by: []
     }
 
-    assert {:ok, %Issue{state: "In Progress"} = refreshed_issue} =
+    assert {:ok, %Issue{state: "Todo"} = refreshed_issue} =
              Orchestrator.prepare_issue_for_dispatch_for_test(
                issue,
                fn
-                 ["todo-transition"] -> {:ok, [%Issue{issue | state: "In Progress"}]}
+                 ["todo-transition"] -> {:ok, [issue]}
                end,
                fn "todo-transition", "In Progress" -> :ok end
              )
 
     assert refreshed_issue.identifier == "MT-1009"
+  end
+
+  test "m3_precheck returns current_work and queue split based on running workers" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      max_concurrent_agents: 2
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-1", identifier: "MT-1100", title: "Todo 1", state: "Todo"},
+      %Issue{id: "issue-2", identifier: "MT-1101", title: "Todo 2", state: "Todo"}
+    ])
+
+    orchestrator_name = Module.concat(__MODULE__, :M3PrecheckCurrentWorkOrchestrator)
+
+    start_supervised!(
+      {SymphonyElixir.ExtensionsTest.M3PrecheckOrchestrator,
+       name: orchestrator_name,
+       max_concurrent_agents: 2,
+       running: %{
+         "running-1" => %{
+           issue: %Issue{id: "running-1", identifier: "RUN-1100", state: "In Progress"},
+           worker_host: "worker-a",
+           workspace_path: "/tmp/run-1100",
+           started_at: DateTime.utc_now()
+         }
+       }}
+    )
+
+    assert {:ok, payload} = Orchestrator.m3_precheck(orchestrator_name)
+    assert payload.current_work.count == 1
+
+    assert payload.current_work.entries == [
+             %{
+               issue_id: "running-1",
+               issue_identifier: "RUN-1100",
+               state: "In Progress",
+               worker_host: "worker-a",
+               workspace_path: "/tmp/run-1100"
+             }
+           ]
+
+    assert Enum.map(payload.eligible_todos, & &1.identifier) == ["MT-1100", "MT-1101"]
+    assert Enum.map(payload.dispatched_todos, & &1.identifier) == ["MT-1100"]
+    assert Enum.map(payload.capacity_queued_todos, & &1.identifier) == ["MT-1101"]
+    assert payload.blocked_todos == %{}
+    assert payload.anomalies == []
+  end
+
+  test "todo transition rollback restores todo state and stops spawned worker when post-start revalidation fails" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      max_concurrent_agents: 1
+    )
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    issue =
+      %Issue{
+        id: "todo-rollback",
+        identifier: "MT-1110",
+        title: "Rollback after spawn",
+        state: "Todo",
+        blocked_by: []
+      }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :TodoRollbackOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:max_concurrent_agents, 1)
+      |> Map.put(:retry_attempts, %{
+        issue.id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 30_000,
+          identifier: issue.identifier,
+          error: "retrying"
+        }
+      })
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      issue,
+      %Issue{id: "other-todo", identifier: "MT-1111", title: "Other", state: "Todo", blocked_by: []}
+    ])
+
+    send(pid, {:retry_issue, issue.id, retry_token})
+    Process.sleep(100)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue.id)
+    refute MapSet.member?(state.claimed, issue.id)
+    assert %{attempt: attempt, error: error} = state.retry_attempts[issue.id]
+    assert attempt >= 2
+    assert error =~ "failed to transition spawned issue"
+
+    assert {:ok, [%Issue{state: "Todo"}]} =
+             SymphonyElixir.Tracker.fetch_issue_states_by_ids([issue.id])
+  end
+
+  test "todo dispatch selection remains stable for the first eligible todo across repeated should_dispatch checks" do
+    write_workflow_file!(Workflow.workflow_file_path(), m3_enabled: true, max_concurrent_agents: 1)
+
+    issues = [
+      %Issue{id: "todo-a", identifier: "MT-1120", title: "A", state: "Todo", blocked_by: []},
+      %Issue{id: "todo-b", identifier: "MT-1121", title: "B", state: "Todo", blocked_by: []}
+    ]
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(List.first(issues), state)
+    assert Orchestrator.should_dispatch_issue_for_test(List.first(issues), state)
   end
 
   test "reconcile stops running issue when it is reassigned away from this worker" do
@@ -1419,6 +1559,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
     assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
     assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
+
+    assert prompt =~
+             "If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`."
+
     assert prompt =~ "Checks from an older head SHA do not satisfy the closeout requirement for the latest commit."
     assert prompt =~ "Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed."
 
@@ -1440,6 +1584,9 @@ defmodule SymphonyElixir.CoreTest do
 
     assert prompt =~
              "Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists."
+
+    assert prompt =~
+             "If the PR already has review comments, top-level PR comments, or review threads, no actionable comments remain and `## Review Summary` accurately reflects that there is no unresolved review delta."
 
     assert prompt =~
              "Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff."

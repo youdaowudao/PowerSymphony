@@ -83,14 +83,35 @@ defmodule SymphonyElixir.M3PrecheckTest do
         m3_enabled: true,
         max_concurrent_agents: 2,
         active_running_count: 1,
+        current_work: %{
+          count: 1,
+          entries: [
+            %{
+              issue_id: "running-1",
+              issue_identifier: "RUN-1",
+              state: "In Progress"
+            }
+          ]
+        },
         terminal_states: ["Done", "Closed"]
       })
 
     assert Enum.map(result.eligible, & &1.identifier) == ["MT-901", "MT-902", "MT-906"]
     assert Enum.map(result.dispatch, & &1.identifier) == ["MT-901"]
+    assert Enum.map(result.eligible_todos, & &1.identifier) == ["MT-901", "MT-902", "MT-906"]
+    assert Enum.map(result.dispatched_todos, & &1.identifier) == ["MT-901"]
+    assert Enum.map(result.capacity_queued_todos, & &1.identifier) == ["MT-902", "MT-906"]
+    assert Map.keys(result.blocked_todos) == ["MT-903", "MT-904", "MT-905"]
     assert result.blocked["MT-903"] == ["waiting on non-terminal blockers: MT-911"]
     assert result.blocked["MT-904"] == ["structural errors: self_dependency"]
     assert result.blocked["MT-905"] == ["structural errors: cross_project_dependency"]
+    assert result.current_work.count == 1
+
+    assert result.current_work.entries == [
+             %{issue_id: "running-1", issue_identifier: "RUN-1", state: "In Progress"}
+           ]
+
+    assert result.anomalies == []
     assert Enum.any?(result.structural_errors, &(&1.issue_identifier == "MT-904" and &1.type == :self_dependency))
     assert Enum.any?(result.structural_errors, &(&1.issue_identifier == "MT-905" and &1.type == :cross_project_dependency))
     assert "MT-906" in result.convergence_points
@@ -113,6 +134,12 @@ defmodule SymphonyElixir.M3PrecheckTest do
 
     assert result.eligible == []
     assert result.dispatch == []
+    assert result.eligible_todos == []
+    assert result.dispatched_todos == []
+    assert result.capacity_queued_todos == []
+    assert result.blocked_todos == %{}
+    assert result.current_work == nil
+    assert result.anomalies == []
     assert result.blocked == %{}
     assert result.structural_errors == []
     assert result.warnings == []
@@ -275,6 +302,58 @@ defmodule SymphonyElixir.M3PrecheckTest do
              )
   end
 
+  test "run sorts eligible todos by created_at ascending then identifier and exposes blocked in progress anomalies" do
+    shared_time = ~U[2026-05-07 10:00:00Z]
+
+    issues = [
+      %Issue{
+        id: "todo-b",
+        identifier: "MT-951",
+        title: "Second by identifier",
+        state: "Todo",
+        created_at: shared_time,
+        blocked_by: []
+      },
+      %Issue{
+        id: "todo-a",
+        identifier: "MT-950",
+        title: "First by identifier",
+        state: "Todo",
+        created_at: shared_time,
+        blocked_by: []
+      },
+      %Issue{
+        id: "active-blocked",
+        identifier: "MT-952",
+        title: "Active but blocked",
+        state: "In Progress",
+        blocked_by: [%{id: "dep-open", identifier: "MT-999", state: "Todo", project_slug: "alpha"}]
+      }
+    ]
+
+    result =
+      SymphonyElixir.M3Precheck.run(issues, %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 5,
+        active_running_count: 0,
+        terminal_states: ["Done", "Closed"]
+      })
+
+    assert Enum.map(result.eligible_todos, & &1.identifier) == ["MT-950", "MT-951"]
+
+    assert result.anomalies == [
+             %{
+               type: :blocked_but_in_progress,
+               issue_identifier: "MT-952",
+               issue_id: "active-blocked",
+               state: "In Progress",
+               blocking_identifiers: ["MT-999"]
+             }
+           ]
+  end
+
   test "run treats blockers with non-binary states as non-terminal blockers" do
     issue = %Issue{
       id: "issue-non-binary-blockers",
@@ -298,5 +377,105 @@ defmodule SymphonyElixir.M3PrecheckTest do
 
     assert result.eligible == []
     assert result.blocked["MT-950"] == ["waiting on non-terminal blockers: DEP-INT, DEP-NIL"]
+  end
+
+  test "run ignores non-issue inputs and non-issue anomaly candidates" do
+    issues = [
+      nil,
+      %{id: "map-only", state: "Todo"},
+      %Issue{id: "todo-only", identifier: "MT-960", title: "Valid todo", state: "Todo", blocked_by: []}
+    ]
+
+    result =
+      SymphonyElixir.M3Precheck.run(issues, %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: 0,
+        terminal_states: ["Done"]
+      })
+
+    assert Enum.map(result.eligible_todos, & &1.identifier) == ["MT-960"]
+    assert result.anomalies == []
+  end
+
+  test "run normalizes current_work variants and active_running_count fallbacks" do
+    issue = %Issue{id: "todo-capacity", identifier: "MT-961", title: "Capacity", state: "Todo", blocked_by: []}
+
+    string_keyed_current_work =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 2,
+        active_running_count: 99,
+        current_work: %{
+          "count" => "invalid",
+          "entries" => [%{"issue_id" => "cw-1", "issue_identifier" => "CW-1", "state" => "In Progress"}]
+        },
+        terminal_states: ["Done"]
+      })
+
+    assert string_keyed_current_work.current_work == %{
+             count: 1,
+             entries: [%{issue_id: "cw-1", issue_identifier: "CW-1", state: "In Progress"}]
+           }
+
+    assert Enum.map(string_keyed_current_work.dispatched_todos, & &1.identifier) == ["MT-961"]
+    assert Enum.map(string_keyed_current_work.capacity_queued_todos, & &1.identifier) == []
+
+    atom_entries_only_current_work =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        current_work: %{entries: :not_a_list},
+        terminal_states: ["Done"]
+      })
+
+    assert atom_entries_only_current_work.current_work == %{count: 0, entries: []}
+    assert Enum.map(atom_entries_only_current_work.dispatched_todos, & &1.identifier) == ["MT-961"]
+
+    string_entries_only_current_work =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        current_work: %{"entries" => []},
+        terminal_states: ["Done"]
+      })
+
+    assert string_entries_only_current_work.current_work == %{count: 0, entries: []}
+
+    fallback_active_running_count =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: "invalid",
+        current_work: :invalid,
+        terminal_states: ["Done"]
+      })
+
+    assert fallback_active_running_count.current_work == %{count: 0, entries: []}
+    assert Enum.map(fallback_active_running_count.dispatched_todos, & &1.identifier) == ["MT-961"]
+
+    integer_fallback_active_running_count =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: 1,
+        terminal_states: ["Done"]
+      })
+
+    assert integer_fallback_active_running_count.current_work == nil
+    assert Enum.map(integer_fallback_active_running_count.dispatched_todos, & &1.identifier) == []
+    assert Enum.map(integer_fallback_active_running_count.capacity_queued_todos, & &1.identifier) == ["MT-961"]
   end
 end

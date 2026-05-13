@@ -7,11 +7,35 @@ defmodule SymphonyElixir.M3Precheck do
 
   @max_sort_key 9_223_372_036_854_775_807
 
+  @type current_work_entry :: %{
+          optional(:issue_id) => String.t() | nil,
+          optional(:issue_identifier) => String.t() | nil,
+          optional(:state) => String.t() | nil,
+          optional(:worker_host) => String.t() | nil,
+          optional(:workspace_path) => String.t() | nil
+        }
+  @type current_work :: %{
+          count: non_neg_integer(),
+          entries: [current_work_entry()]
+        }
+  @type anomaly :: %{
+          type: :blocked_but_in_progress,
+          issue_identifier: String.t() | nil,
+          issue_id: String.t() | nil,
+          state: String.t() | nil,
+          blocking_identifiers: [String.t()]
+        }
   @type result :: %{
           m3_enabled: boolean(),
           eligible: [Issue.t()],
           dispatch: [Issue.t()],
           blocked: %{optional(String.t()) => [String.t()]},
+          eligible_todos: [Issue.t()],
+          dispatched_todos: [Issue.t()],
+          capacity_queued_todos: [Issue.t()],
+          blocked_todos: %{optional(String.t()) => [String.t()]},
+          current_work: current_work() | nil,
+          anomalies: [anomaly()],
           structural_errors: [map()],
           warnings: [String.t()],
           convergence_points: [String.t()],
@@ -36,11 +60,18 @@ defmodule SymphonyElixir.M3Precheck do
     current_project_slug = Map.get(opts, :current_project_slug, Map.get(opts, "current_project_slug"))
     current_project_id = Map.get(opts, :current_project_id, Map.get(opts, "current_project_id"))
     terminal_states = terminal_state_set(Map.get(opts, :terminal_states, Map.get(opts, "terminal_states", [])))
+    current_work = current_work_option(opts)
     max_concurrent_agents = Map.get(opts, :max_concurrent_agents, Map.get(opts, "max_concurrent_agents", 0))
-    active_running_count = Map.get(opts, :active_running_count, Map.get(opts, "active_running_count", 0))
+
+    active_running_count =
+      current_work_count(
+        current_work,
+        Map.get(opts, :active_running_count, Map.get(opts, "active_running_count", 0))
+      )
+
     available_slots = max(max_concurrent_agents - active_running_count, 0)
 
-    todo_issues = Enum.filter(issues, &(match?(%Issue{state: "Todo"}, &1) or (match?(%Issue{state: state} when is_binary(state), &1) and normalize_state(&1.state) == "todo")))
+    todo_issues = Enum.filter(issues, &todo_issue?/1)
 
     analysis =
       Enum.map(todo_issues, fn issue ->
@@ -54,6 +85,7 @@ defmodule SymphonyElixir.M3Precheck do
       |> sort_todo_issues()
 
     dispatch = Enum.take(eligible, available_slots)
+    capacity_queued = Enum.drop(eligible, length(dispatch))
 
     blocked =
       analysis
@@ -75,6 +107,8 @@ defmodule SymphonyElixir.M3Precheck do
       |> Enum.filter(&(length(&1.terminal_blockers) > 1 and &1.reasons == []))
       |> Enum.map(& &1.issue.identifier)
 
+    anomalies = blocked_but_in_progress_anomalies(issues, terminal_states)
+
     text =
       build_text(%{
         m3_enabled: m3_enabled,
@@ -91,6 +125,12 @@ defmodule SymphonyElixir.M3Precheck do
       eligible: eligible,
       dispatch: dispatch,
       blocked: blocked,
+      eligible_todos: eligible,
+      dispatched_todos: dispatch,
+      capacity_queued_todos: capacity_queued,
+      blocked_todos: blocked,
+      current_work: current_work,
+      anomalies: anomalies,
       structural_errors: structural_errors,
       warnings: warnings,
       convergence_points: convergence_points,
@@ -255,16 +295,110 @@ defmodule SymphonyElixir.M3Precheck do
 
   defp blocker_terminal?(_blocker, _terminal_states), do: false
 
-  defp sort_todo_issues(issues) do
-    Enum.sort_by(issues, fn %Issue{} = issue ->
-      {created_at_sort_key(issue), issue.identifier || issue.id || ""}
+  defp todo_issue?(%Issue{state: state}) when is_binary(state), do: normalize_state(state) == "todo"
+  defp todo_issue?(_issue), do: false
+
+  defp blocked_but_in_progress_anomalies(issues, terminal_states) do
+    issues
+    |> Enum.filter(fn issue -> blocked_but_in_progress?(issue, terminal_states) end)
+    |> sort_todo_issues()
+    |> Enum.map(fn %Issue{} = issue ->
+      %{
+        type: :blocked_but_in_progress,
+        issue_identifier: issue.identifier,
+        issue_id: issue.id,
+        state: issue.state,
+        blocking_identifiers:
+          issue.blocked_by
+          |> Enum.reject(&blocker_terminal?(&1, terminal_states))
+          |> Enum.map(&blocker_identifier/1)
+      }
     end)
   end
+
+  defp blocked_but_in_progress?(%Issue{state: state, blocked_by: blockers}, terminal_states)
+       when is_binary(state) and is_list(blockers) do
+    normalize_state(state) == "in progress" and
+      Enum.any?(blockers, &(not blocker_terminal?(&1, terminal_states)))
+  end
+
+  defp blocked_but_in_progress?(_issue, _terminal_states), do: false
+
+  defp sort_todo_issues(issues) do
+    Enum.sort_by(issues, &issue_sort_key/1)
+  end
+
+  defp issue_sort_key(%Issue{} = issue), do: {created_at_sort_key(issue), issue.identifier || issue.id || ""}
+  defp issue_sort_key(_issue), do: {@max_sort_key, ""}
 
   defp created_at_sort_key(%Issue{created_at: %DateTime{} = created_at}),
     do: DateTime.to_unix(created_at, :microsecond)
 
   defp created_at_sort_key(_issue), do: @max_sort_key
+
+  defp current_work_option(opts) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, :current_work) -> normalize_current_work(Map.get(opts, :current_work))
+      Map.has_key?(opts, "current_work") -> normalize_current_work(Map.get(opts, "current_work"))
+      true -> nil
+    end
+  end
+
+  defp normalize_current_work(%{count: count, entries: entries}) do
+    normalized_entries = normalize_current_work_entries(entries)
+    %{count: normalize_count(count, normalized_entries), entries: normalized_entries}
+  end
+
+  defp normalize_current_work(%{"count" => count, "entries" => entries}) do
+    normalized_entries = normalize_current_work_entries(entries)
+    %{count: normalize_count(count, normalized_entries), entries: normalized_entries}
+  end
+
+  defp normalize_current_work(%{entries: entries}) do
+    normalized_entries = normalize_current_work_entries(entries)
+    %{count: length(normalized_entries), entries: normalized_entries}
+  end
+
+  defp normalize_current_work(%{"entries" => entries}) do
+    normalized_entries = normalize_current_work_entries(entries)
+    %{count: length(normalized_entries), entries: normalized_entries}
+  end
+
+  defp normalize_current_work(_current_work), do: %{count: 0, entries: []}
+
+  defp normalize_current_work_entries(entries) when is_list(entries) do
+    entries
+    |> Enum.map(fn entry ->
+      []
+      |> maybe_put_current_work_value(:issue_id, Map.get(entry, :issue_id, Map.get(entry, "issue_id")))
+      |> maybe_put_current_work_value(
+        :issue_identifier,
+        Map.get(entry, :issue_identifier, Map.get(entry, "issue_identifier"))
+      )
+      |> maybe_put_current_work_value(:state, Map.get(entry, :state, Map.get(entry, "state")))
+      |> maybe_put_current_work_value(:worker_host, Map.get(entry, :worker_host, Map.get(entry, "worker_host")))
+      |> maybe_put_current_work_value(
+        :workspace_path,
+        Map.get(entry, :workspace_path, Map.get(entry, "workspace_path"))
+      )
+      |> Map.new()
+    end)
+    |> Enum.sort_by(fn entry ->
+      {Map.get(entry, :issue_identifier) || Map.get(entry, :issue_id) || "", Map.get(entry, :worker_host) || ""}
+    end)
+  end
+
+  defp normalize_current_work_entries(_entries), do: []
+
+  defp maybe_put_current_work_value(entries, _key, nil), do: entries
+  defp maybe_put_current_work_value(entries, key, value), do: [{key, value} | entries]
+
+  defp normalize_count(count, _entries) when is_integer(count) and count >= 0, do: count
+  defp normalize_count(_count, entries), do: length(entries)
+
+  defp current_work_count(%{count: count}, _fallback) when is_integer(count) and count >= 0, do: count
+  defp current_work_count(_current_work, fallback) when is_integer(fallback) and fallback >= 0, do: fallback
+  defp current_work_count(_current_work, _fallback), do: 0
 
   defp terminal_state_set(states) do
     states
