@@ -103,12 +103,10 @@ defmodule SymphonyElixir.RunStateStore do
   defp maybe_override_unknown_phase(summary, entry) do
     issue = Map.get(entry, :issue, %{})
 
-    cond do
-      summary.current_phase == "unknown" and Map.get(issue, :state) == "Checking" ->
-        %{summary | current_phase: "checking_tracker_state"}
-
-      true ->
-        summary
+    if summary.current_phase == "unknown" and Map.get(issue, :state) == "Checking" do
+      %{summary | current_phase: "checking_tracker_state"}
+    else
+      summary
     end
   end
 

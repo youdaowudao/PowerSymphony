@@ -30,23 +30,25 @@ defmodule SymphonyElixir.StateReducer do
 
   @spec initial_summary(map()) :: summary()
   def initial_summary(attrs \\ %{}) when is_map(attrs) do
+    attrs = normalize_initial_summary_attrs(attrs)
+
     %{
-      current_phase: string_or_default(Map.get(attrs, :current_phase) || Map.get(attrs, "current_phase"), @fallback_phase),
-      current_action: string_or_default(Map.get(attrs, :current_action) || Map.get(attrs, "current_action"), @fallback_action),
-      health: string_or_default(Map.get(attrs, :health) || Map.get(attrs, "health"), @fallback_health),
-      linear_state: Map.get(attrs, :linear_state) || Map.get(attrs, "linear_state"),
-      last_event_at: datetime_value(Map.get(attrs, :last_event_at) || Map.get(attrs, "last_event_at")),
-      last_event_type: Map.get(attrs, :last_event_type) || Map.get(attrs, "last_event_type"),
-      thread_id: Map.get(attrs, :thread_id) || Map.get(attrs, "thread_id"),
-      turn_id: Map.get(attrs, :turn_id) || Map.get(attrs, "turn_id"),
-      session_id: Map.get(attrs, :session_id) || Map.get(attrs, "session_id"),
-      turn_count: integer_or_zero(Map.get(attrs, :turn_count) || Map.get(attrs, "turn_count")),
-      last_error: Map.get(attrs, :last_error) || Map.get(attrs, "last_error"),
-      fallback_reason: Map.get(attrs, :fallback_reason) || Map.get(attrs, "fallback_reason"),
-      retry_delay_type: Map.get(attrs, :retry_delay_type) || Map.get(attrs, "retry_delay_type"),
-      approval_pending: boolean_value(Map.get(attrs, :approval_pending) || Map.get(attrs, "approval_pending")),
-      tool_failure: boolean_value(Map.get(attrs, :tool_failure) || Map.get(attrs, "tool_failure")),
-      run_status: Map.get(attrs, :run_status) || Map.get(attrs, "run_status")
+      current_phase: string_or_default(attrs.current_phase, @fallback_phase),
+      current_action: string_or_default(attrs.current_action, @fallback_action),
+      health: string_or_default(attrs.health, @fallback_health),
+      linear_state: attrs.linear_state,
+      last_event_at: datetime_value(attrs.last_event_at),
+      last_event_type: attrs.last_event_type,
+      thread_id: attrs.thread_id,
+      turn_id: attrs.turn_id,
+      session_id: attrs.session_id,
+      turn_count: integer_or_zero(attrs.turn_count),
+      last_error: attrs.last_error,
+      fallback_reason: attrs.fallback_reason,
+      retry_delay_type: attrs.retry_delay_type,
+      approval_pending: boolean_value(attrs.approval_pending),
+      tool_failure: boolean_value(attrs.tool_failure),
+      run_status: attrs.run_status
     }
   end
 
@@ -87,29 +89,12 @@ defmodule SymphonyElixir.StateReducer do
     now = Keyword.get(opts, :now, DateTime.utc_now()) |> datetime_value() || DateTime.utc_now()
     checking_interval_ms = positive_integer(Keyword.get(opts, :checking_interval_ms), 600_000)
 
-    cond do
-      summary.current_phase == @fallback_phase and summary.fallback_reason == "unknown_event" ->
-        @fallback_health
-
-      summary.current_phase == @fallback_phase and is_nil(summary.last_event_at) ->
-        @fallback_health
-
-      summary.tool_failure ->
-        "tool_blocked"
-
-      summary.approval_pending ->
-        "needs_attention"
-
-      summary.run_status == "failed" ->
-        "codex_error"
-
-      checking_cooldown?(summary, now, checking_interval_ms) ->
-        "normal"
-
-      true ->
-        elapsed_ms = elapsed_ms(summary.last_event_at, now)
-        compute_elapsed_health(elapsed_ms, stall_timeout_ms)
-    end
+    fallback_health(summary) ||
+      exceptional_health(summary) ||
+      if(checking_cooldown?(summary, now, checking_interval_ms),
+        do: "normal",
+        else: compute_elapsed_health(elapsed_ms(summary.last_event_at, now), stall_timeout_ms)
+      )
   end
 
   @spec fallback_action() :: String.t()
@@ -204,23 +189,75 @@ defmodule SymphonyElixir.StateReducer do
   end
 
   defp notification_phase(payload) do
-    case nested_string(payload, ["method"]) do
-      "item/reasoning/summaryTextDelta" -> "codex_reasoning"
-      "item/reasoning/textDelta" -> "codex_reasoning"
-      "item/reasoning/summaryPartAdded" -> "codex_reasoning"
-      "item/fileChange/outputDelta" -> "codex_editing_files"
-      "item/completed" -> item_completed_phase(payload)
-      "item/commandExecution/outputDelta" -> "codex_running_shell"
-      "item/commandExecution/requestApproval" -> "codex_waiting_approval_resolution"
-      "item/fileChange/requestApproval" -> "codex_waiting_approval_resolution"
-      "item/tool/call" -> tool_phase(payload, "codex_waiting_tool")
-      "item/tool/requestUserInput" -> "codex_waiting_user_input_policy"
-      "turn/completed" -> "turn_completed"
-      "turn/started" -> "starting_codex_turn"
-      nil -> @fallback_phase
-      _other -> @fallback_phase
+    payload
+    |> nested_string(["method"])
+    |> notification_phase_for_method(payload)
+  end
+
+  defp normalize_initial_summary_attrs(attrs) do
+    %{
+      current_phase: map_value(attrs, :current_phase),
+      current_action: map_value(attrs, :current_action),
+      health: map_value(attrs, :health),
+      linear_state: map_value(attrs, :linear_state),
+      last_event_at: map_value(attrs, :last_event_at),
+      last_event_type: map_value(attrs, :last_event_type),
+      thread_id: map_value(attrs, :thread_id),
+      turn_id: map_value(attrs, :turn_id),
+      session_id: map_value(attrs, :session_id),
+      turn_count: map_value(attrs, :turn_count),
+      last_error: map_value(attrs, :last_error),
+      fallback_reason: map_value(attrs, :fallback_reason),
+      retry_delay_type: map_value(attrs, :retry_delay_type),
+      approval_pending: map_value(attrs, :approval_pending),
+      tool_failure: map_value(attrs, :tool_failure),
+      run_status: map_value(attrs, :run_status)
+    }
+  end
+
+  defp fallback_health(summary) do
+    if unknown_summary_without_activity?(summary), do: @fallback_health, else: nil
+  end
+
+  defp exceptional_health(summary) do
+    cond do
+      summary.tool_failure -> "tool_blocked"
+      summary.approval_pending -> "needs_attention"
+      summary.run_status == "failed" -> "codex_error"
+      true -> nil
     end
   end
+
+  defp unknown_summary_without_activity?(summary) do
+    summary.current_phase == @fallback_phase and
+      (summary.fallback_reason == "unknown_event" or is_nil(summary.last_event_at))
+  end
+
+  defp notification_phase_for_method(method, payload)
+
+  defp notification_phase_for_method(method, _payload)
+       when method in [
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/textDelta",
+              "item/reasoning/summaryPartAdded"
+            ],
+       do: "codex_reasoning"
+
+  defp notification_phase_for_method("item/fileChange/outputDelta", _payload), do: "codex_editing_files"
+  defp notification_phase_for_method("item/completed", payload), do: item_completed_phase(payload)
+  defp notification_phase_for_method("item/commandExecution/outputDelta", _payload), do: "codex_running_shell"
+
+  defp notification_phase_for_method(method, _payload)
+       when method in ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"],
+       do: "codex_waiting_approval_resolution"
+
+  defp notification_phase_for_method("item/tool/call", payload), do: tool_phase(payload, "codex_waiting_tool")
+  defp notification_phase_for_method("item/tool/requestUserInput", _payload), do: "codex_waiting_user_input_policy"
+  defp notification_phase_for_method("turn/completed", _payload), do: "turn_completed"
+  defp notification_phase_for_method("turn/started", _payload), do: "starting_codex_turn"
+  defp notification_phase_for_method(_method, _payload), do: @fallback_phase
+
+  defp map_value(attrs, key), do: Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
 
   defp item_completed_phase(payload) do
     item_type =

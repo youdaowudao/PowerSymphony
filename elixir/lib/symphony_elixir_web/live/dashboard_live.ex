@@ -760,10 +760,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp m3_issue_label(_entry), do: "unknown"
 
   defp running_activity_summary(entry) do
-    cond do
-      is_binary(entry.current_action) and entry.current_action != "" ->
-        entry.current_action
+    current_action(entry) || turns_or_session_summary(entry)
+  end
 
+  defp current_action(entry) do
+    if is_binary(entry.current_action) and entry.current_action != "", do: entry.current_action
+  end
+
+  defp turns_or_session_summary(entry) do
+    cond do
       is_integer(entry.turn_count) and entry.turn_count > 0 and entry.session_id ->
         "#{entry.turn_count} turns · session id available"
 

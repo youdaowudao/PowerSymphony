@@ -854,8 +854,11 @@ defmodule SymphonyElixir.RunTraceTest do
         "payload" => %{"method" => "item/tool/requestUserInput"}
       })
 
-    assert StateReducer.health_for_summary(approval_summary, now: now, stall_timeout_ms: 300_000, checking_interval_ms: 600_000) ==
-             "needs_attention"
+    assert StateReducer.health_for_summary(approval_summary,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "needs_attention"
 
     cleared_approval =
       StateReducer.reduce_event(approval_summary, %{
@@ -880,8 +883,11 @@ defmodule SymphonyElixir.RunTraceTest do
         "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}
       })
 
-    assert StateReducer.health_for_summary(tool_failure_summary, now: now, stall_timeout_ms: 300_000, checking_interval_ms: 600_000) ==
-             "tool_blocked"
+    assert StateReducer.health_for_summary(tool_failure_summary,
+             now: now,
+             stall_timeout_ms: 300_000,
+             checking_interval_ms: 600_000
+           ) == "tool_blocked"
 
     cleared_tool_failure =
       StateReducer.reduce_event(tool_failure_summary, %{
