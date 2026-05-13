@@ -172,37 +172,32 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     run_mode = Keyword.get(opts, :run_mode, :normal)
+    turn_context = %{
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      run_mode: run_mode,
+      max_turns: max_turns
+    }
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          run_mode,
-          1,
-          max_turns
-        )
+        do_run_codex_turns(session, workspace, issue, turn_context, 1)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(
-         app_session,
-         workspace,
-         issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         run_mode,
-         turn_number,
-         max_turns
-       ) do
+  defp do_run_codex_turns(app_session, workspace, issue, turn_context, turn_number) do
+    %{
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      run_mode: run_mode,
+      max_turns: max_turns
+    } = turn_context
+
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     case AppServer.run_turn(
@@ -228,12 +223,8 @@ defmodule SymphonyElixir.AgentRunner do
               app_session,
               workspace,
               refreshed_issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              run_mode,
-              turn_number + 1,
-              max_turns
+              turn_context,
+              turn_number + 1
             )
 
           {:continue, refreshed_issue} ->
