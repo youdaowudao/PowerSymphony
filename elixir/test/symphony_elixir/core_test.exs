@@ -1559,6 +1559,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
     assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
     assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
+
     assert prompt =~
              "If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`."
 
