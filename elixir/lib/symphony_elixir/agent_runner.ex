@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, RunTrace, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
   @type run_result_status :: :completed | :continuation_required | :failed
@@ -37,21 +37,59 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    trace =
+      case Keyword.get(opts, :run_trace) do
+        %RunTrace{} = existing_trace ->
+          existing_trace
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+        nil ->
+          case RunTrace.start(issue, worker_host: worker_host) do
+            {:ok, new_trace} ->
+              new_trace
+
+            {:error, reason} ->
+              Logger.warning("Run trace initialization failed for #{issue_context(issue)}: #{inspect(reason)}")
+              nil
           end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
-        end
+      end
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+    RunTrace.with_context(trace, fn ->
+      RunTrace.record(trace, :agent_runner, %{
+        event: :worker_attempt_started,
+        summary: "agent_runner:worker_attempt_started",
+        payload: %{worker_host: worker_host}
+      })
+
+      case Workspace.create_for_issue(issue, worker_host) do
+        {:ok, workspace} ->
+          trace = RunTrace.update(trace, %{workspace_path: workspace})
+
+          RunTrace.record(trace, :agent_runner, %{
+            event: :workspace_prepared,
+            summary: "agent_runner:workspace_prepared",
+            payload: %{workspace_path: workspace, worker_host: worker_host}
+          })
+
+          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+
+          try do
+            with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            end
+          after
+            Workspace.run_after_run_hook(workspace, issue, worker_host)
+          end
+
+        {:error, reason} ->
+          RunTrace.record(trace, :agent_runner, %{
+            event: :workspace_prepare_failed,
+            summary: "agent_runner:workspace_prepare_failed",
+            payload: %{worker_host: worker_host, reason: inspect(reason)}
+          })
+
+          {:error, reason}
+      end
+    end)
   end
 
   defp codex_message_handler(recipient, issue) do
@@ -62,22 +100,34 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(recipient, %Issue{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
+    RunTrace.record(:codex, message)
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, _message), do: :ok
+  defp send_codex_update(_recipient, _issue, message) do
+    RunTrace.record(:codex, message)
+    :ok
+  end
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+       when is_binary(issue_id) and is_binary(workspace) do
+    RunTrace.record(:agent_runner, %{
+      event: :worker_runtime_info,
+      summary: "agent_runner:worker_runtime_info",
+      payload: %{worker_host: worker_host, workspace_path: workspace}
+    })
+
+    if is_pid(recipient) do
+      send(
+        recipient,
+        {:worker_runtime_info, issue_id,
+         %{
+           worker_host: worker_host,
+           workspace_path: workspace
+         }}
+      )
+    end
 
     :ok
   end
@@ -89,17 +139,24 @@ defmodule SymphonyElixir.AgentRunner do
          reason: reason,
          turn_count: turn_count
        })
-       when is_binary(issue_id) and is_pid(recipient) and is_atom(status) and is_atom(reason) and
-              is_integer(turn_count) and turn_count > 0 do
-    send(
-      recipient,
-      {:agent_run_result, issue_id,
-       %{
-         status: status,
-         reason: reason,
-         turn_count: turn_count
-       }}
-    )
+       when is_binary(issue_id) and is_atom(status) and is_atom(reason) and is_integer(turn_count) and turn_count > 0 do
+    RunTrace.record(:agent_runner, %{
+      event: :run_result,
+      summary: "agent_runner:run_result",
+      payload: %{status: status, reason: reason, turn_count: turn_count}
+    })
+
+    if is_pid(recipient) do
+      send(
+        recipient,
+        {:agent_run_result, issue_id,
+         %{
+           status: status,
+           reason: reason,
+           turn_count: turn_count
+         }}
+      )
+    end
 
     :ok
   end
