@@ -12,7 +12,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec project_m3_precheck_payload(String.t()) ::
           {:ok, map()} | {:error, :project_not_found | term()}
   def project_m3_precheck_payload(project_id) when is_binary(project_id) do
-    project_worker_request(project_id, "/api/v1/m3_precheck")
+    with {:ok, body} <- project_worker_request(project_id, "/api/v1/m3_precheck") do
+      {:ok, Presenter.m3_precheck_payload(body)}
+    end
   end
 
   @spec state(Conn.t(), map()) :: Conn.t()

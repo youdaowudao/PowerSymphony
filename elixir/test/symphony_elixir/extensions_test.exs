@@ -1147,12 +1147,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "invalid"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
-    assert html =~ "rendered"
     assert html =~ "Runtime"
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "7 turns"
+    assert html =~ "session id available"
+    refute html =~ "rendered"
+    refute html =~ "notification"
+    refute html =~ "Timeline"
+    refute html =~ "Prompt"
+    refute html =~ "Shell output"
+    refute html =~ "Recent events"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -1182,7 +1189,7 @@ defmodule SymphonyElixir.ExtensionsTest do
               }
             }
           },
-          last_codex_timestamp: DateTime.utc_now(),
+          last_codex_timestamp: ~U[2026-05-13 03:00:00Z],
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
@@ -1197,7 +1204,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      rendered = render(view)
+
+      rendered =~ "Running sessions" and
+        rendered =~ "In Progress" and
+        rendered =~ "8 turns" and
+        rendered =~ "session id available" and
+        refute_rendered_raw_activity?(rendered)
     end)
   end
 
@@ -1685,7 +1698,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)
 
     assert payload["m3_enabled"] == false
-    assert payload["eligible"] == []
+    refute Map.has_key?(payload, "eligible")
+    refute Map.has_key?(payload, "dispatch")
+    refute Map.has_key?(payload, "blocked")
     assert payload["eligible_todos"] == []
     assert payload["dispatched_todos"] == []
     assert payload["capacity_queued_todos"] == []
@@ -1718,7 +1733,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = json_response(post(build_conn(), "/api/v1/m3_precheck", %{}), 200)
 
-    assert Enum.map(payload["dispatch"], & &1["issue_identifier"]) == ["MT-1"]
+    refute Map.has_key?(payload, "eligible")
+    refute Map.has_key?(payload, "dispatch")
+    refute Map.has_key?(payload, "blocked")
     assert Enum.map(payload["eligible_todos"], & &1["issue_identifier"]) == ["MT-1", "MT-2"]
     assert Enum.map(payload["dispatched_todos"], & &1["issue_identifier"]) == ["MT-1"]
     assert Enum.map(payload["capacity_queued_todos"], & &1["issue_identifier"]) == ["MT-2"]
@@ -1761,7 +1778,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
     payload = json_response(post(build_conn(), "/api/v1/projects/alpha/m3_precheck", %{}), 200)
 
+    assert payload["generated_at"] == "2026-05-12T00:00:00Z"
     assert payload["m3_enabled"] == true
+    refute Map.has_key?(payload, "eligible")
+    refute Map.has_key?(payload, "dispatch")
+    refute Map.has_key?(payload, "blocked")
 
     assert payload["eligible_todos"] == [
              %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
@@ -1800,6 +1821,56 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert payload["text"] =~ "fake worker m3 precheck"
   end
 
+  test "presenter m3 precheck payload normalizes malformed worker body safely" do
+    payload =
+      SymphonyElixirWeb.Presenter.m3_precheck_payload(%{
+        "generated_at" => "2026-05-12T00:00:00Z",
+        "eligible_todos" => %{"issue_identifier" => "bad-shape"},
+        "dispatched_todos" => nil,
+        "capacity_queued_todos" => "bad-shape",
+        "blocked_todos" => %{
+          "MT-BLOCKED-1" => "bad-shape",
+          "MT-BLOCKED-2" => ["waiting on dependency"]
+        },
+        "anomalies" => %{"type" => "bad-shape"},
+        "current_work" => %{
+          "count" => "bad-count",
+          "entries" => [
+            %{
+              "issue_id" => "cp-running",
+              "issue_identifier" => "RUN-CP-1",
+              "state" => "In Progress"
+            }
+          ]
+        }
+      })
+
+    assert payload.generated_at == "2026-05-12T00:00:00Z"
+    assert payload.eligible_todos == []
+    assert payload.dispatched_todos == []
+    assert payload.capacity_queued_todos == []
+    assert payload.blocked_todos == %{"MT-BLOCKED-2" => ["waiting on dependency"]}
+    assert payload.anomalies == []
+
+    assert payload.current_work == %{
+             count: 1,
+             entries: [
+               %{
+                 "issue_id" => "cp-running",
+                 "issue_identifier" => "RUN-CP-1",
+                 "state" => "In Progress"
+               }
+             ]
+           }
+
+    fallback_payload =
+      SymphonyElixirWeb.Presenter.m3_precheck_payload(%{
+        "blocked_todos" => "bad-shape"
+      })
+
+    assert fallback_payload.blocked_todos == %{}
+  end
+
   test "control-plane dashboard renders m3 precheck result on demand" do
     test_root = temp_root!("project-precheck-live")
     manager_name = Module.concat(__MODULE__, ProjectPrecheckLiveManager)
@@ -1828,7 +1899,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='alpha']")
     |> render_click()
 
-    assert render(view) =~ "fake worker m3 precheck"
+    rendered = render(view)
+    assert rendered =~ "运行预检"
+    assert rendered =~ "依赖阻塞"
+    assert rendered =~ "可放行 Todo"
+    assert rendered =~ "容量排队"
+    assert rendered =~ "本轮已派发"
+    assert rendered =~ "异常执行态"
+    assert rendered =~ "当前执行中"
+    assert rendered =~ "MT-CP-2"
+    assert rendered =~ "MT-CP-1"
+    assert rendered =~ "RUN-CP-1"
+    assert rendered =~ "MT-CP-3"
+    refute rendered =~ "fake worker m3 precheck"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
@@ -2093,6 +2176,17 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp refute_rendered_raw_activity?(rendered) when is_binary(rendered) do
+    not String.contains?(rendered, "rendered") and
+      not String.contains?(rendered, "notification") and
+      not String.contains?(rendered, "agent message content streaming: structured update") and
+      not String.contains?(rendered, "2026-05-13T03:00:00Z") and
+      not String.contains?(rendered, "Timeline") and
+      not String.contains?(rendered, "Prompt") and
+      not String.contains?(rendered, "Shell output") and
+      not String.contains?(rendered, "Recent events")
   end
 
   defp wait_for_bound_port do

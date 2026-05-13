@@ -87,41 +87,18 @@ defmodule SymphonyElixirWeb.Presenter do
   @spec m3_precheck_payload(map()) :: map()
   def m3_precheck_payload(payload) when is_map(payload) do
     %{
-      generated_at: generated_at(),
-      m3_enabled: Map.get(payload, :m3_enabled),
-      eligible: Enum.map(Map.get(payload, :eligible, []), &issue_precheck_entry/1),
-      dispatch: Enum.map(Map.get(payload, :dispatch, []), &issue_precheck_entry/1),
-      blocked: Map.get(payload, :blocked, %{}),
-      eligible_todos: Enum.map(Map.get(payload, :eligible_todos, []), &issue_precheck_entry/1),
-      dispatched_todos: Enum.map(Map.get(payload, :dispatched_todos, []), &issue_precheck_entry/1),
-      capacity_queued_todos: Enum.map(Map.get(payload, :capacity_queued_todos, []), &issue_precheck_entry/1),
-      blocked_todos: Map.get(payload, :blocked_todos, %{}),
-      current_work: %{
-        count: get_in(payload, [:current_work, :count]) || 0,
-        entries:
-          Enum.map(get_in(payload, [:current_work, :entries]) || [], fn entry ->
-            %{}
-            |> maybe_put_payload_value("issue_id", Map.get(entry, :issue_id))
-            |> maybe_put_payload_value("issue_identifier", Map.get(entry, :issue_identifier))
-            |> maybe_put_payload_value("state", Map.get(entry, :state))
-            |> maybe_put_payload_value("worker_host", Map.get(entry, :worker_host))
-            |> maybe_put_payload_value("workspace_path", Map.get(entry, :workspace_path))
-          end)
-      },
-      anomalies:
-        Enum.map(Map.get(payload, :anomalies, []), fn anomaly ->
-          %{
-            "type" => anomaly[:type] |> to_string(),
-            "issue_identifier" => anomaly[:issue_identifier],
-            "issue_id" => anomaly[:issue_id],
-            "state" => anomaly[:state],
-            "blocking_identifiers" => anomaly[:blocking_identifiers] || []
-          }
-        end),
-      structural_errors: Map.get(payload, :structural_errors, []),
-      warnings: Map.get(payload, :warnings, []),
-      convergence_points: Map.get(payload, :convergence_points, []),
-      text: Map.get(payload, :text, "")
+      generated_at: m3_generated_at(payload),
+      m3_enabled: m3_payload_value(payload, :m3_enabled),
+      eligible_todos: m3_issue_entries(payload, :eligible_todos),
+      dispatched_todos: m3_issue_entries(payload, :dispatched_todos),
+      capacity_queued_todos: m3_issue_entries(payload, :capacity_queued_todos),
+      blocked_todos: m3_blocked_todos_payload(payload),
+      current_work: m3_current_work_payload(payload),
+      anomalies: m3_anomalies_payload(payload),
+      structural_errors: m3_payload_value(payload, :structural_errors, []),
+      warnings: m3_payload_value(payload, :warnings, []),
+      convergence_points: m3_payload_value(payload, :convergence_points, []),
+      text: m3_payload_value(payload, :text, "")
     }
   end
 
@@ -322,6 +299,115 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_precheck_entry(%{identifier: identifier, id: issue_id, state: state}) do
     %{"issue_identifier" => identifier, "issue_id" => issue_id, "state" => state}
+  end
+
+  defp issue_precheck_entry(%{} = entry) do
+    %{}
+    |> maybe_put_payload_value("issue_identifier", Map.get(entry, :identifier, Map.get(entry, "issue_identifier")))
+    |> maybe_put_payload_value("issue_id", Map.get(entry, :id, Map.get(entry, "issue_id")))
+    |> maybe_put_payload_value("state", Map.get(entry, :state, Map.get(entry, "state")))
+  end
+
+  defp m3_generated_at(payload) do
+    case m3_payload_value(payload, :generated_at) do
+      value when is_binary(value) and value != "" -> value
+      _ -> generated_at()
+    end
+  end
+
+  defp m3_payload_value(payload, key, default \\ nil),
+    do: Map.get(payload, key, Map.get(payload, Atom.to_string(key), default))
+
+  defp m3_issue_entries(payload, key) do
+    payload
+    |> m3_payload_value(key, [])
+    |> m3_list_value()
+    |> Enum.map(&issue_precheck_entry/1)
+  end
+
+  defp m3_current_work_payload(payload) do
+    current_work = m3_payload_value(payload, :current_work, %{})
+
+    entries =
+      current_work
+      |> m3_nested_value(:entries, [])
+      |> m3_list_value()
+      |> Enum.map(fn entry ->
+        %{}
+        |> maybe_put_payload_value("issue_id", m3_nested_value(entry, :issue_id))
+        |> maybe_put_payload_value("issue_identifier", m3_nested_value(entry, :issue_identifier))
+        |> maybe_put_payload_value("state", m3_nested_value(entry, :state))
+        |> maybe_put_payload_value("worker_host", m3_nested_value(entry, :worker_host))
+        |> maybe_put_payload_value("workspace_path", m3_nested_value(entry, :workspace_path))
+      end)
+
+    %{
+      count: m3_current_work_count(current_work, entries),
+      entries: entries
+    }
+  end
+
+  defp m3_anomalies_payload(payload) do
+    payload
+    |> m3_payload_value(:anomalies, [])
+    |> m3_list_value()
+    |> Enum.map(fn anomaly ->
+      %{
+        "type" => anomaly |> m3_nested_value(:type) |> to_string(),
+        "issue_identifier" => m3_nested_value(anomaly, :issue_identifier),
+        "issue_id" => m3_nested_value(anomaly, :issue_id),
+        "state" => m3_nested_value(anomaly, :state),
+        "blocking_identifiers" => m3_nested_value(anomaly, :blocking_identifiers, [])
+      }
+    end)
+  end
+
+  defp m3_blocked_todos_payload(payload) do
+    payload
+    |> m3_payload_value(:blocked_todos, %{})
+    |> case do
+      blocked when is_map(blocked) ->
+        blocked
+        |> Enum.reduce(%{}, fn
+          {issue_identifier, reasons}, acc when is_binary(issue_identifier) ->
+            m3_put_blocked_todo_entry(acc, issue_identifier, reasons)
+
+          _entry, acc ->
+            acc
+        end)
+
+      _other ->
+        %{}
+    end
+  end
+
+  defp m3_put_blocked_todo_entry(acc, issue_identifier, reasons) do
+    normalized_reasons =
+      reasons
+      |> m3_list_value()
+      |> Enum.filter(&is_binary/1)
+
+    case normalized_reasons do
+      [] -> acc
+      _ -> Map.put(acc, issue_identifier, normalized_reasons)
+    end
+  end
+
+  defp m3_nested_value(value, key, default \\ nil)
+
+  defp m3_nested_value(value, key, default) when is_map(value),
+    do: Map.get(value, key, Map.get(value, Atom.to_string(key), default))
+
+  defp m3_nested_value(_value, _key, default), do: default
+
+  defp m3_list_value(value) when is_list(value), do: value
+  defp m3_list_value(_value), do: []
+
+  defp m3_current_work_count(current_work, entries) do
+    case m3_nested_value(current_work, :count) do
+      count when is_integer(count) and count >= 0 -> count
+      _other -> length(entries)
+    end
   end
 
   defp maybe_put_payload_value(payload, _key, nil), do: payload
