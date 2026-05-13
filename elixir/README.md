@@ -20,6 +20,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
+`Checking` is now a first-class runtime state. Once a main implementation run reaches
+`Checking`, Symphony stops that long-running implementation pass, holds the claim, and schedules a
+single short recheck after the configured cooldown window. That recheck only evaluates three signal
+classes: PR merged state, latest head SHA required checks, and the newest human review delta.
+
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.
 
@@ -149,6 +154,8 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `polling.checking_interval_ms` controls the cooldown before Symphony re-runs a short `Checking`
+  recheck. Default: `600000` (10 minutes).
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

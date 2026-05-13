@@ -15,7 +15,7 @@ defmodule SymphonyElixir.CoreTest do
 
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
-    assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.active_states == ["Todo", "In Progress", "Checking"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
@@ -947,6 +947,41 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "checking issue remains non-dispatchable before cooldown retry due time" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Checking"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue = %Issue{
+      id: "issue-checking-cooldown",
+      identifier: "MT-563CHECK",
+      title: "Checking cooldown",
+      description: "Should wait for checking retry window",
+      state: "Checking",
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue.id]),
+      blocked_claims: %{},
+      retry_attempts: %{
+        issue.id => %{
+          attempt: 1,
+          due_at_ms: System.monotonic_time(:millisecond) + 60_000,
+          retry_token: make_ref(),
+          timer_ref: nil,
+          identifier: issue.identifier,
+          delay_type: :checking_recheck
+        }
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "active issue with non-terminal blocker is not dispatchable" do
     issue = %Issue{
       id: "issue-active-blocked",
@@ -1578,6 +1613,12 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
+    assert prompt =~ "`Checking` -> stop the current implementation run after the bounded PR closeout pass."
+    assert prompt =~ "For a ticket already in `Checking`, run one short recheck thread only."
+    assert prompt =~ "Read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta."
+    assert prompt =~ "If merge is complete, move to `Done`."
+    assert prompt =~ "If checks reached a non-success terminal state, move to `In Progress`."
+    assert prompt =~ "If automation cannot safely continue, move to `Human Review`."
     assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
     assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
 
@@ -2221,6 +2262,212 @@ defmodule SymphonyElixir.CoreTest do
       assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
 
       assert_receive {:agent_run_result, "issue-blocked-continuation", run_result}, 500
+      assert run_result.status == :completed
+      assert run_result.reason == :issue_inactive
+      assert run_result.turn_count == 1
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner stops after entering checking and reports checking closeout result" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-checking-closeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3,
+        tracker_active_states: ["Todo", "In Progress", "Checking"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      issue = %Issue{
+        id: "issue-checking-closeout",
+        identifier: "MT-572C",
+        title: "Stop at checking",
+        description: "Run should stop after checking entry",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-572C",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: issue.id,
+             identifier: issue.identifier,
+             title: issue.title,
+             description: issue.description,
+             state: "Checking"
+           }
+         ]}
+      end
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive {:agent_run_result, "issue-checking-closeout", run_result}, 500
+      assert run_result.status == :completed
+      assert run_result.reason == :issue_entered_checking
+      assert run_result.turn_count == 1
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "checking recheck run stops after one turn even if refreshed issue returns to in progress" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-checking-recheck-single-turn-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking-recheck"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-recheck-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-recheck-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3,
+        tracker_active_states: ["Todo", "In Progress", "Checking"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      issue = %Issue{
+        id: "issue-checking-recheck-single-turn",
+        identifier: "MT-572R",
+        title: "Stop checking recheck after one turn",
+        description: "Checking recheck must never continue into a second turn",
+        state: "Checking",
+        url: "https://example.org/issues/MT-572R",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: issue.id,
+             identifier: issue.identifier,
+             title: issue.title,
+             description: issue.description,
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 issue_state_fetcher: state_fetcher,
+                 run_mode: :checking_recheck
+               )
+
+      assert_receive {:agent_run_result, "issue-checking-recheck-single-turn", run_result}, 500
       assert run_result.status == :completed
       assert run_result.reason == :issue_inactive
       assert run_result.turn_count == 1

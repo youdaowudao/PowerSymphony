@@ -300,6 +300,241 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Enum.any?(events, &(&1["event_type"] == "retry_converged_to_blocked_claim"))
   end
 
+  test "checking retry uses cooldown interval and remains gated until due" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Checking"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      checking_interval_ms: 600_000
+    )
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(["issue-orch-checking-cooldown"]),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    issue = %Issue{
+      id: "issue-orch-checking-cooldown",
+      identifier: "MT-CHECKING-ORCH",
+      title: "Checking recheck",
+      description: "Dispatch only when cooldown expires",
+      state: "Checking",
+      labels: []
+    }
+
+    scheduled_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue.id, 1, %{
+        identifier: issue.identifier,
+        delay_type: :checking_recheck
+      })
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :checking_recheck} =
+             scheduled_state.retry_attempts[issue.id]
+
+    assert is_integer(due_at_ms)
+    assert Orchestrator.retry_delay_for_test(1, %{delay_type: :checking_recheck}) == 600_000
+    refute Orchestrator.should_dispatch_issue_for_test(issue, scheduled_state)
+  end
+
+  test "fresh poll does not immediately dispatch checking issue before updated_at cooldown expires" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Checking"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      checking_interval_ms: 600_000
+    )
+
+    recent_update = DateTime.utc_now()
+
+    issue = %Issue{
+      id: "issue-orch-checking-fresh",
+      identifier: "MT-CHECKING-FRESH",
+      title: "Checking fresh poll gate",
+      description: "Fresh poll must respect checking cooldown",
+      state: "Checking",
+      updated_at: recent_update,
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "fresh poll allows checking issue dispatch after updated_at cooldown elapsed" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Checking"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      checking_interval_ms: 600_000
+    )
+
+    stale_update = DateTime.add(DateTime.utc_now(), -601, :second)
+
+    issue = %Issue{
+      id: "issue-orch-checking-due",
+      identifier: "MT-CHECKING-DUE",
+      title: "Checking fresh poll due",
+      description: "Fresh poll may dispatch once cooldown elapsed",
+      state: "Checking",
+      updated_at: stale_update,
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      blocked_claims: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "orchestrator dispatches checking retry in restricted recheck mode after cooldown" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-checking-recheck-#{System.unique_integer([:positive])}"
+      )
+
+    logs_root = Path.join(test_root, "logs")
+    workspace_root = Path.join(test_root, "workspaces")
+    template_repo = Path.join(test_root, "source")
+    codex_binary = Path.join(test_root, "fake-codex")
+    trace_file = Path.join(test_root, "codex.trace")
+
+    try do
+      File.mkdir_p!(logs_root)
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-orch-checking"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-orch-checking"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      issue =
+        %Issue{
+          id: "issue-orch-checking-recheck",
+          identifier: "MT-ORCH-CHECKING",
+          title: "Restricted checking recheck",
+          description: "Retry should use restricted checking prompt",
+          state: "Checking",
+          updated_at: DateTime.add(DateTime.utc_now(), -601, :second),
+          labels: []
+        }
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        tracker_active_states: ["Todo", "In Progress", "Checking"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+        checking_interval_ms: 600_000,
+        max_concurrent_agents: 1
+      )
+
+      Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :CheckingRecheckOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        File.rm_rf(test_root)
+      end)
+
+      initial_state = :sys.get_state(pid)
+      retry_token = make_ref()
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:claimed, MapSet.new([issue.id]))
+        |> Map.put(:retry_attempts, %{
+          issue.id => %{
+            attempt: 1,
+            timer_ref: nil,
+            retry_token: retry_token,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: issue.identifier,
+            delay_type: :checking_recheck
+          }
+        })
+      end)
+
+      send(pid, {:retry_issue, issue.id, retry_token})
+
+      assert_eventually(fn ->
+        case File.read(trace_file) do
+          {:ok, contents} ->
+            contents =~ "Checking recheck only:" and
+              not String.contains?(contents, "You are an agent for this repository.")
+
+          _ ->
+            false
+        end
+      end)
+
+      state = :sys.get_state(pid)
+
+      if running_entry = state.running[issue.id] do
+        if Process.alive?(running_entry.pid) do
+          Process.exit(running_entry.pid, :shutdown)
+        end
+      end
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "orchestrator snapshot reflects last codex update and session id" do
     issue_id = "issue-snapshot"
 

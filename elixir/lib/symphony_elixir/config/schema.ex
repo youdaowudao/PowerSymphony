@@ -50,7 +50,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
-      field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:active_states, {:array, :string}, default: ["Todo", "In Progress", "Checking"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -73,13 +73,15 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:interval_ms, :integer, default: 30_000)
+      field(:checking_interval_ms, :integer, default: 600_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:interval_ms], empty_values: [])
+      |> cast(attrs, [:interval_ms, :checking_interval_ms], empty_values: [])
       |> validate_number(:interval_ms, greater_than: 0)
+      |> validate_number(:checking_interval_ms, greater_than: 0)
     end
   end
 

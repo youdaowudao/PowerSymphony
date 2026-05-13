@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Orchestrator do
   @premature_turn_end_recheck_delay_ms 1_000
   @premature_turn_end_hold_limit 3
   @failure_retry_base_ms 10_000
+  @checking_recheck_delay_type :checking_recheck
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -432,6 +433,12 @@ defmodule SymphonyElixir.Orchestrator do
     schedule_issue_retry(state, issue_id, attempt, metadata)
   end
 
+  @doc false
+  @spec retry_delay_for_test(integer(), map()) :: non_neg_integer()
+  def retry_delay_for_test(attempt, metadata) when is_integer(attempt) and is_map(metadata) do
+    retry_delay(attempt, metadata)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -683,6 +690,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     MapSet.member?(dispatchable_issue_ids, issue.id) and
       candidate_issue?(issue, active_states, terminal_states) and
+      checking_issue_dispatch_allowed?(issue, state) and
       !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -738,6 +746,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp checking_issue_dispatch_allowed?(%Issue{state: state_name} = issue, %State{} = state)
+       when is_binary(state_name) do
+    if normalize_issue_state(state_name) == "checking" do
+      checking_issue_retry_due?(issue, state)
+    else
+      true
+    end
+  end
+
+  defp checking_issue_dispatch_allowed?(_issue, _state), do: false
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -1083,11 +1102,14 @@ defmodule SymphonyElixir.Orchestrator do
          transition_context,
          run_trace
        ) do
+    run_mode = dispatch_run_mode(state, issue)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
-             run_trace: run_trace
+             run_trace: run_trace,
+             run_mode: run_mode
            )
          end) do
       {:ok, pid} ->
@@ -1102,6 +1124,7 @@ defmodule SymphonyElixir.Orchestrator do
             attempt: attempt,
             pid: pid,
             ref: ref,
+            run_mode: run_mode,
             worker_host: worker_host,
             retry_workspace_path: retry_workspace_path,
             transition_context: transition_context,
@@ -1129,6 +1152,7 @@ defmodule SymphonyElixir.Orchestrator do
            attempt: attempt,
            pid: pid,
            ref: ref,
+           run_mode: run_mode,
            worker_host: worker_host,
            retry_workspace_path: retry_workspace_path,
            run_trace: run_trace
@@ -1163,6 +1187,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_total_tokens: 0,
         turn_count: 0,
         run_result: nil,
+        run_mode: run_mode,
         run_trace: run_trace,
         retry_attempt: normalize_retry_attempt(attempt),
         started_at: DateTime.utc_now()
@@ -1185,6 +1210,7 @@ defmodule SymphonyElixir.Orchestrator do
            attempt: attempt,
            pid: pid,
            ref: ref,
+           run_mode: _run_mode,
            worker_host: worker_host,
            retry_workspace_path: retry_workspace_path,
            transition_context: transition_context,
@@ -1531,6 +1557,9 @@ defmodule SymphonyElixir.Orchestrator do
       metadata[:delay_type] == :premature_turn_end_hold ->
         @premature_turn_end_recheck_delay_ms
 
+      metadata[:delay_type] == @checking_recheck_delay_type ->
+        Config.settings!().polling.checking_interval_ms
+
       true ->
         failure_retry_delay(attempt)
     end
@@ -1574,6 +1603,22 @@ defmodule SymphonyElixir.Orchestrator do
   defp pick_retry_delay_type(previous_retry, metadata) do
     metadata[:delay_type] || Map.get(previous_retry, :delay_type)
   end
+
+  defp dispatch_run_mode(%State{} = state, %Issue{id: issue_id, state: state_name})
+       when is_binary(issue_id) and is_binary(state_name) do
+    cond do
+      normalize_issue_state(state_name) == "checking" ->
+        :checking_recheck
+
+      match?(%{delay_type: @checking_recheck_delay_type}, Map.get(state.retry_attempts, issue_id)) ->
+        :checking_recheck
+
+      true ->
+        :normal
+    end
+  end
+
+  defp dispatch_run_mode(_state, _issue), do: :normal
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
@@ -2083,6 +2128,25 @@ defmodule SymphonyElixir.Orchestrator do
     max(0, next_poll_due_at_ms - now_ms)
   end
 
+  defp checking_issue_retry_due?(%Issue{id: issue_id} = issue, %State{} = state) when is_binary(issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{due_at_ms: due_at_ms} when is_integer(due_at_ms) ->
+        due_at_ms <= System.monotonic_time(:millisecond)
+
+      _ ->
+        checking_issue_cooldown_elapsed?(issue)
+    end
+  end
+
+  defp checking_issue_retry_due?(_issue, _state), do: false
+
+  defp checking_issue_cooldown_elapsed?(%Issue{updated_at: %DateTime{} = updated_at}) do
+    DateTime.diff(DateTime.utc_now(), updated_at, :millisecond) >=
+      Config.settings!().polling.checking_interval_ms
+  end
+
+  defp checking_issue_cooldown_elapsed?(_issue), do: false
+
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
@@ -2115,9 +2179,23 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       %{status: :completed} = run_result ->
-        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled")
+        if run_result.reason == :issue_entered_checking do
+          Logger.info("Agent task entered checking for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling checking recheck")
 
-        complete_issue(state, issue_id, release_claim?: true)
+          state
+          |> complete_issue(issue_id)
+          |> schedule_issue_retry(issue_id, 1, %{
+            identifier: running_entry.identifier,
+            delay_type: @checking_recheck_delay_type,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            run_trace: run_trace
+          })
+        else
+          Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled")
+
+          complete_issue(state, issue_id, release_claim?: true)
+        end
 
       %{status: :failed, reason: :premature_turn_end} = run_result ->
         Logger.warning("Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck")

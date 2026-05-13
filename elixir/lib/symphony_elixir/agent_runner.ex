@@ -10,7 +10,12 @@ defmodule SymphonyElixir.AgentRunner do
   @type worker_host :: String.t() | nil
   @type run_result_status :: :completed | :continuation_required | :failed
   @type run_result_reason ::
-          :issue_inactive | :issue_still_active | :max_turns_reached | :premature_turn_end | :turn_timeout
+          :issue_inactive
+          | :issue_still_active
+          | :issue_entered_checking
+          | :max_turns_reached
+          | :premature_turn_end
+          | :turn_timeout
   @type run_result :: %{
           status: run_result_status(),
           reason: run_result_reason(),
@@ -166,17 +171,34 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    run_mode = Keyword.get(opts, :run_mode, :normal)
+
+    turn_context = %{
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      run_mode: run_mode,
+      max_turns: max_turns
+    }
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(session, workspace, issue, turn_context, 1)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(app_session, workspace, issue, turn_context, turn_number) do
+    %{
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      run_mode: run_mode,
+      max_turns: max_turns
+    } = turn_context
+
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     case AppServer.run_turn(
@@ -188,7 +210,7 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, turn_session} ->
         Logger.info("Completed agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-        case continue_with_issue?(issue, issue_state_fetcher) do
+        case continue_with_issue?(issue, issue_state_fetcher, run_mode) do
           {:continue, refreshed_issue} when turn_number < max_turns ->
             send_run_result(codex_update_recipient, issue, %{
               status: :continuation_required,
@@ -202,11 +224,8 @@ defmodule SymphonyElixir.AgentRunner do
               app_session,
               workspace,
               refreshed_issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              turn_number + 1,
-              max_turns
+              turn_context,
+              turn_number + 1
             )
 
           {:continue, refreshed_issue} ->
@@ -220,10 +239,10 @@ defmodule SymphonyElixir.AgentRunner do
 
             :ok
 
-          {:done, _refreshed_issue} ->
+          {:done, _refreshed_issue, reason} ->
             send_run_result(codex_update_recipient, issue, %{
               status: :completed,
-              reason: :issue_inactive,
+              reason: reason,
               turn_count: turn_number
             })
 
@@ -281,24 +300,41 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, run_mode) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
-        end
+        continue_with_refreshed_issue(refreshed_issue, run_mode)
 
       {:ok, []} ->
-        {:done, issue}
+        {:done, issue, :issue_inactive}
 
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _run_mode), do: {:done, issue, :issue_inactive}
+
+  defp continue_with_refreshed_issue(%Issue{} = refreshed_issue, :checking_recheck) do
+    {:done, refreshed_issue, checking_recheck_completion_reason(refreshed_issue)}
+  end
+
+  defp continue_with_refreshed_issue(%Issue{} = refreshed_issue, _run_mode) do
+    cond do
+      checking_issue_state?(refreshed_issue.state) ->
+        {:done, refreshed_issue, :issue_entered_checking}
+
+      retry_candidate_issue?(refreshed_issue) ->
+        {:continue, refreshed_issue}
+
+      true ->
+        {:done, refreshed_issue, :issue_inactive}
+    end
+  end
+
+  defp checking_recheck_completion_reason(%Issue{} = refreshed_issue) do
+    if checking_issue_state?(refreshed_issue.state), do: :issue_entered_checking, else: :issue_inactive
+  end
 
   defp retry_candidate_issue?(%Issue{} = issue) do
     issue_routable_to_worker?(issue) and
@@ -341,6 +377,12 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp active_issue_state?(_state_name), do: false
+
+  defp checking_issue_state?(state_name) when is_binary(state_name) do
+    normalize_issue_state(state_name) == "checking"
+  end
+
+  defp checking_issue_state?(_state_name), do: false
 
   defp selected_worker_host(nil, []), do: nil
 

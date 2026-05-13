@@ -106,9 +106,10 @@ defmodule SymphonyElixir.TestSupport do
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_assignee: nil,
-          tracker_active_states: ["Todo", "In Progress"],
+          tracker_active_states: ["Todo", "In Progress", "Checking"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
+          checking_interval_ms: 600_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           control_plane: nil,
           worker_ssh_hosts: [],
@@ -148,6 +149,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
+    checking_interval_ms = Keyword.get(config, :checking_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     control_plane = Keyword.get(config, :control_plane)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
@@ -189,6 +191,7 @@ defmodule SymphonyElixir.TestSupport do
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
+        "  checking_interval_ms: #{yaml_value(checking_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         control_plane_yaml(control_plane),

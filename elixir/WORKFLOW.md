@@ -5,6 +5,7 @@ tracker:
   active_states:
     - Todo
     - In Progress
+    - Checking
     - Merging
     - Rework
    #  - Human Review
@@ -265,6 +266,14 @@ If command output is in English, keep the original output first, then add a brie
   - Special case: if a PR is already attached, treat as feedback/rework loop and run a PR feedback sweep before new feature work.
 - `In Progress` -> implementation actively underway.
   - PR created / updated is only the entry signal into `Checking`, not the completion signal.
+- `Checking` -> stop the current implementation run after the bounded PR closeout pass.
+  - Entry condition: PR already exists and auto-merge has been confirmed enabled successfully.
+  - For a ticket already in `Checking`, run one short recheck thread only.
+  - Read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
+  - If merge is complete, move to `Done`.
+  - If checks reached a non-success terminal state, move to `In Progress`.
+  - If automation cannot safely continue, move to `Human Review`.
+  - If none of those exit conditions are hit, keep `Checking` and end the run.
   - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue.
 - `Human Review` -> validated work is waiting on human approval unless a new clear human delta or a new unresolved review delta exists, in which case immediately move to `Rework` and run the incremental rework flow.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
@@ -282,6 +291,7 @@ Step 0 may only run after the preflight body gate has classified the run as `exe
    - `Todo` -> immediately move to `In Progress`, then ensure the issue body has the minimal required execution sections and `## Codex Workpad`, then start execution flow.
      - If a PR is already attached, start by reviewing all open PR comments and deciding required changes versus explicit pushback responses.
    - `In Progress` -> continue execution flow from the current issue-body snapshot.
+   - `Checking` -> run one bounded recheck pass using only PR merge state, latest head SHA required checks, and newest human review delta; then route to `Done`, `In Progress`, `Human Review`, or stay in `Checking`.
    - `Human Review` -> if a new execute-mode human delta or an active unresolved review delta exists, immediately move to `Rework` and run the incremental rework flow; otherwise stop immediately and resume only on a later explicit trigger.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run the incremental rework flow, reusing the existing branch, PR, and body workpad when safe.
@@ -362,7 +372,13 @@ Use this only when completion is blocked by missing required tools or missing au
 - Checks from an older head SHA do not satisfy the closeout requirement for the latest commit.
 - If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA.
 - Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed.
+- `Checking` entry requires both an attached PR and confirmed successful auto-merge enablement.
 - When an attached PR already exists, do not move to `Human Review` merely because the PR exists.
+- During `Checking`, read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
+- If merge is complete, move to `Done`.
+- If required checks on the latest head SHA reach a non-success terminal state, move to `In Progress`.
+- If checks are green but merge still cannot complete because of permission, conflict, protection-rule, merge-queue, or similar automation blockers, move to `Human Review`.
+- If a human explicitly asks for more implementation work while in `Checking`, move to `In Progress`.
 - If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure.
 - First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable.
 - Escalation comments must minimally include the failure reason, current PR identifier, current head SHA, affected checks or gate, and the recommended human action, with deduplication for repeated identical causes.
@@ -398,7 +414,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
-11. Before moving to `Human Review`, perform one bounded PR feedback and `Checking` closeout pass:
+11. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
@@ -408,8 +424,9 @@ Use this only when completion is blocked by missing required tools or missing au
    - If checks fail, keep working in the same branch and PR by default; do not open a new ticket, do not open a new PR, and do not move to `Human Review` after a single failed run.
    - If a new commit lands during `Checking`, restart the closeout decision using only the new head SHA.
    - If new unresolved feedback or failing checks are discovered, handle only the bounded delta for this run or stop with an explicit blocker or handoff; do not remain in an open-ended same-run polling loop.
+   - If the bounded pass succeeds and auto-merge is confirmed enabled successfully, move to `Checking` and stop this implementation run.
    - Refresh `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, `## Blockers`, and `## Codex Workpad` so they reflect the completed work accurately.
-12. Only then move issue to `Human Review`.
+12. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
    - Exception: if blocked by missing required non-GitHub tools or auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
    - Ensure all existing PR feedback was reviewed and resolved, including inline review comments.
