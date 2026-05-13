@@ -78,9 +78,6 @@ defmodule SymphonyElixir.StateReducer do
       _ ->
         unknown_summary(summary)
     end
-  rescue
-    _error ->
-      unknown_summary(summary)
   end
 
   @spec health_for_summary(summary(), keyword()) :: String.t()
@@ -302,9 +299,6 @@ defmodule SymphonyElixir.StateReducer do
       _ ->
         fallback_action_for_event(source, event_type)
     end
-  rescue
-    _error ->
-      fallback_action_for_event(source, event_type)
   end
 
   defp fallback_action_for_event("agent_runner", "workspace_prepared"), do: "agent_runner:workspace_prepared"
@@ -312,7 +306,6 @@ defmodule SymphonyElixir.StateReducer do
 
   defp build_message_payload("codex", _event_type, payload) when is_map(payload), do: payload
   defp build_message_payload("agent_runner", "run_result", payload) when is_map(payload), do: payload
-  defp build_message_payload("orchestrator", "retry_scheduled", payload) when is_map(payload), do: payload
   defp build_message_payload(_source, _event_type, _payload), do: nil
 
   defp turn_count_for_event(count, "session_started", session_id) when is_integer(count) and is_binary(session_id), do: count + 1
@@ -371,11 +364,13 @@ defmodule SymphonyElixir.StateReducer do
   defp payload_root(payload) when is_map(payload), do: payload
   defp payload_root(_payload), do: %{}
 
-  defp nested_string(data, path) do
+  defp nested_string(data, path) when is_map(data) and is_list(path) do
     data
     |> nested_value(path)
     |> string_present()
   end
+
+  defp nested_string(_data, _path), do: nil
 
   defp nested_value(data, path) when is_map(data) and is_list(path) do
     Enum.reduce_while(path, data, fn key, acc ->
@@ -386,20 +381,22 @@ defmodule SymphonyElixir.StateReducer do
     end)
   end
 
-  defp nested_value(_data, _path), do: nil
-
   defp fetch_key(data, key) when is_map(data) do
+    binary_variant = if is_binary(key), do: find_atom_key(data, key), else: nil
+
     cond do
       Map.has_key?(data, key) -> {:ok, Map.get(data, key)}
-      is_binary(key) and Map.has_key?(data, String.to_atom(key)) -> {:ok, Map.get(data, String.to_atom(key))}
+      is_atom(binary_variant) -> {:ok, Map.get(data, binary_variant)}
       is_atom(key) and Map.has_key?(data, Atom.to_string(key)) -> {:ok, Map.get(data, Atom.to_string(key))}
       true -> :error
     end
-  rescue
-    ArgumentError -> :error
   end
 
   defp fetch_key(_data, _key), do: :error
+
+  defp find_atom_key(data, key) when is_map(data) and is_binary(key) do
+    Enum.find(Map.keys(data), &(is_atom(&1) and Atom.to_string(&1) == key))
+  end
 
   defp string_present(value) when is_binary(value) do
     case String.trim(value) do
@@ -408,6 +405,7 @@ defmodule SymphonyElixir.StateReducer do
     end
   end
 
+  defp string_present(nil), do: nil
   defp string_present(value) when is_atom(value), do: value |> Atom.to_string() |> string_present()
   defp string_present(_value), do: nil
 

@@ -121,8 +121,6 @@ defmodule SymphonyElixir.RunStateStore do
       true ->
         SymphonyElixir.StatusDashboard.humanize_codex_message(Map.get(entry, :last_codex_message))
     end
-  rescue
-    _error -> current_action
   end
 
   defp base_summary_attrs(trace, running_entry) do
@@ -133,9 +131,6 @@ defmodule SymphonyElixir.RunStateStore do
 
         is_struct(trace, RunTrace) ->
           "In Progress"
-
-        true ->
-          nil
       end
 
     %{
@@ -189,7 +184,6 @@ defmodule SymphonyElixir.RunStateStore do
   end
 
   defp entry_issue(entry) when is_map(entry), do: Map.get(entry, :issue, %{})
-  defp entry_issue(_entry), do: %{}
 
   defp maybe_put(summary, _key, nil), do: summary
   defp maybe_put(summary, key, value), do: Map.put(summary, key, value)

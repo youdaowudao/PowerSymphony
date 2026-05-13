@@ -1355,7 +1355,7 @@ defmodule SymphonyElixir.RunTraceTest do
         "payload" => %{"method" => "item/completed", "params" => %{"type" => "reasoning"}}
       })
 
-    assert params_type_completed.current_phase == "codex_waiting_next_event"
+    assert params_type_completed.current_phase == "codex_reasoning"
 
     ordinary_retry =
       StateReducer.reduce_event(base, %{
@@ -1497,6 +1497,29 @@ defmodule SymphonyElixir.RunTraceTest do
       )
 
     assert overridden_unknown_event_type.last_event_type == "notification"
+
+    rescued_from_events =
+      RunStateStore.summary_from_events([123],
+        base_summary: %{linear_state: "In Progress", current_action: "custom"}
+      )
+
+    assert rescued_from_events.current_phase == "unknown"
+    assert rescued_from_events.current_action == "unknown event"
+    assert rescued_from_events.linear_state == "In Progress"
+    assert rescued_from_events.health == "unknown"
+
+    entry_action =
+      RunStateStore.summary_from_events([],
+        base_summary: %{current_phase: "codex_reasoning", current_action: "still reasoning"},
+        running_entry: %{
+          last_codex_message: %{
+            method: "item/tool/requestUserInput",
+            params: %{question: <<255>>}
+          }
+        }
+      )
+
+    assert entry_action.current_action == "still reasoning"
   end
 
   test "state reducer covers turn count fallback and blank string inputs" do
@@ -1528,6 +1551,81 @@ defmodule SymphonyElixir.RunTraceTest do
     assert blank_event_type.current_action == "unknown event"
 
     assert StateReducer.health_for_summary(StateReducer.initial_summary(%{current_phase: "unknown"})) == "unknown"
+
+    rescued_phase =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now()),
+        "payload" => %{"method" => <<255>>}
+      })
+
+    assert rescued_phase.current_phase == "unknown"
+    assert rescued_phase.current_action == "unknown event"
+
+    user_input_action =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now()),
+        "payload" => %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"question" => <<255>>}
+        }
+      })
+
+    assert user_input_action.current_phase == "codex_waiting_user_input_policy"
+
+    assert user_input_action.current_action ==
+             <<
+               116,
+               111,
+               111,
+               108,
+               32,
+               114,
+               101,
+               113,
+               117,
+               105,
+               114,
+               101,
+               115,
+               32,
+               117,
+               115,
+               101,
+               114,
+               32,
+               105,
+               110,
+               112,
+               117,
+               116,
+               58,
+               32,
+               255
+             >>
+
+    nested_non_map_item =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now()),
+        "payload" => %{"method" => "item/completed", "params" => "not-a-map"}
+      })
+
+    assert nested_non_map_item.current_phase == "codex_waiting_next_event"
+
+    params_type_item =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "notification",
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now()),
+        "payload" => %{"method" => "item/completed", "params" => %{type: "command_execution"}}
+      })
+
+    assert params_type_item.current_phase == "codex_running_shell"
   end
 
   defp health_for_elapsed_ms(trace, elapsed_ms, now) do
