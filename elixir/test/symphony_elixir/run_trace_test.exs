@@ -1255,6 +1255,27 @@ defmodule SymphonyElixir.RunTraceTest do
       assert missing_trace_summary.current_action == "unknown event"
       assert missing_trace_summary.linear_state == "In Progress"
       assert missing_trace_summary.health == "unknown"
+
+      unreadable_trace_summary = RunStateStore.summary_for_trace(%{trace | trace_file: trace.payload_dir})
+
+      assert unreadable_trace_summary.current_phase == "unknown"
+      assert unreadable_trace_summary.current_action == "unknown event"
+      assert unreadable_trace_summary.linear_state == "In Progress"
+      assert unreadable_trace_summary.health == "unknown"
+
+      inline_payload_summary =
+        RunStateStore.summary_from_events(
+          [
+            %{
+              "source" => "codex",
+              "event_type" => "notification",
+              "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}
+            }
+          ],
+          base_summary: %{linear_state: "In Progress"}
+        )
+
+      assert inline_payload_summary.current_phase == "codex_running_shell"
     after
       File.rm_rf(test_root)
     end
@@ -1284,6 +1305,9 @@ defmodule SymphonyElixir.RunTraceTest do
 
       summary = RunStateStore.summary_for_trace(trace)
       assert summary.current_phase == "unknown"
+      assert summary.current_action == "unknown event"
+      assert summary.linear_state == "In Progress"
+      assert summary.health == "unknown"
     after
       File.rm_rf(test_root)
     end
@@ -1426,12 +1450,84 @@ defmodule SymphonyElixir.RunTraceTest do
 
     assert binary_timestamp_summary.last_event_at == now
 
+    parsed_datetime_from_event =
+      RunStateStore.summary_from_events([
+        %{
+          "source" => "codex",
+          "event_type" => [],
+          "timestamp" => now
+        }
+      ])
+
+    assert parsed_datetime_from_event.last_event_at == now
+
+    parsed_iso8601_from_event =
+      RunStateStore.summary_from_events([
+        %{
+          "source" => "codex",
+          "event_type" => [],
+          "timestamp" => DateTime.to_iso8601(now)
+        }
+      ])
+
+    assert parsed_iso8601_from_event.last_event_at == now
+
+    unsupported_timestamp_summary =
+      RunStateStore.summary_from_events([
+        %{
+          "source" => "codex",
+          "event_type" => [],
+          "timestamp" => System.system_time(:second)
+        }
+      ])
+
+    assert unsupported_timestamp_summary.last_event_at == nil
+
     unknown_fallback_summary =
       RunStateStore.summary_from_events([],
         base_summary: %{current_phase: "unknown", last_event_type: "unknown"}
       )
 
     assert unknown_fallback_summary.last_event_type == "unknown"
+
+    overridden_unknown_event_type =
+      RunStateStore.summary_from_events([],
+        base_summary: %{current_phase: "unknown", last_event_type: "unknown"},
+        running_entry: %{last_codex_event: :notification}
+      )
+
+    assert overridden_unknown_event_type.last_event_type == "notification"
+  end
+
+  test "state reducer covers turn count fallback and blank string inputs" do
+    turn_count_reset =
+      StateReducer.reduce_event(%{turn_count: "bad"}, %{
+        "source" => "codex",
+        "event_type" => "session_started",
+        "session_id" => "thread-reset-turn-reset"
+      })
+
+    assert turn_count_reset.turn_count == 0
+
+    blank_source =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "  ",
+        "event_type" => "notification"
+      })
+
+    assert blank_source.current_phase == "unknown"
+    assert blank_source.current_action == "unknown event"
+
+    blank_event_type =
+      StateReducer.reduce_event(StateReducer.initial_summary(), %{
+        "source" => "codex",
+        "event_type" => "  "
+      })
+
+    assert blank_event_type.current_phase == "unknown"
+    assert blank_event_type.current_action == "unknown event"
+
+    assert StateReducer.health_for_summary(StateReducer.initial_summary(%{current_phase: "unknown"})) == "unknown"
   end
 
   defp health_for_elapsed_ms(trace, elapsed_ms, now) do
