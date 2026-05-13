@@ -1090,7 +1090,26 @@ defmodule SymphonyElixir.CoreTest do
              :sys.get_state(pid).retry_attempts[issue_id]
 
     send(pid, {:retry_issue, issue_id, retry_token})
-    Process.sleep(50)
+
+    assert_eventually(
+      fn ->
+        case :sys.get_state(pid).running[issue_id] do
+          %{
+            retry_attempt: 1,
+            worker_host: nil,
+            workspace_path: workspace_path,
+            issue: %Issue{id: ^issue_id}
+          }
+          when is_binary(workspace_path) ->
+            workspace_path =~ "/MT-570"
+
+          _ ->
+            false
+        end
+      end,
+      20
+    )
+
     state = :sys.get_state(pid)
 
     assert %{retry_attempt: 1, worker_host: nil, workspace_path: workspace_path, issue: %Issue{id: ^issue_id}} =
@@ -1132,14 +1151,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_at_ms = System.monotonic_time(:millisecond)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 38_750, 40_500)
+    assert_due_from_trigger_window(due_at_ms, down_triggered_at_ms, observed_at_ms, 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -3581,4 +3602,17 @@ defmodule SymphonyElixir.CoreTest do
       File.rm_rf(test_root)
     end
   end
+
+  defp assert_eventually(fun, attempts, sleep_ms \\ 25)
+
+  defp assert_eventually(fun, attempts, sleep_ms) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(sleep_ms)
+      assert_eventually(fun, attempts - 1, sleep_ms)
+    end
+  end
+
+  defp assert_eventually(_fun, 0, _sleep_ms), do: flunk("condition not met in time")
 end

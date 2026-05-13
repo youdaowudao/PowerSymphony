@@ -1,6 +1,24 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.{LogFile, RawEventStore, RunTrace}
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp assert_eventually(fun, attempts \\ 40)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(25)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition was not met in time")
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -19,6 +37,267 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Orchestrator.snapshot(server_name, 10) == :timeout
 
     send(pid, :stop)
+  end
+
+  test "orchestrator schedule_issue_retry_for_test records retry scheduling into run trace" do
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-trace-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    File.mkdir_p!(logs_root)
+
+    issue = %Issue{id: "issue-orch-trace", identifier: "MT-TRACE-ORCH", title: "Trace retry", state: "In Progress"}
+    trace = RunTrace.start!(issue, logs_root: logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :TraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    state = :sys.get_state(pid)
+
+    new_state =
+      Orchestrator.schedule_issue_retry_for_test(state, "issue-orch-trace", 1, %{
+        identifier: "MT-TRACE-ORCH",
+        error: "boom",
+        run_trace: trace
+      })
+
+    :sys.replace_state(pid, fn _ -> new_state end)
+
+    events = RawEventStore.list_events(trace)
+    assert Enum.any?(events, &(&1["source"] == "orchestrator"))
+    assert Enum.any?(events, &(&1["event_type"] == "retry_scheduled"))
+  end
+
+  test "orchestrator traces accepted dispatch and normal worker exit retry flow" do
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-dispatch-trace-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    File.mkdir_p!(logs_root)
+
+    issue_id = "issue-orch-dispatch-trace"
+    ref = make_ref()
+    issue = %Issue{id: issue_id, identifier: "MT-TRACE-ORCH-2", title: "Dispatch trace", state: "In Progress"}
+    trace = RunTrace.start!(issue, logs_root: logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :DispatchTraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: "worker-a",
+      workspace_path: "/tmp/orch-trace",
+      run_trace: trace,
+      retry_attempt: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_result, issue_id, %{status: :failed, reason: :turn_timeout, turn_count: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    events = RawEventStore.list_events(trace)
+    assert Enum.any?(events, &(&1["event_type"] == "worker_exit_normal"))
+    assert Enum.any?(events, &(&1["event_type"] == "retry_scheduled"))
+  end
+
+  test "orchestrator real retry dispatch path records dispatch_started and dispatch_accepted into one trace" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-real-dispatch-trace-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(logs_root, "workspaces")
+
+    issue = %Issue{
+      id: "issue-orch-real-dispatch",
+      identifier: "MT-TRACE-ORCH-REAL",
+      title: "Real dispatch trace",
+      description: "Drive retry dispatch through the real path",
+      state: "In Progress",
+      labels: []
+    }
+
+    try do
+      File.mkdir_p!(logs_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        max_concurrent_agents: 1
+      )
+
+      Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      orchestrator_name = Module.concat(__MODULE__, :RealDispatchTraceOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        File.rm_rf(logs_root)
+      end)
+
+      initial_state = :sys.get_state(pid)
+      retry_token = make_ref()
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:max_concurrent_agents, 1)
+        |> Map.put(:claimed, MapSet.new([issue.id]))
+        |> Map.put(:retry_attempts, %{
+          issue.id => %{
+            attempt: 1,
+            timer_ref: nil,
+            retry_token: retry_token,
+            due_at_ms: System.monotonic_time(:millisecond) + 30_000,
+            identifier: issue.identifier,
+            error: "retrying",
+            run_trace: trace
+          }
+        })
+      end)
+
+      send(pid, {:retry_issue, issue.id, retry_token})
+
+      assert_eventually(fn ->
+        events = RawEventStore.list_events(trace)
+
+        Enum.any?(events, &(&1["event_type"] == "dispatch_started")) and
+          Enum.any?(events, &(&1["event_type"] == "dispatch_accepted"))
+      end)
+
+      state = :sys.get_state(pid)
+
+      if running_entry = state.running[issue.id] do
+        if Process.alive?(running_entry.pid) do
+          Process.exit(running_entry.pid, :shutdown)
+        end
+      end
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
+  test "orchestrator traces premature turn end convergence to blocked claim" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-blocked-trace-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    File.mkdir_p!(logs_root)
+
+    issue_id = "issue-orch-blocked-trace"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TRACE-ORCH-3",
+      title: "Blocked trace",
+      description: "Premature hold convergence",
+      state: "In Progress",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    trace = RunTrace.start!(issue, logs_root: logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :BlockedTraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if is_nil(previous_memory_issues) do
+        Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      else
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, previous_memory_issues)
+      end
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    first_retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 3,
+          timer_ref: nil,
+          retry_token: first_retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000,
+          identifier: issue.identifier,
+          error: "premature turn end",
+          delay_type: :premature_turn_end_hold,
+          run_trace: trace
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue_id, first_retry_token})
+    Process.sleep(50)
+
+    events = RawEventStore.list_events(trace)
+    assert Enum.any?(events, &(&1["event_type"] == "retry_converged_to_blocked_claim"))
   end
 
   test "orchestrator snapshot reflects last codex update and session id" do

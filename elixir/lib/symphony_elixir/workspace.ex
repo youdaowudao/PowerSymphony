@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, RunTrace, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -296,6 +296,12 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    RunTrace.record(:workspace_hook, %{
+      event: :hook_started,
+      summary: "workspace_hook:#{hook_name}:started",
+      payload: %{hook_name: hook_name, workspace: workspace}
+    })
+
     task =
       Task.async(fn ->
         System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
@@ -310,6 +316,12 @@ defmodule SymphonyElixir.Workspace do
 
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
+        RunTrace.record(:workspace_hook, %{
+          event: :hook_timed_out,
+          summary: "workspace_hook:#{hook_name}:timed_out",
+          payload: %{hook_name: hook_name, timeout_ms: timeout_ms, workspace: workspace}
+        })
+
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
     end
   end
@@ -319,11 +331,23 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
+    RunTrace.record(:workspace_hook, %{
+      event: :hook_started,
+      summary: "workspace_hook:#{hook_name}:started",
+      payload: %{hook_name: hook_name, workspace: workspace, worker_host: worker_host}
+    })
+
     case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      {:error, {:workspace_hook_timeout, ^hook_name, _timeout_ms} = reason} ->
+      {:error, {:workspace_hook_timeout, _name, timeout_ms} = reason} ->
+        RunTrace.record(:workspace_hook, %{
+          event: :hook_timed_out,
+          summary: "workspace_hook:#{hook_name}:timed_out",
+          payload: %{hook_name: hook_name, timeout_ms: timeout_ms, workspace: workspace, worker_host: worker_host}
+        })
+
         {:error, reason}
 
       {:error, reason} ->
@@ -331,7 +355,13 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
+  defp handle_hook_command_result({_output, 0}, workspace, _issue_id, hook_name) do
+    RunTrace.record(:workspace_hook, %{
+      event: :hook_succeeded,
+      summary: "workspace_hook:#{hook_name}:succeeded",
+      payload: %{hook_name: hook_name, workspace: workspace}
+    })
+
     :ok
   end
 
@@ -339,6 +369,12 @@ defmodule SymphonyElixir.Workspace do
     sanitized_output = sanitize_hook_output_for_log(output)
 
     Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
+
+    RunTrace.record(:workspace_hook, %{
+      event: :hook_failed,
+      summary: "workspace_hook:#{hook_name}:failed",
+      payload: %{hook_name: hook_name, workspace: workspace, status: status, output: output}
+    })
 
     {:error, {:workspace_hook_failed, hook_name, status, output}}
   end

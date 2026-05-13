@@ -699,7 +699,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 50}
+      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 10}
     )
 
     start_supervised!(
@@ -712,7 +712,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     register_project_cleanup(manager_name, ["alpha"], [port])
 
-    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 100})
+    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 250})
 
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -721,13 +721,35 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
-    assert_runtime_eventually_reaches_status_with_details(
-      manager_name,
-      "alpha",
-      :unreachable,
-      require_last_error?: true,
-      extra_check: fn -> project_api_state_visible_with_burst?("alpha", :unreachable) end,
-      attempts: 80
+    saw_unreachable_status_key = {:saw_project_runtime_state, manager_name, "alpha", :unreachable}
+    saw_unreachable_details_key = {:saw_project_runtime_details, manager_name, "alpha", :unreachable}
+    saw_unreachable_api_key = {:saw_project_api_state, manager_name, "alpha", :unreachable}
+
+    Process.put(saw_unreachable_status_key, false)
+    Process.put(saw_unreachable_details_key, false)
+    Process.put(saw_unreachable_api_key, false)
+
+    assert_eventually(
+      fn ->
+        runtime_state = fetch_project_entry!(manager_name, "alpha").runtime_state
+
+        if runtime_state.status == :unreachable do
+          Process.put(saw_unreachable_status_key, true)
+        end
+
+        if not is_nil(runtime_state.last_health_check_at) and is_binary(runtime_state.last_error) do
+          Process.put(saw_unreachable_details_key, true)
+        end
+
+        if project_api_state_visible_with_burst?("alpha", :unreachable) do
+          Process.put(saw_unreachable_api_key, true)
+        end
+
+        Process.get(saw_unreachable_status_key) and
+          Process.get(saw_unreachable_details_key) and
+          Process.get(saw_unreachable_api_key)
+      end,
+      80
     )
 
     assert_eventually(
@@ -1346,7 +1368,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 50}
+      control_plane: %{health_poll_interval_ms: 10, health_check_timeout_ms: 10}
     )
 
     start_supervised!(
@@ -1366,7 +1388,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       unreachable_port
     ])
 
-    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 100})
+    start_supervised!({SymphonyElixir.WorkerHealthPoller, manager: manager_name, poll_interval_ms: 250})
 
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "running-project")
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "unreachable-project")
@@ -2564,6 +2586,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     extra_check = Keyword.get(opts, :extra_check, fn -> true end)
     attempts = Keyword.get(opts, :attempts, 20)
     extra_attempts = Keyword.get(opts, :extra_attempts, attempts)
+    sleep_ms = Keyword.get(opts, :sleep_ms, 25)
 
     Process.put(saw_status_key, false)
     Process.put(saw_details_key, false)
@@ -2587,24 +2610,25 @@ defmodule SymphonyElixir.ExtensionsTest do
         Process.get(saw_status_key) and
           Process.get(saw_details_key)
       end,
-      attempts
+      attempts,
+      sleep_ms
     )
 
-    assert_eventually(extra_check, extra_attempts)
+    assert_eventually(extra_check, extra_attempts, sleep_ms)
   end
 
-  defp assert_eventually(fun, attempts \\ 20)
+  defp assert_eventually(fun, attempts \\ 20, sleep_ms \\ 25)
 
-  defp assert_eventually(fun, attempts) when attempts > 0 do
+  defp assert_eventually(fun, attempts, sleep_ms) when attempts > 0 do
     if fun.() do
       true
     else
-      Process.sleep(25)
-      assert_eventually(fun, attempts - 1)
+      Process.sleep(sleep_ms)
+      assert_eventually(fun, attempts - 1, sleep_ms)
     end
   end
 
-  defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+  defp assert_eventually(_fun, 0, _sleep_ms), do: flunk("condition not met in time")
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do

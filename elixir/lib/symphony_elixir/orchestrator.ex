@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RunTrace, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -27,6 +27,22 @@ defmodule SymphonyElixir.Orchestrator do
     @moduledoc """
     Runtime state for the orchestrator polling loop.
     """
+
+    @type t :: %__MODULE__{
+            poll_interval_ms: non_neg_integer() | nil,
+            max_concurrent_agents: non_neg_integer() | nil,
+            next_poll_due_at_ms: integer() | nil,
+            poll_check_in_progress: boolean() | nil,
+            tick_timer_ref: reference() | nil,
+            tick_token: reference() | nil,
+            running: map(),
+            completed: MapSet.t(String.t()),
+            claimed: MapSet.t(String.t()),
+            blocked_claims: map(),
+            retry_attempts: map(),
+            codex_totals: map() | nil,
+            codex_rate_limits: map() | nil
+          }
 
     defstruct [
       :poll_interval_ms,
@@ -138,6 +154,14 @@ defmodule SymphonyElixir.Orchestrator do
               handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
             _ ->
+              run_trace = Map.get(running_entry, :run_trace)
+
+              RunTrace.record(run_trace, :orchestrator, %{
+                event: :worker_exit_abnormal,
+                summary: "orchestrator:worker_exit_abnormal",
+                payload: %{issue_id: issue_id, session_id: session_id, reason: inspect(reason)}
+              })
+
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
@@ -146,7 +170,8 @@ defmodule SymphonyElixir.Orchestrator do
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
+                workspace_path: Map.get(running_entry, :workspace_path),
+                run_trace: run_trace
               })
           end
 
@@ -398,6 +423,13 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec schedule_issue_retry_for_test(State.t(), String.t(), integer(), map()) :: State.t()
+  def schedule_issue_retry_for_test(%State{} = state, issue_id, attempt, metadata)
+      when is_binary(issue_id) and is_integer(attempt) and is_map(metadata) do
+    schedule_issue_retry(state, issue_id, attempt, metadata)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -871,7 +903,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, retry_metadata \\ %{}) do
     transition_context = %{
       issue_fetcher: &Tracker.fetch_issue_states_by_ids/1,
       issue_state_updater: &Tracker.update_issue_state/2,
@@ -886,7 +918,7 @@ defmodule SymphonyElixir.Orchestrator do
            transition_context.terminal_states
          ) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, transition_context)
+        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, transition_context, retry_metadata)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -984,7 +1016,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_put_current_work_value(entry, _key, nil), do: entry
   defp maybe_put_current_work_value(entry, key, value), do: Map.put(entry, key, value)
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, transition_context) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, transition_context, retry_metadata) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -993,11 +1025,15 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        retry_workspace_path =
-          case Map.get(state.retry_attempts, issue.id) do
-            %{workspace_path: workspace_path} -> workspace_path
-            _ -> nil
-          end
+        retry_workspace_path = retry_workspace_path(state, issue.id)
+        retry_trace = retry_trace(state, issue.id, retry_metadata)
+        run_trace = resolve_dispatch_run_trace(retry_trace, issue, worker_host, retry_workspace_path)
+
+        RunTrace.record(run_trace, :orchestrator, %{
+          event: :dispatch_started,
+          summary: "orchestrator:dispatch_started",
+          payload: %{attempt: attempt, worker_host: worker_host, workspace_path: retry_workspace_path}
+        })
 
         spawn_issue_on_worker_host(
           state,
@@ -1006,8 +1042,34 @@ defmodule SymphonyElixir.Orchestrator do
           recipient,
           worker_host,
           retry_workspace_path,
-          transition_context
+          Map.put(transition_context, :run_trace, run_trace),
+          run_trace
         )
+    end
+  end
+
+  defp retry_workspace_path(%State{} = state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{workspace_path: workspace_path} -> workspace_path
+      _ -> nil
+    end
+  end
+
+  defp retry_trace(%State{} = state, issue_id, retry_metadata) do
+    Map.get(retry_metadata, :run_trace) ||
+      state.retry_attempts |> Map.get(issue_id, %{}) |> Map.get(:run_trace)
+  end
+
+  defp resolve_dispatch_run_trace(%RunTrace{} = trace, _issue, _worker_host, _retry_workspace_path), do: trace
+
+  defp resolve_dispatch_run_trace(_retry_trace, issue, worker_host, retry_workspace_path) do
+    case RunTrace.start(issue, worker_host: worker_host, workspace_path: retry_workspace_path) do
+      {:ok, trace} ->
+        trace
+
+      {:error, reason} ->
+        Logger.warning("Run trace initialization failed for #{issue_context(issue)}: #{inspect(reason)}")
+        nil
     end
   end
 
@@ -1018,10 +1080,15 @@ defmodule SymphonyElixir.Orchestrator do
          recipient,
          worker_host,
          retry_workspace_path,
-         transition_context
+         transition_context,
+         run_trace
        ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             run_trace: run_trace
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -1037,7 +1104,8 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             worker_host: worker_host,
             retry_workspace_path: retry_workspace_path,
-            transition_context: transition_context
+            transition_context: transition_context,
+            run_trace: run_trace
           }
         )
 
@@ -1048,7 +1116,8 @@ defmodule SymphonyElixir.Orchestrator do
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          run_trace: run_trace
         })
     end
   end
@@ -1061,9 +1130,16 @@ defmodule SymphonyElixir.Orchestrator do
            pid: pid,
            ref: ref,
            worker_host: worker_host,
-           retry_workspace_path: retry_workspace_path
+           retry_workspace_path: retry_workspace_path,
+           run_trace: run_trace
          }
        ) do
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :dispatch_accepted,
+      summary: "orchestrator:dispatch_accepted",
+      payload: %{attempt: attempt, worker_host: worker_host, workspace_path: retry_workspace_path}
+    })
+
     Logger.info("Dispatching issue to agent: #{issue_context(running_issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
     running =
@@ -1087,6 +1163,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_total_tokens: 0,
         turn_count: 0,
         run_result: nil,
+        run_trace: run_trace,
         retry_attempt: normalize_retry_attempt(attempt),
         started_at: DateTime.utc_now()
       })
@@ -1110,12 +1187,24 @@ defmodule SymphonyElixir.Orchestrator do
            ref: ref,
            worker_host: worker_host,
            retry_workspace_path: retry_workspace_path,
-           transition_context: transition_context
+           transition_context: transition_context,
+           run_trace: run_trace
          }
        ) do
     Process.demonitor(ref, [:flush])
     terminate_task(pid)
     rollback_result = rollback_spawned_todo_transition(issue, transition_context)
+
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :dispatch_transition_failed,
+      summary: "orchestrator:dispatch_transition_failed",
+      payload: %{
+        attempt: attempt,
+        worker_host: worker_host,
+        reason: inspect(reason),
+        rollback: inspect(rollback_result)
+      }
+    })
 
     Logger.warning("Rolling back spawned dispatch for #{issue_context(issue)}: #{inspect(reason)} rollback=#{inspect(rollback_result)}")
 
@@ -1125,7 +1214,8 @@ defmodule SymphonyElixir.Orchestrator do
       identifier: issue.identifier,
       error: "failed to transition spawned issue: #{inspect(reason)}; rollback=#{inspect(rollback_result)}",
       worker_host: worker_host,
-      workspace_path: retry_workspace_path
+      workspace_path: retry_workspace_path,
+      run_trace: run_trace
     })
   end
 
@@ -1135,7 +1225,8 @@ defmodule SymphonyElixir.Orchestrator do
            issue_fetcher: issue_fetcher,
            issue_state_updater: issue_state_updater,
            candidate_fetcher: candidate_fetcher,
-           terminal_states: terminal_states
+           terminal_states: terminal_states,
+           run_trace: run_trace
          }
        )
        when is_binary(state_name) and is_function(issue_fetcher, 1) and
@@ -1146,12 +1237,29 @@ defmodule SymphonyElixir.Orchestrator do
            true <- normalize_issue_state(refreshed_issue.state) == "in progress",
            {:ok, candidate_issues} <- candidate_fetcher.(),
            true <- retry_candidate_issue?(refreshed_issue, terminal_states, candidate_issues) do
+        RunTrace.record(run_trace, :orchestrator, %{
+          event: :spawned_todo_transition_succeeded,
+          summary: "orchestrator:spawned_todo_transition_succeeded",
+          payload: %{issue_id: issue.id}
+        })
+
         {:ok, refreshed_issue}
       else
-        false -> {:error, :issue_not_in_progress_after_update}
-        {:ok, []} -> {:error, :issue_missing_after_update}
-        {:error, reason} -> {:error, reason}
-        other -> {:error, other}
+        false ->
+          record_spawned_todo_transition_failure(run_trace, issue.id, :issue_not_in_progress_after_update)
+          {:error, :issue_not_in_progress_after_update}
+
+        {:ok, []} ->
+          record_spawned_todo_transition_failure(run_trace, issue.id, :issue_missing_after_update)
+          {:error, :issue_missing_after_update}
+
+        {:error, reason} ->
+          record_spawned_todo_transition_failure(run_trace, issue.id, reason)
+          {:error, reason}
+
+        other ->
+          record_spawned_todo_transition_failure(run_trace, issue.id, other)
+          {:error, other}
       end
     else
       {:ok, issue}
@@ -1226,6 +1334,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    run_trace = pick_retry_run_trace(previous_retry, metadata)
     delay_type = pick_retry_delay_type(previous_retry, metadata)
 
     if is_reference(old_timer) do
@@ -1237,6 +1346,12 @@ defmodule SymphonyElixir.Orchestrator do
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
     Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :retry_scheduled,
+      summary: "orchestrator:retry_scheduled",
+      payload: %{attempt: next_attempt, error: error, delay_type: delay_type}
+    })
 
     %{
       state
@@ -1250,7 +1365,8 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             delay_type: delay_type,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            run_trace: run_trace
           })
     }
   end
@@ -1263,7 +1379,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           delay_type: Map.get(retry_entry, :delay_type),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          run_trace: Map.get(retry_entry, :run_trace)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1342,6 +1459,12 @@ defmodule SymphonyElixir.Orchestrator do
       if attempt >= @premature_turn_end_hold_limit do
         Logger.warning("Issue remains active after repeated premature turn end: #{issue_context(issue)}; converging to blocked local claim")
 
+        RunTrace.record(metadata[:run_trace], :orchestrator, %{
+          event: :retry_converged_to_blocked_claim,
+          summary: "orchestrator:retry_converged_to_blocked_claim",
+          payload: %{attempt: attempt, issue_id: issue.id}
+        })
+
         {:noreply,
          block_issue_claim(state, issue.id, %{
            attempt: attempt,
@@ -1349,7 +1472,8 @@ defmodule SymphonyElixir.Orchestrator do
            worker_host: metadata[:worker_host],
            workspace_path: metadata[:workspace_path],
            reason: :premature_turn_end,
-           issue: issue
+           issue: issue,
+           run_trace: metadata[:run_trace]
          })}
       else
         Logger.debug("Issue remains active after premature turn end: #{issue_context(issue)}; holding claim")
@@ -1378,7 +1502,8 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: metadata[:worker_host],
       workspace_path: metadata[:workspace_path],
       reason: metadata[:reason] || :premature_turn_end,
-      issue: metadata[:issue]
+      issue: metadata[:issue],
+      run_trace: metadata[:run_trace]
     }
 
     %{
@@ -1440,6 +1565,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_run_trace(previous_retry, metadata) do
+    metadata[:run_trace] || Map.get(previous_retry, :run_trace)
   end
 
   defp pick_retry_delay_type(previous_retry, metadata) do
@@ -1654,7 +1783,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.fetch_candidate_issues() do
       {:ok, candidate_issues} ->
         if can_dispatch_retried_issue?(issue, state, metadata, candidate_issues) do
-          {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+          {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host], metadata)}
         else
           Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -1959,6 +2088,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_normal_worker_exit(state, issue_id, running_entry, session_id) do
+    run_trace = Map.get(running_entry, :run_trace)
+
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :worker_exit_normal,
+      summary: "orchestrator:worker_exit_normal",
+      payload: %{
+        issue_id: issue_id,
+        session_id: session_id,
+        run_result: inspect(Map.get(running_entry, :run_result))
+      }
+    })
+
     case Map.get(running_entry, :run_result) do
       %{status: :continuation_required} = run_result ->
         Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check")
@@ -1969,7 +2110,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: running_entry.identifier,
           delay_type: :continuation,
           worker_host: Map.get(running_entry, :worker_host),
-          workspace_path: Map.get(running_entry, :workspace_path)
+          workspace_path: Map.get(running_entry, :workspace_path),
+          run_trace: run_trace
         })
 
       %{status: :completed} = run_result ->
@@ -1987,7 +2129,8 @@ defmodule SymphonyElixir.Orchestrator do
           delay_type: :premature_turn_end_hold,
           error: "premature turn end",
           worker_host: Map.get(running_entry, :worker_host),
-          workspace_path: Map.get(running_entry, :workspace_path)
+          workspace_path: Map.get(running_entry, :workspace_path),
+          run_trace: run_trace
         })
 
       %{status: :failed, reason: :turn_timeout} = run_result ->
@@ -1999,7 +2142,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: running_entry.identifier,
           error: "turn_timeout",
           worker_host: Map.get(running_entry, :worker_host),
-          workspace_path: Map.get(running_entry, :workspace_path)
+          workspace_path: Map.get(running_entry, :workspace_path),
+          run_trace: run_trace
         })
 
       _ ->
@@ -2011,9 +2155,18 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: running_entry.identifier,
           error: "agent exited normally without run_result",
           worker_host: Map.get(running_entry, :worker_host),
-          workspace_path: Map.get(running_entry, :workspace_path)
+          workspace_path: Map.get(running_entry, :workspace_path),
+          run_trace: run_trace
         })
     end
+  end
+
+  defp record_spawned_todo_transition_failure(run_trace, issue_id, reason) do
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :spawned_todo_transition_failed,
+      summary: "orchestrator:spawned_todo_transition_failed",
+      payload: %{issue_id: issue_id, reason: inspect(reason)}
+    })
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do

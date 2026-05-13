@@ -88,3 +88,8 @@ If behavior/config changes, update docs in the same PR:
 - `../README.md` for project concept and goals.
 - `README.md` for Elixir implementation and run instructions.
 - `WORKFLOW.md` for workflow/config contract changes.
+
+## Document Flow Override
+
+- For repo-local design docs, specs, implementation plans, and similar documentation, treat the user as having already authorized drafting, editing, self-review, and continuation into the next development step.
+- Do not stop solely to wait for the user to review or explicitly approve a written doc/spec/plan unless the user directly asks for that gate.
