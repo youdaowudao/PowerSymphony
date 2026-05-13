@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.RunTraceTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AgentRunner, LogFile, RawEventStore, RunTrace, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, EventNormalizer, LogFile, RawEventStore, RunTrace, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   setup do
@@ -450,6 +450,154 @@ defmodule SymphonyElixir.RunTraceTest do
       assert event["event_type"] == "worker_runtime_info"
       assert event["payload_ref"] == nil
       assert event["payload_size_bytes"] == nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace covers default start paths, nested context restore, read_meta and failure isolation" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{
+        id: "issue-trace-9",
+        identifier: "MT-TRACE-9",
+        title: "Trace branches",
+        state: "In Progress",
+        project_id: "project-9",
+        project_slug: "project-9"
+      }
+
+      assert {:ok, default_trace} = RunTrace.start(issue)
+      assert String.starts_with?(default_trace.run_dir, Path.join(logs_root, "runs"))
+
+      started_trace = RunTrace.start!(issue)
+      meta = RunTrace.read_meta(started_trace)
+
+      assert meta["run_id"] == started_trace.run_id
+      assert meta["project_id"] == "project-9"
+      assert meta["project_slug"] == "project-9"
+      assert meta["issue_identifier"] == "MT-TRACE-9"
+
+      outer_trace = %{started_trace | worker_host: "outer-worker"}
+      inner_trace = %{started_trace | worker_host: "inner-worker"}
+
+      assert RunTrace.current() == nil
+
+      RunTrace.with_context(outer_trace, fn ->
+        assert RunTrace.current().worker_host == "outer-worker"
+
+        RunTrace.with_context(inner_trace, fn ->
+          assert RunTrace.current().worker_host == "inner-worker"
+        end)
+
+        assert RunTrace.current().worker_host == "outer-worker"
+      end)
+
+      assert RunTrace.current() == nil
+
+      blocked_run_dir = Path.join(test_root, "blocked-run-dir")
+      File.write!(blocked_run_dir, "not-a-directory")
+      blocked_trace = %{started_trace | run_dir: blocked_run_dir}
+
+      assert RunTrace.update(blocked_trace, %{worker_host: "blocked-worker"}) == blocked_trace
+
+      blocked_logs_root = Path.join(test_root, "blocked-logs-root")
+      File.write!(blocked_logs_root, "not-a-directory")
+
+      assert_raise File.Error, fn ->
+        RunTrace.start!(issue, logs_root: blocked_logs_root)
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "event normalizer covers fallback timestamp, event type, event group and nested payload traversal branches" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-normalizer-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-trace-10", identifier: "MT-TRACE-10", title: "Normalize branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      payload_method_event =
+        EventNormalizer.normalize!(trace, :codex, %{
+          event: :notification,
+          timestamp: "not-a-datetime",
+          payload: %{"method" => "turn/started"}
+        })
+
+      assert payload_method_event["event_type"] == "turn_started"
+      assert payload_method_event["event_group"] == "codex_activity"
+      assert payload_method_event["summary"] == "codex:turn_started"
+      assert is_binary(payload_method_event["timestamp"])
+
+      fallback_notification =
+        EventNormalizer.normalize!(trace, :codex, %{
+          event: :notification,
+          payload: %{"params" => "not-a-map"},
+          details: "not-a-map"
+        })
+
+      assert fallback_notification["event_type"] == "notification"
+      assert fallback_notification["thread_id"] == nil
+      assert fallback_notification["turn_id"] == nil
+      assert fallback_notification["session_id"] == nil
+
+      custom_type_event =
+        EventNormalizer.normalize!(trace, :agent_runner, %{
+          event_type: "custom_event",
+          summary: "agent_runner:custom_event"
+        })
+
+      assert custom_type_event["event_type"] == "custom_event"
+      assert custom_type_event["event_group"] == "lifecycle"
+
+      default_type_event = EventNormalizer.normalize!(trace, :orchestrator, %{})
+      assert default_type_event["event_type"] == "event"
+      assert default_type_event["event_group"] == "control"
+      assert default_type_event["summary"] == "orchestrator:event"
+
+      unknown_group_event = EventNormalizer.normalize!(trace, :custom_source, %{event_type: "custom_group"})
+      assert unknown_group_event["event_type"] == "custom_group"
+      assert unknown_group_event["event_group"] == "event"
+      assert unknown_group_event["summary"] == "custom_source:custom_group"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "raw event store streams events, preserves raw-only payloads and run trace record swallows payload encoding failures" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-stream-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-trace-11", identifier: "MT-TRACE-11", title: "Stream trace", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.with_context(trace, fn ->
+        RunTrace.record(:codex, %{
+          event: :other_message,
+          raw: %{"jsonrpc" => "2.0", "method" => "turn/stream"}
+        })
+      end)
+
+      [event] = RawEventStore.stream_events(trace)
+      payload_path = Path.join(trace.run_dir, event["payload_ref"])
+      payload = payload_path |> File.read!() |> Jason.decode!()
+
+      assert payload == %{"jsonrpc" => "2.0", "method" => "turn/stream"}
+
+      assert :ok =
+               RunTrace.record(trace, :agent_runner, %{
+                 event: :worker_runtime_info,
+                 payload: %{pid: self()}
+               })
+
+      assert [persisted_event] = RawEventStore.list_events(trace)
+      assert persisted_event["event_id"] == event["event_id"]
     after
       File.rm_rf(test_root)
     end
