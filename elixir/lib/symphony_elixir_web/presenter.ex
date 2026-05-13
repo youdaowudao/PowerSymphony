@@ -92,6 +92,32 @@ defmodule SymphonyElixirWeb.Presenter do
       eligible: Enum.map(Map.get(payload, :eligible, []), &issue_precheck_entry/1),
       dispatch: Enum.map(Map.get(payload, :dispatch, []), &issue_precheck_entry/1),
       blocked: Map.get(payload, :blocked, %{}),
+      eligible_todos: Enum.map(Map.get(payload, :eligible_todos, []), &issue_precheck_entry/1),
+      dispatched_todos: Enum.map(Map.get(payload, :dispatched_todos, []), &issue_precheck_entry/1),
+      capacity_queued_todos: Enum.map(Map.get(payload, :capacity_queued_todos, []), &issue_precheck_entry/1),
+      blocked_todos: Map.get(payload, :blocked_todos, %{}),
+      current_work: %{
+        count: get_in(payload, [:current_work, :count]) || 0,
+        entries:
+          Enum.map(get_in(payload, [:current_work, :entries]) || [], fn entry ->
+            %{}
+            |> maybe_put_payload_value("issue_id", Map.get(entry, :issue_id))
+            |> maybe_put_payload_value("issue_identifier", Map.get(entry, :issue_identifier))
+            |> maybe_put_payload_value("state", Map.get(entry, :state))
+            |> maybe_put_payload_value("worker_host", Map.get(entry, :worker_host))
+            |> maybe_put_payload_value("workspace_path", Map.get(entry, :workspace_path))
+          end)
+      },
+      anomalies:
+        Enum.map(Map.get(payload, :anomalies, []), fn anomaly ->
+          %{
+            "type" => anomaly[:type] |> to_string(),
+            "issue_identifier" => anomaly[:issue_identifier],
+            "issue_id" => anomaly[:issue_id],
+            "state" => anomaly[:state],
+            "blocking_identifiers" => anomaly[:blocking_identifiers] || []
+          }
+        end),
       structural_errors: Map.get(payload, :structural_errors, []),
       warnings: Map.get(payload, :warnings, []),
       convergence_points: Map.get(payload, :convergence_points, []),
@@ -297,6 +323,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_precheck_entry(%{identifier: identifier, id: issue_id, state: state}) do
     %{"issue_identifier" => identifier, "issue_id" => issue_id, "state" => state}
   end
+
+  defp maybe_put_payload_value(payload, _key, nil), do: payload
+  defp maybe_put_payload_value(payload, key, value), do: Map.put(payload, key, value)
 
   defp workspace_path(issue_identifier, running, retry) do
     (running && Map.get(running, :workspace_path)) ||
