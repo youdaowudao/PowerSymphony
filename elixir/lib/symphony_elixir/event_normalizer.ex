@@ -139,8 +139,6 @@ defmodule SymphonyElixir.EventNormalizer do
     Enum.find_value(paths, &get_in_path(data, &1))
   end
 
-  defp nested_value(_data, _paths), do: nil
-
   defp get_in_path(data, path) when is_map(data) and is_list(path) do
     Enum.reduce_while(path, data, fn key, acc ->
       case fetch_path_value(acc, key) do

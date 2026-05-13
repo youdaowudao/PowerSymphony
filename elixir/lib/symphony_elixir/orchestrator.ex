@@ -28,6 +28,22 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{
+            poll_interval_ms: non_neg_integer() | nil,
+            max_concurrent_agents: non_neg_integer() | nil,
+            next_poll_due_at_ms: integer() | nil,
+            poll_check_in_progress: boolean() | nil,
+            tick_timer_ref: reference() | nil,
+            tick_token: reference() | nil,
+            running: map(),
+            completed: MapSet.t(String.t()),
+            claimed: MapSet.t(String.t()),
+            blocked_claims: map(),
+            retry_attempts: map(),
+            codex_totals: map() | nil,
+            codex_rate_limits: map() | nil
+          }
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,

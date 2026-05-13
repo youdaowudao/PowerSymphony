@@ -141,7 +141,12 @@ defmodule SymphonyElixir.ControlPlaneRuntimeTest do
       current_pid = Process.whereis(default_name)
 
       if current_pid do
-        GenServer.stop(current_pid)
+        try do
+          GenServer.stop(current_pid)
+        catch
+          :exit, {:noproc, _} -> :ok
+          :exit, {:normal, _} -> :ok
+        end
       end
 
       if previous_pid do
