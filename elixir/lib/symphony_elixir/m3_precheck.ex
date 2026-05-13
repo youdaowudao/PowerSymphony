@@ -34,7 +34,7 @@ defmodule SymphonyElixir.M3Precheck do
           dispatched_todos: [Issue.t()],
           capacity_queued_todos: [Issue.t()],
           blocked_todos: %{optional(String.t()) => [String.t()]},
-          current_work: current_work(),
+          current_work: current_work() | nil,
           anomalies: [anomaly()],
           structural_errors: [map()],
           warnings: [String.t()],
@@ -60,7 +60,7 @@ defmodule SymphonyElixir.M3Precheck do
     current_project_slug = Map.get(opts, :current_project_slug, Map.get(opts, "current_project_slug"))
     current_project_id = Map.get(opts, :current_project_id, Map.get(opts, "current_project_id"))
     terminal_states = terminal_state_set(Map.get(opts, :terminal_states, Map.get(opts, "terminal_states", [])))
-    current_work = normalize_current_work(Map.get(opts, :current_work, Map.get(opts, "current_work")))
+    current_work = current_work_option(opts)
     max_concurrent_agents = Map.get(opts, :max_concurrent_agents, Map.get(opts, "max_concurrent_agents", 0))
 
     active_running_count =
@@ -335,6 +335,14 @@ defmodule SymphonyElixir.M3Precheck do
     do: DateTime.to_unix(created_at, :microsecond)
 
   defp created_at_sort_key(_issue), do: @max_sort_key
+
+  defp current_work_option(opts) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, :current_work) -> normalize_current_work(Map.get(opts, :current_work))
+      Map.has_key?(opts, "current_work") -> normalize_current_work(Map.get(opts, "current_work"))
+      true -> nil
+    end
+  end
 
   defp normalize_current_work(%{count: count, entries: entries}) do
     normalized_entries = normalize_current_work_entries(entries)
