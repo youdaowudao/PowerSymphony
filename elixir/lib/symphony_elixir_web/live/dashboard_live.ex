@@ -75,12 +75,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
       if socket.assigns.runtime_mode == :control_plane do
         case ObservabilityApiController.project_m3_precheck_payload(project_id) do
           {:ok, body} -> body
-          _ -> %{"text" => "m3 precheck request failed"}
+          _ -> %{text: "m3 precheck request failed"}
         end
       else
         case SymphonyElixir.Orchestrator.m3_precheck() do
           {:ok, payload} -> Presenter.m3_precheck_payload(payload)
-          _ -> %{"text" => "m3 precheck request failed"}
+          _ -> %{text: "m3 precheck request failed"}
         end
       end
 
@@ -223,7 +223,68 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                       <details class="session-stack">
                         <summary>M3-0 预检</summary>
-                        <pre class="code-panel"><%= get_in(@m3_precheck_results, [project.project_id, "text"]) || "" %></pre>
+                        <% result = Map.get(@m3_precheck_results, project.project_id, %{}) %>
+                        <div class="session-stack">
+                          <p class="mono">
+                            <%= "可放行 #{length(m3_issue_entries(result, :eligible_todos))}" %>
+                            ·
+                            <%= "容量排队 #{length(m3_issue_entries(result, :capacity_queued_todos))}" %>
+                            ·
+                            <%= "本轮已派发 #{length(m3_issue_entries(result, :dispatched_todos))}" %>
+                            ·
+                            <%= "阻塞 #{length(m3_blocked_entries(result))}" %>
+                            ·
+                            <%= "执行中 #{length(m3_current_work_entries(result))}" %>
+                            ·
+                            <%= "异常 #{length(m3_anomalies(result))}" %>
+                          </p>
+
+                          <section :if={m3_issue_entries(result, :eligible_todos) != []} class="session-stack">
+                            <p class="issue-id">可放行 Todo</p>
+                            <p :for={entry <- m3_issue_entries(result, :eligible_todos)} class="mono">
+                              <%= m3_issue_label(entry) %>
+                            </p>
+                          </section>
+
+                          <section :if={m3_blocked_entries(result) != []} class="session-stack">
+                            <p class="issue-id">依赖阻塞</p>
+                            <p :for={{issue_identifier, reasons} <- m3_blocked_entries(result)} class="mono">
+                              <%= issue_identifier %>: <%= Enum.join(reasons, "; ") %>
+                            </p>
+                          </section>
+
+                          <section :if={m3_issue_entries(result, :capacity_queued_todos) != []} class="session-stack">
+                            <p class="issue-id">容量排队</p>
+                            <p :for={entry <- m3_issue_entries(result, :capacity_queued_todos)} class="mono">
+                              <%= m3_issue_label(entry) %>
+                            </p>
+                          </section>
+
+                          <section :if={m3_issue_entries(result, :dispatched_todos) != []} class="session-stack">
+                            <p class="issue-id">本轮已派发</p>
+                            <p :for={entry <- m3_issue_entries(result, :dispatched_todos)} class="mono">
+                              <%= m3_issue_label(entry) %>
+                            </p>
+                          </section>
+
+                          <section :if={m3_current_work_entries(result) != []} class="session-stack">
+                            <p class="issue-id">当前执行中</p>
+                            <p :for={entry <- m3_current_work_entries(result)} class="mono">
+                              <%= m3_issue_label(entry) %>
+                              <%= if entry["worker_host"], do: " @#{entry["worker_host"]}" %>
+                            </p>
+                          </section>
+
+                          <section :if={m3_anomalies(result) != []} class="session-stack">
+                            <p class="issue-id">异常执行态</p>
+                            <p :for={anomaly <- m3_anomalies(result)} class="mono">
+                              <%= m3_issue_label(anomaly) %>
+                              <%= if anomaly["blocking_identifiers"] != [], do: " blocked by #{Enum.join(anomaly["blocking_identifiers"], ", ")}" %>
+                            </p>
+                          </section>
+
+                          <p :if={m3_result_empty?(result)} class="mono">(none)</p>
+                        </div>
                       </details>
                     </td>
                   </tr>
@@ -397,16 +458,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
                     <td>
                       <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
+                        <span class="event-text"><%= running_activity_summary(entry) %></span>
+                        <span class="muted event-meta"><%= running_activity_meta(entry) %></span>
                       </div>
                     </td>
                     <td>
@@ -653,6 +706,85 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp project_action_disallowed_for_status?(status, action) do
     (status in ["not_started", "stopped"] and action == "stop") or
       (status in ["running", "unreachable"] and action == "start")
+  end
+
+  defp m3_issue_entries(nil, _key), do: []
+
+  defp m3_issue_entries(result, key) when is_map(result) do
+    Map.get(result, key, Map.get(result, Atom.to_string(key), []))
+  end
+
+  defp m3_issue_entries(_result, _key), do: []
+
+  defp m3_blocked_entries(result) when is_map(result) do
+    result
+    |> Map.get(:blocked_todos, Map.get(result, "blocked_todos", %{}))
+    |> Enum.sort_by(fn {issue_identifier, _reasons} -> issue_identifier end)
+  end
+
+  defp m3_blocked_entries(_result), do: []
+
+  defp m3_current_work_entries(result) when is_map(result) do
+    current_work = Map.get(result, :current_work, Map.get(result, "current_work", %{}))
+    Map.get(current_work, :entries, Map.get(current_work, "entries", []))
+  end
+
+  defp m3_current_work_entries(_result), do: []
+
+  defp m3_anomalies(result) when is_map(result) do
+    Map.get(result, :anomalies, Map.get(result, "anomalies", []))
+  end
+
+  defp m3_anomalies(_result), do: []
+
+  defp m3_result_empty?(result) do
+    m3_issue_entries(result, :eligible_todos) == [] and
+      m3_issue_entries(result, :capacity_queued_todos) == [] and
+      m3_issue_entries(result, :dispatched_todos) == [] and
+      m3_blocked_entries(result) == [] and
+      m3_current_work_entries(result) == [] and
+      m3_anomalies(result) == []
+  end
+
+  defp m3_issue_label(%{"issue_identifier" => identifier, "state" => state})
+       when is_binary(identifier) and is_binary(state),
+       do: "#{identifier} (#{state})"
+
+  defp m3_issue_label(%{issue_identifier: identifier, state: state})
+       when is_binary(identifier) and is_binary(state),
+       do: "#{identifier} (#{state})"
+
+  defp m3_issue_label(%{"issue_identifier" => identifier}) when is_binary(identifier), do: identifier
+  defp m3_issue_label(%{issue_identifier: identifier}) when is_binary(identifier), do: identifier
+  defp m3_issue_label(_entry), do: "unknown"
+
+  defp running_activity_summary(entry) do
+    cond do
+      is_integer(entry.turn_count) and entry.turn_count > 0 and entry.session_id ->
+        "#{entry.turn_count} turns · session id available"
+
+      is_integer(entry.turn_count) and entry.turn_count > 0 ->
+        "#{entry.turn_count} turns"
+
+      entry.session_id ->
+        "session id available"
+
+      true ->
+        "status tracked"
+    end
+  end
+
+  defp running_activity_meta(entry) do
+    cond do
+      not is_nil(entry.session_id) and activity_summary_present?(entry) -> "session id available · summary withheld"
+      not is_nil(entry.session_id) -> "session id available"
+      activity_summary_present?(entry) -> "summary withheld"
+      true -> "no recent summary"
+    end
+  end
+
+  defp activity_summary_present?(entry) do
+    not is_nil(entry.last_message) or not is_nil(entry.last_event) or not is_nil(entry.last_event_at)
   end
 
   defp pretty_value(nil), do: "n/a"
