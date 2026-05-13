@@ -1003,37 +1003,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, transition_context, retry_metadata) do
     recipient = self()
 
-    retry_trace =
-      Map.get(retry_metadata, :run_trace) ||
-        state.retry_attempts |> Map.get(issue.id, %{}) |> Map.get(:run_trace)
-
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        retry_workspace_path =
-          case Map.get(state.retry_attempts, issue.id) do
-            %{workspace_path: workspace_path} -> workspace_path
-            _ -> nil
-          end
-
-        run_trace =
-          case retry_trace do
-            %RunTrace{} = trace ->
-              trace
-
-            _ ->
-              case RunTrace.start(issue, worker_host: worker_host, workspace_path: retry_workspace_path) do
-                {:ok, trace} ->
-                  trace
-
-                {:error, reason} ->
-                  Logger.warning("Run trace initialization failed for #{issue_context(issue)}: #{inspect(reason)}")
-                  nil
-              end
-          end
+        retry_workspace_path = retry_workspace_path(state, issue.id)
+        retry_trace = retry_trace(state, issue.id, retry_metadata)
+        run_trace = resolve_dispatch_run_trace(retry_trace, issue, worker_host, retry_workspace_path)
 
         RunTrace.record(run_trace, :orchestrator, %{
           event: :dispatch_started,
@@ -1051,6 +1029,31 @@ defmodule SymphonyElixir.Orchestrator do
           Map.put(transition_context, :run_trace, run_trace),
           run_trace
         )
+    end
+  end
+
+  defp retry_workspace_path(%State{} = state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{workspace_path: workspace_path} -> workspace_path
+      _ -> nil
+    end
+  end
+
+  defp retry_trace(%State{} = state, issue_id, retry_metadata) do
+    Map.get(retry_metadata, :run_trace) ||
+      state.retry_attempts |> Map.get(issue_id, %{}) |> Map.get(:run_trace)
+  end
+
+  defp resolve_dispatch_run_trace(%RunTrace{} = trace, _issue, _worker_host, _retry_workspace_path), do: trace
+
+  defp resolve_dispatch_run_trace(_retry_trace, issue, worker_host, retry_workspace_path) do
+    case RunTrace.start(issue, worker_host: worker_host, workspace_path: retry_workspace_path) do
+      {:ok, trace} ->
+        trace
+
+      {:error, reason} ->
+        Logger.warning("Run trace initialization failed for #{issue_context(issue)}: #{inspect(reason)}")
+        nil
     end
   end
 
@@ -1179,7 +1182,12 @@ defmodule SymphonyElixir.Orchestrator do
     RunTrace.record(run_trace, :orchestrator, %{
       event: :dispatch_transition_failed,
       summary: "orchestrator:dispatch_transition_failed",
-      payload: %{attempt: attempt, worker_host: worker_host, reason: inspect(reason), rollback: inspect(rollback_result)}
+      payload: %{
+        attempt: attempt,
+        worker_host: worker_host,
+        reason: inspect(reason),
+        rollback: inspect(rollback_result)
+      }
     })
 
     Logger.warning("Rolling back spawned dispatch for #{issue_context(issue)}: #{inspect(reason)} rollback=#{inspect(rollback_result)}")

@@ -102,9 +102,10 @@ defmodule SymphonyElixir.RunTrace do
     try do
       fun.()
     after
-      cond do
-        previous -> Process.put(@context_key, previous)
-        true -> Process.delete(@context_key)
+      if previous do
+        Process.put(@context_key, previous)
+      else
+        Process.delete(@context_key)
       end
     end
   end
