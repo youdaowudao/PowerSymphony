@@ -172,6 +172,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     run_mode = Keyword.get(opts, :run_mode, :normal)
+
     turn_context = %{
       codex_update_recipient: codex_update_recipient,
       opts: opts,
