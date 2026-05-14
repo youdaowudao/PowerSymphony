@@ -100,10 +100,33 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       {:ok, state}
     end
+
+    def handle_call(:snapshot, _from, %SymphonyElixir.Orchestrator.State{} = state) do
+      snapshot = %{
+        running: [],
+        retrying: [],
+        codex_totals: state.codex_totals || %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        rate_limits: nil
+      }
+
+      {:reply, snapshot, state}
+    end
+
+    def handle_call(:request_refresh, _from, state) do
+      {:reply, :unavailable, state}
+    end
   end
 
   defmodule StaticProjectRegistry do
     defstruct entries: []
+  end
+
+  defmodule FailingTrackerAdapter do
+    def fetch_candidate_issues, do: {:error, :tracker_unavailable}
+    def fetch_issues_by_states(_states), do: {:error, :tracker_unavailable}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:error, :tracker_unavailable}
+    def create_comment(_issue_id, _body), do: {:error, :tracker_unavailable}
+    def update_issue_state(_issue_id, _state_name), do: {:error, :tracker_unavailable}
   end
 
   setup do
@@ -1957,6 +1980,107 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert rendered =~ "RUN-CP-1"
     assert rendered =~ "MT-CP-3"
     refute rendered =~ "fake worker m3 precheck"
+  end
+
+  test "workflow dashboard renders m3 precheck entry and result on demand" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      max_concurrent_agents: 2
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-1", identifier: "MT-1", title: "Ready 1", state: "Todo", blocked_by: []},
+      %Issue{id: "issue-2", identifier: "MT-2", title: "Ready 2", state: "Todo", blocked_by: []},
+      %Issue{
+        id: "issue-3",
+        identifier: "MT-3",
+        title: "Blocked",
+        state: "Todo",
+        blocked_by: [%{id: "dep-1", identifier: "MT-9", state: "In Progress", project_slug: "alpha"}]
+      },
+      %Issue{
+        id: "issue-4",
+        identifier: "MT-4",
+        title: "Blocked but running",
+        state: "In Progress",
+        blocked_by: [%{id: "dep-2", identifier: "MT-10", state: "Todo", project_slug: "alpha"}]
+      }
+    ])
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkflowDashboardM3PrecheckOrchestrator)
+
+    start_supervised!(
+      {M3PrecheckOrchestrator,
+       name: orchestrator_name,
+       max_concurrent_agents: 2,
+       running: %{
+         "running-1" => %{issue: %Issue{id: "running-1", identifier: "RUN-1", state: "In Progress"}}
+       }}
+    )
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Todo 池检验"
+    assert html =~ "M3-0 预检"
+
+    view
+    |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='workflow']")
+    |> render_click()
+
+    rendered = render(view)
+    assert rendered =~ "可放行 Todo"
+    assert rendered =~ "容量排队"
+    assert rendered =~ "本轮已派发"
+    assert rendered =~ "依赖阻塞"
+    assert rendered =~ "当前执行中"
+    assert rendered =~ "异常执行态"
+    assert rendered =~ "MT-1"
+    assert rendered =~ "MT-2"
+    assert rendered =~ "MT-3"
+    assert rendered =~ "waiting on non-terminal blockers: MT-9"
+    assert rendered =~ "RUN-1"
+    assert rendered =~ "MT-4"
+  end
+
+  test "workflow dashboard shows m3 precheck failure instead of an empty result" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      m3_enabled: true,
+      max_concurrent_agents: 2
+    )
+
+    previous_override = Application.get_env(:symphony_elixir, :tracker_adapter_override)
+
+    on_exit(fn ->
+      if is_nil(previous_override) do
+        Application.delete_env(:symphony_elixir, :tracker_adapter_override)
+      else
+        Application.put_env(:symphony_elixir, :tracker_adapter_override, previous_override)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :tracker_adapter_override, FailingTrackerAdapter)
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkflowDashboardM3PrecheckFailureOrchestrator)
+
+    start_supervised!({M3PrecheckOrchestrator, name: orchestrator_name, max_concurrent_agents: 2})
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Todo 池检验"
+
+    view
+    |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='workflow']")
+    |> render_click()
+
+    rendered = render(view)
+    assert rendered =~ "m3 precheck request failed"
+    refute rendered =~ "(none)"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do

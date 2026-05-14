@@ -19,6 +19,8 @@ polling:
   interval_ms: 10000
 workspace:
   root: ~/projects/symphony-workspaces
+m3:
+  enabled: true
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/youdaowudao/PowerSymphony.git .

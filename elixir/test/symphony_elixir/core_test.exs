@@ -142,6 +142,11 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
+    m3 = Map.get(config, "m3", %{})
+    assert is_map(m3)
+    assert Map.get(m3, "enabled") == true
+    assert Config.m3_enabled?() == true
+
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
 
