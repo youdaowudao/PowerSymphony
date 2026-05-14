@@ -17,6 +17,8 @@ description:
   unless blocked.
 - No need to delete remote branches after merge; the repo auto-deletes head
   branches.
+- Treat manual merge as a fallback path. The default path should already have
+  attempted auto-merge immediately after the latest successful push.
 
 ## Preconditions
 
@@ -131,8 +133,14 @@ Exit codes:
 - Codex review jobs retry on failure and are non-blocking; use the presence of
   `## Codex Review — <persona>` issue comments (not job status) as the signal
   that review feedback is available.
-- Do not enable auto-merge; this repo has no required checks so auto-merge can
-  skip tests.
+- If auto-merge is already active, prefer waiting for the auto-merge path over
+  forcing a manual merge.
+- If auto-merge was not activated, manual merge is allowed only after the exact
+  auto-merge failure reason has been reported in the PR or issue comment stream
+  and the latest head SHA required checks are green.
+- If the latest auto-merge attempt failed only because the PR was already in
+  clean status, treat that as “auto-merge no longer necessary”, not as a
+  permission blocker.
 - If the remote PR branch advanced due to your own prior force-push or merge,
   avoid redundant merges; re-run the formatter locally if needed and
   `git push --force-with-lease`.

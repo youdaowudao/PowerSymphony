@@ -75,6 +75,14 @@ mix specs.check
 ## PR Requirements
 
 - PR body must follow `../.github/pull_request_template.md` exactly.
+- After every successful PR creation or branch-update push, immediately attempt
+  to enable auto-merge before reading checks or mergeability.
+- Treat `already enabled` as success.
+- Treat `clean status` as “direct merge stage reached”, not as a permission
+  blocker.
+- Manual merge is fallback-only: use it only when auto-merge failed for another
+  reason and the latest head SHA required checks are green, and report that
+  failure reason in the PR or issue comment stream first.
 - Validate PR body locally when needed:
 
 ```bash

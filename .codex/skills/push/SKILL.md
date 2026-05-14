@@ -17,6 +17,7 @@ description:
 - Push current branch changes to `origin` safely.
 - Create a PR if none exists for the branch, otherwise update the existing PR.
 - Keep branch history clean when remote has moved.
+- Attempt to enable auto-merge immediately after every successful PR creation or branch update push.
 
 ## Related Skills
 
@@ -44,7 +45,11 @@ description:
    - Write a proper PR title that clearly describes the change outcome
    - For branch updates, explicitly reconsider whether current PR title still
      matches the latest scope; update it if it no longer does.
-6. Write/update PR body explicitly using `.github/pull_request_template.md`:
+6. Immediately after the successful push and PR create/update step, attempt to enable auto-merge for the current PR before reading checks or mergeability:
+   - If auto-merge is already enabled, treat that as success.
+   - If GitHub reports the PR is already in clean status, do not treat that as a blocker; it means the PR has already moved past the auto-merge window.
+   - If any other error occurs, capture the exact failure text and post it to the PR or issue comment stream because any later manual merge must cite that failure.
+7. Write/update PR body explicitly using `.github/pull_request_template.md`:
    - Fill every section with concrete content for this change.
    - Replace all placeholder comments (`<!-- ... -->`).
    - Keep bullets/checkboxes where template expects them.
@@ -52,8 +57,8 @@ description:
      scope (all intended work on the branch), not just the newest commits,
      including newly added work, removed work, or changed approach.
    - Do not reuse stale description text from earlier iterations.
-7. Validate PR body with `mix pr_body.check` and fix all reported issues.
-8. Reply with the PR URL from `gh pr view`.
+8. Validate PR body with `mix pr_body.check` and fix all reported issues.
+9. Reply with the PR URL from `gh pr view`.
 
 ## Commands
 
@@ -93,6 +98,10 @@ else
   gh pr edit --title "$pr_title"
 fi
 
+# Attempt auto-merge immediately after push + PR create/update, before reading
+# checks or mergeability.
+gh pr merge --auto --squash || true
+
 # Write/edit PR body to match .github/pull_request_template.md before validation.
 # Example workflow:
 # 1) open the template and draft body content for this PR
@@ -111,6 +120,8 @@ gh pr view --json url -q .url
 ## Notes
 
 - Do not use `--force`; only use `--force-with-lease` as the last resort.
+- Do not defer the auto-merge attempt until after reading checks. The default
+  order is push first, auto-merge attempt second, signal inspection third.
 - Distinguish sync problems from remote auth/permission problems:
   - Use the `pull` skill for non-fast-forward or stale-branch issues.
   - Surface auth, permissions, or workflow restrictions directly instead of
