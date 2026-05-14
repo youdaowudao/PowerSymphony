@@ -1233,7 +1233,7 @@ defmodule SymphonyElixir.CoreTest do
 
     :sys.replace_state(pid, fn _ ->
       initial_state
-      |> Map.put(:max_concurrent_agents, 0)
+      |> Map.put(:max_concurrent_agents, 1)
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.new([issue_id]))
       |> Map.put(:retry_attempts, %{})
@@ -1255,11 +1255,14 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, retry_token: retry_token, worker_host: "worker-a", workspace_path: "/tmp/continuation-callback"} =
              :sys.get_state(pid).retry_attempts[issue_id]
 
+    assert MapSet.member?(:sys.get_state(pid).claimed, issue_id)
     send(pid, {:retry_issue, issue_id, retry_token})
 
     assert_eventually(
       fn ->
-        case :sys.get_state(pid).running[issue_id] do
+        state = :sys.get_state(pid)
+
+        case state.running[issue_id] do
           %{
             retry_attempt: 1,
             worker_host: nil,
@@ -1267,7 +1270,9 @@ defmodule SymphonyElixir.CoreTest do
             issue: %Issue{id: ^issue_id}
           }
           when is_binary(workspace_path) ->
-            workspace_path =~ "/MT-570"
+            workspace_path =~ "/MT-570" and
+              MapSet.member?(state.claimed, issue_id) and
+              not Map.has_key?(state.retry_attempts, issue_id)
 
           _ ->
             false

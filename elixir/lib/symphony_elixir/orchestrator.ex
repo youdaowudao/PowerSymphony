@@ -17,7 +17,6 @@ defmodule SymphonyElixir.Orchestrator do
   @checking_recheck_delay_type :checking_recheck
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
-  @inert_startup_mode_sentinel {__MODULE__, :inert_startup_mode}
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -71,6 +70,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   if Code.ensure_loaded?(Mix) and Mix.env() == :test do
+    @inert_startup_mode_sentinel {__MODULE__, :inert_startup_mode}
+
     @doc false
     @spec start_inert_for_test(keyword()) :: GenServer.on_start()
     def start_inert_for_test(opts \\ []) do
@@ -78,47 +79,28 @@ defmodule SymphonyElixir.Orchestrator do
       opts = Keyword.put(opts, :startup_mode, @inert_startup_mode_sentinel)
       GenServer.start_link(__MODULE__, opts, name: name)
     end
-  end
 
-  @impl true
-  def init(opts) do
-    now_ms = System.monotonic_time(:millisecond)
-    config = Config.settings!()
-    startup_mode = parse_startup_mode!(opts)
+    @impl true
+    def init(opts) do
+      now_ms = System.monotonic_time(:millisecond)
+      config = Config.settings!()
+      startup_mode = parse_startup_mode!(opts)
 
-    state = %State{
-      poll_interval_ms: config.polling.interval_ms,
-      max_concurrent_agents: config.agent.max_concurrent_agents,
-      next_poll_due_at_ms: now_ms,
-      poll_check_in_progress: false,
-      tick_timer_ref: nil,
-      tick_token: nil,
-      codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
-    }
+      state = initial_state(now_ms, config)
 
-    state =
-      case startup_mode do
-        :inert ->
-          state
+      state =
+        case startup_mode do
+          :inert ->
+            state
 
-        _ ->
-          run_terminal_workspace_cleanup()
-          schedule_tick(state, 0)
-      end
+          :active ->
+            run_terminal_workspace_cleanup()
+            schedule_tick(state, 0)
+        end
 
-    {:ok, state}
-  end
-
-  defp reject_internal_startup_mode_option!(opts) when is_list(opts) do
-    if Keyword.has_key?(opts, :startup_mode) do
-      raise ArgumentError, "startup_mode is reserved for internal test helpers"
+      {:ok, state}
     end
-  end
 
-  defp reject_internal_startup_mode_option!(_opts), do: :ok
-
-  if Code.ensure_loaded?(Mix) and Mix.env() == :test do
     defp parse_startup_mode!(opts) when is_list(opts) do
       case Keyword.get(opts, :startup_mode, :active) do
         :active -> :active
@@ -127,6 +109,23 @@ defmodule SymphonyElixir.Orchestrator do
       end
     end
   else
+    @impl true
+    def init(opts) do
+      now_ms = System.monotonic_time(:millisecond)
+      config = Config.settings!()
+      :active = parse_startup_mode!(opts)
+
+      state =
+        now_ms
+        |> initial_state(config)
+        |> then(fn state ->
+          run_terminal_workspace_cleanup()
+          schedule_tick(state, 0)
+        end)
+
+      {:ok, state}
+    end
+
     defp parse_startup_mode!(opts) when is_list(opts) do
       case Keyword.get(opts, :startup_mode, :active) do
         :active -> :active
@@ -137,6 +136,27 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp parse_startup_mode!(opts) do
     raise ArgumentError, "orchestrator init expects keyword opts, got: #{inspect(opts)}"
+  end
+
+  defp reject_internal_startup_mode_option!(opts) when is_list(opts) do
+    if Keyword.has_key?(opts, :startup_mode) do
+      raise ArgumentError, "startup_mode is reserved for internal test helpers"
+    end
+  end
+
+  defp reject_internal_startup_mode_option!(_opts), do: :ok
+
+  defp initial_state(now_ms, config) do
+    %State{
+      poll_interval_ms: config.polling.interval_ms,
+      max_concurrent_agents: config.agent.max_concurrent_agents,
+      next_poll_due_at_ms: now_ms,
+      poll_check_in_progress: false,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      codex_totals: @empty_codex_totals,
+      codex_rate_limits: nil
+    }
   end
 
   @impl true
@@ -1589,7 +1609,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(identifier), do: cleanup_issue_workspace(identifier, nil)
 
   defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
     Workspace.remove_issue_workspaces(identifier, worker_host)
