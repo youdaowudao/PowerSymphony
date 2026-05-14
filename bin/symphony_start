@@ -4,6 +4,7 @@ set -euo pipefail
 DEFAULT_PORT="4000"
 LINEAR_TOKEN_RELATIVE_PATH=".config/linear/linear_api_key.token"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_PORT=""
 
 resolve_root_dir() {
   if [[ -n "${POWERSYMPHONY_ROOT:-}" ]]; then
@@ -31,6 +32,66 @@ EOF
 die() {
   printf 'Error: %s\n' "$1" >&2
   exit 1
+}
+
+port_is_listening() {
+  local port="$1"
+  local ss_output=""
+  local lsof_status=0
+  local port_hex=""
+  local proc_file=""
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss_output="$(ss -ltnH 2>/dev/null)"; then
+      if grep -Eq "[:.]${port}[[:space:]]" <<<"$ss_output"; then
+        return 0
+      fi
+
+      return 1
+    fi
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0
+    fi
+
+    lsof_status=$?
+    if [[ "$lsof_status" -eq 1 ]]; then
+      return 1
+    fi
+  fi
+
+  printf -v port_hex '%04X' "$port"
+
+  for proc_file in /proc/net/tcp /proc/net/tcp6; do
+    [[ -r "$proc_file" ]] || continue
+
+    if awk -v port_hex="$port_hex" '
+      NR > 1 {
+        split($2, local_addr, ":")
+        if (toupper(local_addr[2]) == port_hex && $4 == "0A") {
+          found = 1
+          exit
+        }
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$proc_file"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_port_available() {
+  local port="$1"
+
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+
+  if port_is_listening "$port"; then
+    die "端口 ${port} 已被监听，无法启动 Symphony。请先运行 ss -ltnp | grep ':${port} ' 或 lsof -nP -iTCP:${port} -sTCP:LISTEN 查看占用进程，并停止现有实例或改用 --port 指定其他端口。"
+  fi
 }
 
 ARGS=()
@@ -66,10 +127,12 @@ while (($#)); do
         usage
         exit 1
       fi
+      TARGET_PORT="$1"
       ARGS+=("$1")
       ;;
     --port=*)
       HAS_PORT=1
+      TARGET_PORT="${1#--port=}"
       ARGS+=("$1")
       ;;
     *)
@@ -142,7 +205,10 @@ if [[ "$HAS_LOGS_ROOT" -eq 0 ]]; then
 fi
 
 if [[ "$HAS_PORT" -eq 0 ]]; then
+  TARGET_PORT="$DEFAULT_PORT"
   ARGS=(--port "$DEFAULT_PORT" "${ARGS[@]}")
 fi
+
+ensure_port_available "$TARGET_PORT"
 
 exec "${ROOT_DIR}/bin/symphony" "${ARGS[@]}" "$WORKFLOW_PATH"
