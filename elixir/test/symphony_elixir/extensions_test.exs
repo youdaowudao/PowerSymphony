@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias Floki
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.ProjectProcessManager
   alias SymphonyElixir.Tracker.Memory
@@ -1607,6 +1608,90 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Raw event"
   end
 
+  test "project detail page shows unavailable state when project summary is missing" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{entries: []}
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/missing")
+    assert html =~ "Project unavailable"
+    assert html =~ "No lightweight project summary matched"
+    assert html =~ "missing"
+  end
+
+  test "project detail page renders presenter-backed empty summary fields as n/a and keeps empty run lists lightweight" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: ""},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, last_seen_at: "", last_error: "", run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    assert html =~ "No run summaries available."
+    assert html =~ "worker port: n/a"
+    assert html =~ "last seen: n/a"
+    assert html =~ "last error: n/a"
+  end
+
+  test "project detail page renders empty run action text as n/a" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "",
+                  health: "normal",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert [
+             {"article", _, _} = article
+           ] = Floki.find(document, "article.section-card")
+
+    article_html = Floki.raw_html(article)
+    assert article_html =~ "MT-ALPHA-1"
+    assert article_html =~ "Alpha task"
+    assert article_html =~ "<p class=\"mono\">n/a</p>"
+  end
+
   test "run deep view renders summary fields and skeleton sections without heavy content by default" do
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -1669,6 +1754,66 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Shell output"
     refute html =~ "notification"
     refute html =~ "rendered"
+  end
+
+  test "run deep view shows project unavailable when the project is missing" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{entries: []}
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/missing/runs/MT-ALPHA-1")
+    assert html =~ "Project unavailable"
+    assert html =~ "No project matched"
+    assert html =~ "missing"
+  end
+
+  test "run deep view renders integer and empty summary values with active badge state" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "running",
+                  current_phase: nil,
+                  current_action: "",
+                  health: nil,
+                  thread_id: nil,
+                  turn_id: 7,
+                  last_event_at: nil,
+                  run_duration_seconds: 960
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert html =~ "state-badge state-badge-active"
+    assert summary_row_text(document, "linear_state") == "linear_state: running"
+    assert summary_row_text(document, "current_phase") == "current_phase: n/a"
+    assert summary_row_text(document, "current_action") == "current_action: n/a"
+    assert summary_row_text(document, "health") == "health: n/a"
+    assert summary_row_text(document, "thread_id") == "thread_id: n/a"
+    assert summary_row_text(document, "turn_id") == "turn_id: 7"
+    assert summary_row_text(document, "last_event_at") == "last_event_at: n/a"
+    assert summary_row_text(document, "run_duration_seconds") == "run_duration_seconds: 960s"
   end
 
   test "run deep view stays lightweight when the run summary is unavailable" do
@@ -2761,6 +2906,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp summary_row_text(document, label) do
+    document
+    |> Floki.find("section.section-card p")
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(String.starts_with?(&1, "#{label}:")))
   end
 
   defp fake_worker_builder(modes) do
