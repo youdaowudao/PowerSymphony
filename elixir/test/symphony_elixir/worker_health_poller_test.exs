@@ -76,7 +76,7 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
 
   setup do
     previous_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
-    {:ok, cleanup_agent} = Agent.start_link(fn -> [] end)
+    {:ok, cleanup_agent} = Agent.start(fn -> [] end)
     Process.put(:fake_worker_cleanup_agent, cleanup_agent)
 
     on_exit(fn ->
