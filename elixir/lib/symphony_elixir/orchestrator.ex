@@ -1704,8 +1704,6 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(metadata, :run_instance_id)
   end
 
-  defp run_instance_id_from_metadata(_metadata), do: nil
-
   defp dispatch_run_mode(%State{} = state, %Issue{id: issue_id, state: state_name})
        when is_binary(issue_id) and is_binary(state_name) do
     cond do
