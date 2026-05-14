@@ -262,6 +262,94 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server sends turn interrupt when worker receives interrupt message" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-interrupt-#{System.unique_integer([:positive])}"
+      )
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    on_exit(fn ->
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-INT-1")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "interrupt.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/usr/bin/env bash
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/interrupt.trace}"
+
+      while true; do
+        if ! IFS= read -r line; then
+          exit 1
+        fi
+
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-int-1"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-int-1"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/interrupt"'; then
+          printf '%s\\n' '{"method":"turn/cancelled","params":{"reason":"interrupted"}}'
+          exit 0
+        fi
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-int-1",
+        identifier: "MT-INT-1",
+        title: "Interrupt me",
+        state: "In Progress"
+      }
+
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          assert {:ok, session} = AppServer.start_session(workspace)
+          send(parent, {:session_ready, self()})
+          on_message = fn message -> send(parent, {:app_server_message, message}) end
+
+          try do
+            AppServer.run_turn(session, "interrupt", issue, on_message: on_message)
+          after
+            AppServer.stop_session(session)
+          end
+        end)
+
+      assert_receive {:session_ready, worker_pid}, 1_000
+      assert_receive {:app_server_message, %{event: :session_started, thread_id: "thread-int-1", turn_id: "turn-int-1"}}, 1_000
+      send(worker_pid, {:interrupt_codex_turn, "run-int-1", :stall_detected})
+
+      assert {:error, {:turn_cancelled, %{"reason" => "interrupted"}}} = Task.await(task, 2_000)
+
+      trace = File.read!(trace_file)
+      assert trace =~ ~s("method":"turn/interrupt")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server fails when command execution approval is required under safer defaults" do
     test_root =
       Path.join(

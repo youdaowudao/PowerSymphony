@@ -10,6 +10,10 @@ defmodule SymphonyElixir.RunStateStore do
     events = RawEventStore.list_events(trace)
     base_attrs = base_summary_attrs(trace, Keyword.get(opts, :running_entry))
 
+    events =
+      events
+      |> events_for_generation(Keyword.get(opts, :running_entry))
+
     summary_from_events(events, Keyword.merge(opts, base_summary: base_attrs, trace: trace))
   rescue
     _error ->
@@ -161,6 +165,13 @@ defmodule SymphonyElixir.RunStateStore do
       _ -> maybe_put(summary, :last_event_at, events |> List.last() |> Map.get("timestamp") |> parse_datetime())
     end
   end
+
+  defp events_for_generation(events, %{run_instance_id: run_instance_id})
+       when is_binary(run_instance_id) do
+    Enum.filter(events, &(Map.get(&1, "run_instance_id") == run_instance_id))
+  end
+
+  defp events_for_generation(events, _running_entry), do: events
 
   defp hydrate_payload(event, nil), do: event
 

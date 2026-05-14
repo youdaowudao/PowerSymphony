@@ -80,6 +80,54 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Enum.any?(events, &(&1["event_type"] == "retry_scheduled"))
   end
 
+  test "orchestrator retry scheduling trace survives current generation summary filtering" do
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-retry-generation-trace-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    File.mkdir_p!(logs_root)
+
+    issue = %Issue{id: "issue-orch-retry-generation", identifier: "MT-TRACE-GEN", title: "Trace retry generation", state: "In Progress"}
+    trace = RunTrace.start!(issue, logs_root: logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :RetryGenerationTraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    state = :sys.get_state(pid)
+
+    new_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue.id, 1, %{
+        identifier: issue.identifier,
+        error: "boom",
+        run_trace: trace,
+        run_instance_id: "run-current"
+      })
+
+    :sys.replace_state(pid, fn _ -> new_state end)
+
+    summary =
+      SymphonyElixir.RunStateStore.summary_for_running_entry(%{
+        issue: issue,
+        run_trace: trace,
+        run_instance_id: "run-current"
+      })
+
+    assert summary.current_phase == "retry_scheduled"
+    assert summary.current_action == "retry scheduled"
+  end
+
   test "orchestrator traces accepted dispatch and normal worker exit retry flow" do
     logs_root =
       Path.join(
@@ -616,6 +664,131 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              event: :notification,
              message: %{method: "some-event"},
              timestamp: now
+           }
+  end
+
+  test "orchestrator ignores stale generation codex updates and run results" do
+    issue_id = "issue-generation-fence"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-GEN-FENCE",
+      title: "Generation fence",
+      description: "Drop stale worker messages",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-GEN-FENCE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :GenerationFenceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      run_instance_id: "run-current",
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      run_result: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    old_at = DateTime.add(started_at, 1, :second)
+    current_at = DateTime.add(started_at, 2, :second)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         run_instance_id: "run-old",
+         session_id: "thread-old-turn-old",
+         thread_id: "thread-old",
+         turn_id: "turn-old",
+         timestamp: old_at
+       }}
+    )
+
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :failed,
+         reason: :turn_timeout,
+         turn_count: 9,
+         run_instance_id: "run-old"
+       }}
+    )
+
+    stale_state = :sys.get_state(pid)
+    stale_entry = stale_state.running[issue_id]
+    assert stale_entry.session_id == nil
+    assert Map.get(stale_entry, :thread_id) == nil
+    assert Map.get(stale_entry, :turn_id) == nil
+    assert stale_entry.run_result == nil
+    assert stale_entry.turn_count == 0
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         run_instance_id: "run-current",
+         session_id: "thread-current-turn-current",
+         thread_id: "thread-current",
+         turn_id: "turn-current",
+         timestamp: current_at
+       }}
+    )
+
+    send(
+      pid,
+      {:agent_run_result, issue_id,
+       %{
+         status: :completed,
+         reason: :issue_inactive,
+         turn_count: 1,
+         run_instance_id: "run-current"
+       }}
+    )
+
+    current_state = :sys.get_state(pid)
+    current_entry = current_state.running[issue_id]
+    assert current_entry.session_id == "thread-current-turn-current"
+    assert current_entry.thread_id == "thread-current"
+    assert current_entry.turn_id == "turn-current"
+    assert current_entry.turn_count == 1
+
+    assert current_entry.run_result == %{
+             status: :completed,
+             reason: :issue_inactive,
+             turn_count: 1,
+             run_instance_id: "run-current"
            }
   end
 
@@ -1495,7 +1668,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
-  test "orchestrator restarts stalled workers with retry backoff" do
+  test "orchestrator requests cooperative interrupt before retrying stalled workers" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
       codex_stall_timeout_ms: 1_000
@@ -1511,10 +1684,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
+    parent = self()
+
     worker_pid =
       spawn(fn ->
         receive do
-          :done -> :ok
+          {:interrupt_codex_turn, "run-stall-1", :stall_detected} ->
+            send(parent, :stall_worker_interrupted)
+
+            receive do
+              :done -> :ok
+            end
+
+          :done ->
+            :ok
         end
       end)
 
@@ -1523,9 +1706,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     running_entry = %{
       pid: worker_pid,
-      ref: make_ref(),
+      ref: Process.monitor(worker_pid),
       identifier: "MT-STALL",
       issue: %Issue{id: issue_id, identifier: "MT-STALL", state: "In Progress"},
+      run_instance_id: "run-stall-1",
       session_id: "thread-stall-turn-stall",
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
@@ -1541,34 +1725,321 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     send(pid, :tick)
 
-    state =
-      Enum.reduce_while(1..40, nil, fn _, _ ->
-        current_state = :sys.get_state(pid)
+    assert_receive :stall_worker_interrupted, 1_000
 
-        if Map.has_key?(current_state.retry_attempts, issue_id) do
-          {:halt, current_state}
-        else
-          Process.sleep(5)
-          {:cont, nil}
+    state = :sys.get_state(pid)
+
+    assert Process.alive?(worker_pid)
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{
+             release_state: %{
+               status: :stall_interrupt_requested,
+               reason: :stall_detected,
+               retry_metadata: %{
+                 identifier: "MT-STALL",
+                 error: "stalled for " <> _
+               }
+             }
+           } = state.running[issue_id]
+
+    refute Orchestrator.should_dispatch_issue_for_test(running_entry.issue, state)
+  end
+
+  test "stall preserves local ownership until retry convergence" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-stop-gate"
+    orchestrator_name = Module.concat(__MODULE__, :StopGateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    parent = self()
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          {:interrupt_codex_turn, "run-stop-1", :stall_detected} ->
+            send(parent, :worker_interrupted)
+
+            receive do
+              :done -> :ok
+            end
         end
       end)
 
-    assert state, "timed out waiting for stalled worker retry state"
+    on_exit(fn ->
+      if Process.alive?(worker_pid) do
+        Process.exit(worker_pid, :shutdown)
+      end
 
-    refute Process.alive?(worker_pid)
-    refute Map.has_key?(state.running, issue_id)
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    stale_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: Process.monitor(worker_pid),
+      identifier: "MT-STOP-GATE",
+      issue: %Issue{id: issue_id, identifier: "MT-STOP-GATE", state: "In Progress"},
+      run_instance_id: "run-stop-1",
+      session_id: "thread-stop-turn-stop",
+      last_codex_timestamp: stale_at,
+      started_at: stale_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+    end)
+
+    send(pid, :tick)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      received_worker_interrupt? =
+        receive do
+          :worker_interrupted -> true
+        after
+          0 -> false
+        end
+
+      received_worker_interrupt? or
+        not MapSet.member?(state.claimed, issue_id) or Map.has_key?(state.retry_attempts, issue_id)
+    end)
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute Orchestrator.should_dispatch_issue_for_test(running_entry.issue, state)
+  end
+
+  test "stall grace timeout without terminal evidence blocks claim instead of retrying" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      codex_stall_timeout_ms: 10
+    )
+
+    issue_id = "issue-stall-unconfirmed"
+    orchestrator_name = Module.concat(__MODULE__, :StallUnconfirmedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    parent = self()
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          {:interrupt_codex_turn, "run-stall-unconfirmed-1", :stall_detected} ->
+            send(parent, :unconfirmed_worker_interrupted)
+
+            receive do
+              :done -> :ok
+            end
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid) do
+        Process.exit(worker_pid, :shutdown)
+      end
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    stale_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+    issue = %Issue{id: issue_id, identifier: "MT-STALL-UNCONFIRMED", state: "In Progress"}
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: Process.monitor(worker_pid),
+      identifier: issue.identifier,
+      issue: issue,
+      run_instance_id: "run-stall-unconfirmed-1",
+      session_id: "thread-stall-unconfirmed-turn-stall-unconfirmed",
+      last_codex_timestamp: stale_at,
+      started_at: stale_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+    end)
+
+    send(pid, :tick)
+
+    assert_receive :unconfirmed_worker_interrupted, 1_000
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      not Map.has_key?(state.running, issue_id) and
+        Map.has_key?(state.blocked_claims, issue_id) and
+        not Map.has_key?(state.retry_attempts, issue_id)
+    end)
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
 
     assert %{
-             attempt: 1,
-             due_at_ms: due_at_ms,
-             identifier: "MT-STALL",
-             error: "stalled for " <> _
-           } = state.retry_attempts[issue_id]
+             reason: :remote_stop_unconfirmed,
+             identifier: "MT-STALL-UNCONFIRMED",
+             run_instance_id: "run-stall-unconfirmed-1"
+           } = state.blocked_claims[issue_id]
 
-    assert is_integer(due_at_ms)
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 8_000
-    assert remaining_ms <= 10_500
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "stall worker exit without terminal evidence blocks claim instead of retrying" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-stall-exit-unconfirmed"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :StallExitUnconfirmedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    issue = %Issue{id: issue_id, identifier: "MT-STALL-EXIT-UNCONFIRMED", state: "In Progress"}
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      run_instance_id: "run-stall-exit-unconfirmed-1",
+      release_state: %{
+        status: :stall_interrupt_requested,
+        reason: :stall_detected,
+        requested_at: DateTime.utc_now(),
+        retry_metadata: %{
+          next_attempt: 1,
+          identifier: issue.identifier,
+          error: "stalled for 5000ms without codex activity",
+          run_instance_id: "run-stall-exit-unconfirmed-1"
+        }
+      },
+      turn_terminal_seen?: false,
+      session_id: "thread-stall-exit-turn-stall-exit",
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+    end)
+
+    send(pid, {:DOWN, ref, :process, worker_pid, :shutdown})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      not Map.has_key?(state.running, issue_id) and
+        Map.has_key?(state.blocked_claims, issue_id) and
+        not Map.has_key?(state.retry_attempts, issue_id)
+    end)
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             reason: :remote_stop_unconfirmed,
+             identifier: "MT-STALL-EXIT-UNCONFIRMED",
+             run_instance_id: "run-stall-exit-unconfirmed-1"
+           } = state.blocked_claims[issue_id]
+  end
+
+  test "retry dispatch does not bypass blocked local ownership gate" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    issue = %Issue{
+      id: "issue-retry-blocked-gate",
+      identifier: "MT-RETRY-BLOCKED-GATE",
+      title: "Retry blocked gate",
+      description: "Retry callback must not bypass blocked local claim",
+      state: "In Progress",
+      labels: []
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :RetryBlockedGateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    retry_token = make_ref()
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.new([issue.id]))
+      |> Map.put(:blocked_claims, %{
+        issue.id => %{
+          attempt: 1,
+          identifier: issue.identifier,
+          reason: :remote_stop_unconfirmed,
+          issue: issue,
+          run_instance_id: "run-retry-blocked-gate-1"
+        }
+      })
+      |> Map.put(:retry_attempts, %{
+        issue.id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: issue.identifier,
+          error: "blocked claim should gate retry",
+          run_instance_id: "run-retry-blocked-gate-1"
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue.id, retry_token})
+    Process.sleep(50)
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue.id)
+    assert MapSet.member?(state.claimed, issue.id)
+    assert Map.has_key?(state.blocked_claims, issue.id)
+    assert %{attempt: 2, retry_token: new_retry_token} = state.retry_attempts[issue.id]
+    refute new_retry_token == retry_token
   end
 
   test "status dashboard renders offline marker to terminal" do
