@@ -1640,10 +1640,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha")
-    assert html =~ "No run summaries available."
-    assert html =~ "worker port: n/a"
-    assert html =~ "last seen: n/a"
-    assert html =~ "last error: n/a"
+    {:ok, document} = Floki.parse_document(html)
+
+    assert project_section_texts(document, "Project summary") |> Enum.member?("worker port: n/a")
+    assert project_section_texts(document, "Project summary") |> Enum.member?("last seen: n/a")
+    assert project_section_texts(document, "Project summary") |> Enum.member?("last error: n/a")
+    assert run_summaries_empty_state_text(document) == "No run summaries available."
   end
 
   test "project detail page renders empty run action text as n/a" do
@@ -1686,10 +1688,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              {"article", _, _} = article
            ] = Floki.find(document, "article.section-card")
 
-    article_html = Floki.raw_html(article)
-    assert article_html =~ "MT-ALPHA-1"
-    assert article_html =~ "Alpha task"
-    assert article_html =~ "<p class=\"mono\">n/a</p>"
+    assert Floki.text(article) =~ "MT-ALPHA-1"
+    assert Floki.text(article) =~ "Alpha task"
+    assert article_mono_texts(article) |> Enum.member?("n/a")
   end
 
   test "run deep view renders summary fields and skeleton sections without heavy content by default" do
@@ -1805,7 +1806,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
     {:ok, document} = Floki.parse_document(html)
 
-    assert html =~ "state-badge state-badge-active"
+    assert [
+             {"span", attributes, _}
+           ] = Floki.find(document, "header.hero-card div.status-stack span.state-badge")
+
+    assert attributes |> Enum.into(%{}) |> Map.fetch!("class") =~ "state-badge-active"
     assert summary_row_text(document, "linear_state") == "linear_state: running"
     assert summary_row_text(document, "current_phase") == "current_phase: n/a"
     assert summary_row_text(document, "current_action") == "current_action: n/a"
@@ -2910,11 +2915,57 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp summary_row_text(document, label) do
     document
-    |> Floki.find("section.section-card p")
+    |> find_section_by_title("Summary")
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.mono")
+    end)
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.replace(&1, ~r/\s*:\s*/, ": "))
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&String.starts_with?(&1, "#{label}:"))
+  end
+
+  defp project_section_texts(document, title) do
+    document
+    |> find_section_by_title(title)
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.mono")
+    end)
     |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
     |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
     |> Enum.map(&String.trim/1)
-    |> Enum.find(&(String.starts_with?(&1, "#{label}:")))
+  end
+
+  defp run_summaries_empty_state_text(document) do
+    document
+    |> find_section_by_title("Run summaries")
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.empty-state")
+    end)
+    |> Floki.text()
+    |> String.trim()
+  end
+
+  defp find_section_by_title(document, title) do
+    document
+    |> Floki.find("section.section-card")
+    |> Enum.find(fn section ->
+      Floki.find(section, "h2.section-title")
+      |> Floki.text()
+      |> String.trim() == title
+    end)
+  end
+
+  defp article_mono_texts(article) do
+    article
+    |> Floki.find("p.mono")
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.trim/1)
   end
 
   defp fake_worker_builder(modes) do
