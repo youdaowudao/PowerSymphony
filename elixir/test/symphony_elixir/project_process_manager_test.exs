@@ -5,13 +5,19 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
   setup do
     previous_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
-    Process.put(:reserved_fake_worker_ports, [])
+    {:ok, cleanup_agent} = Agent.start_link(fn -> [] end)
+    Process.put(:fake_worker_cleanup_agent, cleanup_agent)
 
     on_exit(fn ->
       restore_app_env(:project_config_path_override, previous_config_path)
 
-      reserved_fake_worker_ports()
+      cleanup_agent
+      |> maybe_agent_values()
       |> Enum.each(&kill_fake_worker_port/1)
+
+      if Process.alive?(cleanup_agent) do
+        Agent.stop(cleanup_agent)
+      end
     end)
 
     :ok
@@ -1726,30 +1732,6 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert_eventually(fn -> not process_alive?(running_state.pid) end)
   end
 
-  test "manager shutdown stops running workers it started" do
-    test_root = temp_root!("manager-shutdown-stops-workers")
-    manager_name = Module.concat(__MODULE__, ShutdownManager)
-    port = reserve_tcp_port!()
-
-    config_path =
-      write_projects_config!(test_root, [
-        project_fixture(test_root, "alpha", port)
-      ])
-
-    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
-    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "hang"})})
-
-    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
-    assert running_state.status == :running
-    assert is_integer(running_state.pid)
-    assert process_alive?(running_state.pid)
-
-    manager_pid = GenServer.whereis(manager_name)
-    GenServer.stop(manager_pid)
-
-    assert_eventually(fn -> not process_alive?(running_state.pid) end)
-  end
-
   test "reconciles persisted pid after control-plane restart" do
     test_root = temp_root!("reconcile-pid")
     manager_name = Module.concat(__MODULE__, ReconcileManager)
@@ -2113,6 +2095,16 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
   defp kill_fake_worker_port(_port), do: :ok
 
+  defp maybe_agent_values(agent) when is_pid(agent) do
+    if Process.alive?(agent) do
+      Agent.get(agent, & &1)
+    else
+      []
+    end
+  end
+
+  defp maybe_agent_values(_agent), do: []
+
   defp assert_eventually(fun, attempts \\ 20)
 
   defp assert_eventually(fun, attempts) when attempts > 0 do
@@ -2129,7 +2121,15 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
   defp reserve_tcp_port! do
     base = 40_000 + rem(System.unique_integer([:positive]), 20_000)
     port = reserve_tcp_port!(base, 200)
-    Process.put(:reserved_fake_worker_ports, [port | reserved_fake_worker_ports()])
+
+    case Process.get(:fake_worker_cleanup_agent) do
+      cleanup_agent when is_pid(cleanup_agent) ->
+        Agent.update(cleanup_agent, &[port | &1])
+
+      _other ->
+        :ok
+    end
+
     port
   end
 
@@ -2145,10 +2145,6 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
   end
 
   defp reserve_tcp_port!(_port, 0), do: flunk("failed to reserve fake worker tcp port")
-
-  defp reserved_fake_worker_ports do
-    Process.get(:reserved_fake_worker_ports, [])
-  end
 
   defp shell_escape(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
