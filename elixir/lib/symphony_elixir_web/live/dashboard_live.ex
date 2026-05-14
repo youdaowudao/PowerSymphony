@@ -339,10 +339,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </button>
           </div>
 
+          <% workflow_result = Map.get(@m3_precheck_results, workflow_m3_project_id(), %{}) %>
           <details class="session-stack" open>
             <summary>M3-0 预检</summary>
-            <.m3_precheck_result result={Map.get(@m3_precheck_results, workflow_m3_project_id(), %{})} />
-            <p :if={m3_result_unavailable?(Map.get(@m3_precheck_results, workflow_m3_project_id(), %{}))} class="empty-state">
+            <.m3_precheck_result :if={not m3_result_unavailable?(workflow_result)} result={workflow_result} />
+            <p :if={m3_result_unavailable?(workflow_result)} class="empty-state">
               尚未运行。点击“运行预检”查看当前 Todo 池放行、容量排队、阻塞与异常判断。
             </p>
           </details>
@@ -490,7 +491,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp m3_precheck_result(assigns) do
     ~H"""
     <div class="session-stack">
-      <p class="mono">
+      <p :if={m3_result_has_payload?(@result)} class="mono">
         <%= "可放行 #{length(m3_issue_entries(@result, :eligible_todos))}" %>
         ·
         <%= "容量排队 #{length(m3_issue_entries(@result, :capacity_queued_todos))}" %>
@@ -504,53 +505,53 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <%= "异常 #{length(m3_anomalies(@result))}" %>
       </p>
 
-      <section :if={m3_issue_entries(@result, :eligible_todos) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_issue_entries(@result, :eligible_todos) != []} class="session-stack">
         <p class="issue-id">可放行 Todo</p>
         <p :for={entry <- m3_issue_entries(@result, :eligible_todos)} class="mono">
           <%= m3_issue_label(entry) %>
         </p>
       </section>
 
-      <section :if={m3_blocked_entries(@result) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_blocked_entries(@result) != []} class="session-stack">
         <p class="issue-id">依赖阻塞</p>
         <p :for={{issue_identifier, reasons} <- m3_blocked_entries(@result)} class="mono">
           <%= issue_identifier %>: <%= Enum.join(reasons, "; ") %>
         </p>
       </section>
 
-      <section :if={m3_issue_entries(@result, :capacity_queued_todos) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_issue_entries(@result, :capacity_queued_todos) != []} class="session-stack">
         <p class="issue-id">容量排队</p>
         <p :for={entry <- m3_issue_entries(@result, :capacity_queued_todos)} class="mono">
           <%= m3_issue_label(entry) %>
         </p>
       </section>
 
-      <section :if={m3_issue_entries(@result, :dispatched_todos) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_issue_entries(@result, :dispatched_todos) != []} class="session-stack">
         <p class="issue-id">本轮已派发</p>
         <p :for={entry <- m3_issue_entries(@result, :dispatched_todos)} class="mono">
           <%= m3_issue_label(entry) %>
         </p>
       </section>
 
-      <section :if={m3_current_work_entries(@result) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_current_work_entries(@result) != []} class="session-stack">
         <p class="issue-id">当前执行中</p>
         <p :for={entry <- m3_current_work_entries(@result)} class="mono">
           <%= m3_issue_label(entry) %><%= m3_worker_host_suffix(entry) %>
         </p>
       </section>
 
-      <section :if={m3_anomalies(@result) != []} class="session-stack">
+      <section :if={m3_result_has_payload?(@result) and m3_anomalies(@result) != []} class="session-stack">
         <p class="issue-id">异常执行态</p>
         <p :for={anomaly <- m3_anomalies(@result)} class="mono">
           <%= m3_issue_label(anomaly) %><%= m3_anomaly_blockers_suffix(anomaly) %>
         </p>
       </section>
 
-      <p :if={m3_result_empty?(@result) and is_binary(m3_result_text(@result)) and m3_result_text(@result) != ""} class="mono">
+      <p :if={not m3_result_has_payload?(@result) and is_binary(m3_result_text(@result)) and m3_result_text(@result) != ""} class="mono">
         <%= m3_result_text(@result) %>
       </p>
 
-      <p :if={m3_result_empty?(@result) and m3_result_text(@result) in [nil, ""]} class="mono">(none)</p>
+      <p :if={m3_result_has_payload?(@result) and m3_result_empty?(@result) and m3_result_text(@result) in [nil, ""]} class="mono">(none)</p>
     </div>
     """
   end
@@ -783,6 +784,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
       m3_current_work_entries(result) == [] and
       m3_anomalies(result) == []
   end
+
+  defp m3_result_has_payload?(result) when is_map(result) do
+    Map.has_key?(result, :generated_at) or
+      Map.has_key?(result, "generated_at") or
+      Map.has_key?(result, :m3_enabled) or
+      Map.has_key?(result, "m3_enabled")
+  end
+
+  defp m3_result_has_payload?(_result), do: false
 
   defp m3_result_unavailable?(result) do
     m3_result_empty?(result) and
