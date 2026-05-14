@@ -17,6 +17,7 @@ defmodule SymphonyElixir.Orchestrator do
   @checking_recheck_delay_type :checking_recheck
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @inert_startup_mode_sentinel {__MODULE__, :inert_startup_mode}
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -64,14 +65,26 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
+    reject_internal_startup_mode_option!(opts)
     name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    GenServer.start_link(__MODULE__, Keyword.delete(opts, :startup_mode), name: name)
+  end
+
+  if Code.ensure_loaded?(Mix) and Mix.env() == :test do
+    @doc false
+    @spec start_inert_for_test(keyword()) :: GenServer.on_start()
+    def start_inert_for_test(opts \\ []) do
+      name = Keyword.get(opts, :name, __MODULE__)
+      opts = Keyword.put(opts, :startup_mode, @inert_startup_mode_sentinel)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+    startup_mode = parse_startup_mode!(opts)
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -84,10 +97,46 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
-    state = schedule_tick(state, 0)
+    state =
+      case startup_mode do
+        :inert ->
+          state
+
+        _ ->
+          run_terminal_workspace_cleanup()
+          schedule_tick(state, 0)
+      end
 
     {:ok, state}
+  end
+
+  defp reject_internal_startup_mode_option!(opts) when is_list(opts) do
+    if Keyword.has_key?(opts, :startup_mode) do
+      raise ArgumentError, "startup_mode is reserved for internal test helpers"
+    end
+  end
+
+  defp reject_internal_startup_mode_option!(_opts), do: :ok
+
+  if Code.ensure_loaded?(Mix) and Mix.env() == :test do
+    defp parse_startup_mode!(opts) when is_list(opts) do
+      case Keyword.get(opts, :startup_mode, :active) do
+        :active -> :active
+        @inert_startup_mode_sentinel -> :inert
+        other -> raise ArgumentError, "invalid startup mode: #{inspect(other)}"
+      end
+    end
+  else
+    defp parse_startup_mode!(opts) when is_list(opts) do
+      case Keyword.get(opts, :startup_mode, :active) do
+        :active -> :active
+        other -> raise ArgumentError, "invalid startup mode: #{inspect(other)}"
+      end
+    end
+  end
+
+  defp parse_startup_mode!(opts) do
+    raise ArgumentError, "orchestrator init expects keyword opts, got: #{inspect(opts)}"
   end
 
   @impl true

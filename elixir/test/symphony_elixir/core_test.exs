@@ -220,6 +220,132 @@ defmodule SymphonyElixir.CoreTest do
     assert Workflow.workflow_file_path() == app_workflow_path
   end
 
+  test "orchestrator inert start skips startup cleanup and initial poll scheduling" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    orchestrator_name = Module.concat(__MODULE__, :InertStartupOrchestrator)
+    pid = nil
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-inert-startup-#{System.unique_integer([:positive])}"
+      )
+
+    closed_identifier = "MT-STARTUP-CLEANUP"
+    closed_workspace = Path.join(test_root, closed_identifier)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-startup-cleanup", identifier: closed_identifier, state: "Closed", labels: []}
+    ])
+
+    try do
+      File.mkdir_p!(closed_workspace)
+      {:ok, pid} = start_inert_orchestrator(orchestrator_name)
+
+      state = :sys.get_state(pid)
+
+      refute state.poll_check_in_progress
+      assert state.tick_timer_ref == nil
+      assert state.tick_token == nil
+      assert File.exists?(closed_workspace)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+
+      if is_pid(pid) and Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end
+  end
+
+  test "orchestrator active start performs startup cleanup and enters startup poll flow" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    orchestrator_name = Module.concat(__MODULE__, :ActiveStartupOrchestrator)
+    pid = nil
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-active-startup-#{System.unique_integer([:positive])}"
+      )
+
+    closed_identifier = "MT-ACTIVE-STARTUP"
+    closed_workspace = Path.join(test_root, closed_identifier)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      poll_interval_ms: 30_000,
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: "issue-active-startup", identifier: closed_identifier, state: "Closed", labels: []}
+    ])
+
+    try do
+      File.mkdir_p!(closed_workspace)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      assert_eventually(
+        fn ->
+          state = :sys.get_state(pid)
+
+          not File.exists?(closed_workspace) and
+            state.poll_check_in_progress == true and
+            state.next_poll_due_at_ms == nil and
+            state.tick_timer_ref == nil and
+            state.tick_token == nil
+        end,
+        40,
+        2
+      )
+
+      assert_eventually(
+        fn ->
+          state = :sys.get_state(pid)
+
+          next_poll_due_in_ms =
+            case state.next_poll_due_at_ms do
+              due_at_ms when is_integer(due_at_ms) ->
+                due_at_ms - System.monotonic_time(:millisecond)
+
+              _ ->
+                nil
+            end
+
+          not File.exists?(closed_workspace) and
+            state.poll_check_in_progress == false and
+            is_reference(state.tick_timer_ref) and
+            is_reference(state.tick_token) and
+            is_integer(state.next_poll_due_at_ms) and
+            is_integer(next_poll_due_in_ms) and
+            next_poll_due_in_ms > 20_000
+        end,
+        40
+      )
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+
+      if is_pid(pid) and Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end
+  end
+
+  test "orchestrator public start_link rejects reserved startup_mode option" do
+    assert_raise ArgumentError, ~r/startup_mode is reserved for internal test helpers/, fn ->
+      Orchestrator.start_link(name: Module.concat(__MODULE__, :RejectedStartupModeOrchestrator), startup_mode: :active)
+    end
+  end
+
   test "workflow load accepts prompt-only files without front matter" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
     File.write!(workflow_path, "Prompt only\n")
@@ -429,7 +555,7 @@ defmodule SymphonyElixir.CoreTest do
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
       orchestrator_name = Module.concat(__MODULE__, :MissingRunningIssueOrchestrator)
-      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
       on_exit(fn ->
         restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -635,7 +761,7 @@ defmodule SymphonyElixir.CoreTest do
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
     orchestrator_name = Module.concat(__MODULE__, :TodoRollbackOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -755,7 +881,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -807,7 +933,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-run-complete"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CompletedRunOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -846,7 +972,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-run-reopen"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CompletedRunReopenOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -893,7 +1019,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-run-continue"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :RunResultContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1083,7 +1209,7 @@ defmodule SymphonyElixir.CoreTest do
       }
     ])
 
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -1165,7 +1291,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-crash"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1207,7 +1333,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-crash-initial"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1245,7 +1371,7 @@ defmodule SymphonyElixir.CoreTest do
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1380,6 +1506,10 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp start_inert_orchestrator(name) do
+    Orchestrator.start_inert_for_test(name: name)
+  end
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
@@ -3042,7 +3172,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-run-failed-closeout"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :FailedRunCloseoutOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -3096,7 +3226,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-run-timeout-closeout"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :TimeoutRunCloseoutOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -3156,7 +3286,7 @@ defmodule SymphonyElixir.CoreTest do
       }
     ])
 
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -3253,7 +3383,7 @@ defmodule SymphonyElixir.CoreTest do
       }
     ])
 
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -3300,7 +3430,7 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -3367,7 +3497,7 @@ defmodule SymphonyElixir.CoreTest do
       }
     ])
 
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
@@ -3480,7 +3610,7 @@ defmodule SymphonyElixir.CoreTest do
     ])
 
     File.mkdir_p!(Path.join(test_root, issue_identifier))
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
