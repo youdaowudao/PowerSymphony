@@ -193,18 +193,9 @@ defmodule SymphonyElixirWeb.Presenter do
   def project_run_summary_runtime(summary) when is_map(summary) do
     parts =
       [
-        case map_integer_value(summary, :turn_count) do
-          value when is_integer(value) -> "#{value} turns"
-          _ -> nil
-        end,
-        case map_value(summary, :last_event_at) do
-          value when is_binary(value) and value != "" -> "last event #{value}"
-          _ -> nil
-        end,
-        case map_integer_value(summary, :run_duration_seconds) do
-          value when is_integer(value) -> "#{value}s"
-          _ -> nil
-        end
+        run_turn_count_text(summary),
+        run_last_event_text(summary),
+        run_duration_text(summary)
       ]
       |> Enum.filter(&is_binary/1)
 
@@ -342,6 +333,27 @@ defmodule SymphonyElixirWeb.Presenter do
   defp summary_text(summary, key, label) do
     case map_value(summary, key) do
       value when is_binary(value) and value != "" -> "#{label} #{value}"
+      _ -> nil
+    end
+  end
+
+  defp run_turn_count_text(summary) do
+    case map_integer_value(summary, :turn_count) do
+      value when is_integer(value) -> "#{value} turns"
+      _ -> nil
+    end
+  end
+
+  defp run_last_event_text(summary) do
+    case map_value(summary, :last_event_at) do
+      value when is_binary(value) and value != "" -> "last event #{value}"
+      _ -> nil
+    end
+  end
+
+  defp run_duration_text(summary) do
+    case map_integer_value(summary, :run_duration_seconds) do
+      value when is_integer(value) -> "#{value}s"
       _ -> nil
     end
   end
