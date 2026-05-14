@@ -243,6 +243,10 @@ If command output is in English, keep the original output first, then add a brie
 - Treat `## Scope Snapshot` as a stable summary of scope, not as the latest human instruction channel.
 - Treat `## Execution Brief` as the last execution handoff summary only. It is not a mirror of the Linear state machine.
 - Use `## Codex Workpad` as the main execution record inside the issue body when normal execution is active.
+- Treat understanding the requirement, forming the implementation plan, splitting tasks/subtasks, defining validation, and bounding dependencies and implementation edges as the required document phase before any coding.
+- For any run that intends to edit repository files, complete the document-phase evaluation gate before coding and keep its result recorded in `## Codex Workpad`.
+- The document-phase evaluation gate applies only to normal execution that is preparing to enter coding.
+- It does not apply to preflight-only `reply-only`, `no-op`, `read-only`, or `unclear` routing, pure status or closeout operations, the bounded `Checking` recheck lane, pure waiting in `Human Review`, `Merging`, or `Done`.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
 - Keep the stable task panel current, but do not push every intermediate judgment into high-level issue-body sections.
@@ -310,6 +314,38 @@ Step 0 may only run after the preflight body gate has classified the run as `exe
    - add only the minimum missing execution sections when no equivalent section already exists
    - only then begin analysis, planning, validation, or implementation work
 6. If state and issue-body content are inconsistent, update only the minimal high-level execution summary with verified facts, then proceed with the safest flow.
+
+## Document-phase evaluation gate (required before coding)
+
+This gate applies after preflight and before the run enters coding.
+
+- This gate applies only after the preflight body gate has classified the run as `execute` and the main thread is preparing to start coding.
+- Do not start coding until the document-phase evaluation gate has completed with a final `proceed`.
+- It covers requirement reading, implementation planning, task/subtask splitting, validation design, and boundary/dependency checks.
+- Use exactly two lanes: `Small change` and `Large change`.
+- Keep the split stable and simple by reusing the existing small-change posture:
+  - `Small change` only when all of the following stay true: the delta touches no more than 2 files; it does not add or remove public interfaces, config keys, data structures, workflow states, or cross-module dependencies; it does not touch concurrency, security, permissions, retries, persistence, startup flow, or other high-risk paths; and targeted or local validation can directly prove correctness.
+  - If the change does not clearly qualify as `Small change`, classify it as `Large change`.
+- If new facts discovered during the document phase show that the work no longer fits `Small change`, immediately promote it to `Large change`.
+- Once promoted to `Large change`, the run must finish that lane before coding. It may not fall back to "no assessment, direct coding."
+- `Small change` uses exactly 1 read-only analysis subagent.
+- `Large change` uses exactly 2 read-only analysis subagents in a lightweight red/blue review.
+- In the `Small change` lane, dispatch that subagent to review the first-pass plan/task independently.
+- In the `Large change` lane, dispatch those subagents into a lightweight red/blue review.
+- The blue side argues the current route can proceed. The red side challenges scope, assumptions, risks, and missing validation.
+- Read-only analysis subagents must not write code, edit files, change requirements, update Linear, or expand scope.
+- They are limited to pre-implementation analysis and must not create or close PRs on their own.
+- Fixed output vocabulary:
+  - `proceed`
+  - `revise`
+  - `escalate`
+- `proceed` means the current plan/task split and validation route are sufficiently clear and bounded for coding.
+- `revise` means the route is close but incomplete; the main thread must revise the plan/task and run the same evaluation lane again.
+- `escalate` means the route is unsafe, under-specified, or crossing the current lane's boundary.
+- In the `Small change` lane, `escalate` promotes the run to the `Large change` lane immediately.
+- If a second `Small change` pass still does not end in `proceed`, promote it to `Large change`.
+- In the `Large change` lane, any remaining `escalate`, or a second pass that still does not end in `proceed`, must stop before coding and escalate.
+- If the required read-only analysis subagents cannot be dispatched in the current environment, stop before coding and report the blocker.
 
 ## Step 1: Start/continue execution (Todo or In Progress)
 
@@ -398,7 +434,12 @@ Use this only when completion is blocked by missing required tools or missing au
 2. If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
 3. Load the existing issue-body snapshot, preserve the stable human-authored task definition, and treat `## Codex Workpad` as the active execution checklist.
    - Edit it whenever reality changes (scope, risks, validation approach, discovered tasks).
-4. Implement against the hierarchical TODOs and keep the execution record current:
+4. Classify the planned delta as `Small change` or `Large change` before any code edits.
+   - Run the document-phase evaluation gate before any code edits.
+   - Only after a final `proceed` may the run continue from document-phase planning into coding.
+   - `revise` requires plan updates and a fresh evaluation pass before coding.
+   - `escalate` requires either promotion to `Large change` within scope or a blocker/handoff stop.
+5. Implement against the hierarchical TODOs and keep the execution record current:
    - Check off completed items.
    - Add newly discovered items in the appropriate section.
    - Keep the existing human-authored task definition intact as scope evolves.
@@ -406,26 +447,26 @@ Use this only when completion is blocked by missing required tools or missing au
    - Update `## Execution Brief`, `## Review Summary`, and `## Blockers` only when their high-level conclusions actually change.
    - Never leave completed work unchecked in the plan.
    - For tickets that started as `Todo` with an attached PR, run the full PR feedback sweep protocol immediately after kickoff and before new feature work.
-5. Run validation or tests required for the scope.
+6. Run validation or tests required for the scope.
    - Mandatory gate: execute all ticket-provided `Validation`, `Test Plan`, or `Testing` requirements when present; treat unmet items as incomplete work.
    - Prefer a targeted proof that directly demonstrates the behavior you changed.
    - You may make temporary local proof edits to validate assumptions when this increases confidence.
    - Revert every temporary proof edit before commit or push.
    - Document these temporary proof steps and outcomes in `## Codex Workpad > Validation` or `Notes`.
    - If app-touching, run `launch-app` validation and capture or upload media before handoff.
-6. Re-check all completion criteria and close any gaps.
-7. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8. Attach PR URL to the issue (prefer attachment; use the issue body only if attachment is unavailable).
+7. Re-check all completion criteria and close any gaps.
+8. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
+9. Attach PR URL to the issue (prefer attachment; use the issue body only if attachment is unavailable).
    - Ensure the GitHub PR has label `symphony` (add it if missing).
    - Immediately after PR creation or branch-update push succeeds, attempt to enable auto-merge for the current PR before reading checks, mergeability, or other closeout signals.
    - If the auto-merge attempt fails for any reason other than `already enabled` or `clean status`, record that exact failure in the PR or issue comment stream and preserve manual merge only as an explicit fallback after latest head SHA required checks are green.
-9. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
-10. Update the execution sections with final checklist status and validation notes.
+10. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
+11. Update the execution sections with final checklist status and validation notes.
    - Mark completed items in `## Acceptance Criteria` and `## Codex Workpad` as checked.
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
-11. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
+12. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm that the latest PR create/update push already triggered an immediate auto-merge attempt; do not defer that attempt until after checks are read.
@@ -439,19 +480,19 @@ Use this only when completion is blocked by missing required tools or missing au
    - If the bounded pass succeeds and auto-merge is active, move to `Checking` and stop this implementation run.
    - If the bounded pass succeeds, the latest auto-merge attempt reported clean status, and latest head SHA required checks are green, manual merge may proceed as the documented fallback without first treating clean status as a blocker.
    - Refresh `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, `## Blockers`, and `## Codex Workpad` so they reflect the completed work accurately.
-12. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
+13. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
    - Exception: if blocked by missing required non-GitHub tools or auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-13. For `Todo` tickets that already had a PR attached at kickoff:
+14. For `Todo` tickets that already had a PR attached at kickoff:
    - Ensure all existing PR feedback was reviewed and resolved, including inline review comments.
    - Ensure branch was pushed with any required updates.
    - Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists.
-14. Add a short issue comment only at a significant external checkpoint:
+15. Add a short issue comment only at a significant external checkpoint:
    - entering `Human Review`,
    - a true blocker requiring human action,
    - a completed rework pass after review feedback,
    - or final completion when a short thread-visible note is useful.
    Keep these comments brief and never use them as the sole source of current instructions or progress state.
-15. Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff.
+16. Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff.
 
 ## Step 3: Human Review and merge handling
 
