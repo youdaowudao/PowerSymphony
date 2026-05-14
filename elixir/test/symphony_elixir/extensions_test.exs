@@ -2892,7 +2892,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute Map.has_key?(project, "shell_output")
   end
 
-
   defp assert_validation_errors_shape(actual, expected) do
     assert length(actual) == length(expected)
 
