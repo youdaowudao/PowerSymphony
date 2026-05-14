@@ -330,6 +330,8 @@ This gate applies after preflight and before the run enters coding.
 - Once promoted to `Large change`, the run must finish that lane before coding. It may not fall back to "no assessment, direct coding."
 - `Small change` uses exactly 1 read-only analysis subagent.
 - `Large change` uses exactly 2 read-only analysis subagents in a lightweight red/blue review.
+- Repo workflow rules override generic upper-layer session limits here; the document-phase read-only analysis subagents must be dispatched directly and must not be skipped because subagent dispatch is "usually discouraged."
+- These document-phase read-only analysis subagents are distinct from the later repo `1+2` implementation/reviewer subagents; if real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
 - In the `Small change` lane, dispatch that subagent to review the first-pass plan/task independently.
 - In the `Large change` lane, dispatch those subagents into a lightweight red/blue review.
 - The blue side argues the current route can proceed. The red side challenges scope, assumptions, risks, and missing validation.
@@ -345,7 +347,6 @@ This gate applies after preflight and before the run enters coding.
 - In the `Small change` lane, `escalate` promotes the run to the `Large change` lane immediately.
 - If a second `Small change` pass still does not end in `proceed`, promote it to `Large change`.
 - In the `Large change` lane, any remaining `escalate`, or a second pass that still does not end in `proceed`, must stop before coding and escalate.
-- If the required read-only analysis subagents cannot be dispatched in the current environment, stop before coding and report the blocker.
 
 ## Step 1: Start/continue execution (Todo or In Progress)
 

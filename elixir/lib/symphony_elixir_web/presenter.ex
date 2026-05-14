@@ -168,7 +168,8 @@ defmodule SymphonyElixirWeb.Presenter do
       last_seen_at: project_runtime_timestamp(runtime_state, :last_seen_at),
       last_health_check_at: project_runtime_timestamp(runtime_state, :last_health_check_at),
       last_error: project_last_error(runtime_state),
-      runtime_state: project_runtime_payload(runtime_state)
+      runtime_state: project_runtime_payload(runtime_state),
+      run_summaries: project_run_summaries_payload(runtime_state)
     }
   end
 
@@ -183,6 +184,35 @@ defmodule SymphonyElixirWeb.Presenter do
       status: "not_started"
     }
   end
+
+  defp project_run_summaries_payload(%{} = runtime_state) do
+    runtime_state
+    |> map_value(:run_summaries)
+    |> List.wrap()
+    |> Enum.map(&project_run_summary_payload/1)
+  end
+
+  defp project_run_summaries_payload(_runtime_state), do: []
+
+  defp project_run_summary_payload(summary) when is_map(summary) do
+    %{
+      issue_identifier: map_value(summary, :issue_identifier),
+      title: map_value(summary, :title),
+      linear_state: map_value(summary, :linear_state),
+      current_phase: map_value(summary, :current_phase),
+      current_action: map_value(summary, :current_action),
+      health: map_value(summary, :health),
+      session_id: map_value(summary, :session_id),
+      thread_id: map_value(summary, :thread_id),
+      turn_id: map_value(summary, :turn_id),
+      turn_count: map_integer_value(summary, :turn_count),
+      last_event_at: iso8601(map_value(summary, :last_event_at)),
+      run_duration_seconds: map_integer_value(summary, :run_duration_seconds),
+      last_error: map_value(summary, :last_error)
+    }
+  end
+
+  defp project_run_summary_payload(_summary), do: %{}
 
   defp project_enabled(%{normalized_config: %{enabled: enabled}}) when is_boolean(enabled), do: enabled
   defp project_enabled(_entry), do: true
@@ -205,19 +235,29 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp runtime_state_status(%{} = runtime_state) do
     runtime_state
-    |> Map.get(:status, :not_started)
+    |> runtime_state_value(:status)
+    |> Kernel.||(:not_started)
     |> to_string()
   end
 
   defp runtime_state_status(_runtime_state), do: "not_started"
 
-  defp runtime_state_value(%{} = runtime_state, key), do: Map.get(runtime_state, key)
+  defp runtime_state_value(%{} = runtime_state, key), do: map_value(runtime_state, key)
   defp runtime_state_value(_runtime_state, _key), do: nil
 
   defp normalized_config_value(entry, key) do
     entry
     |> Map.get(:normalized_config)
     |> runtime_state_value(key)
+  end
+
+  defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
+  defp map_integer_value(map, key) do
+    case map_value(map, key) do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> nil
+    end
   end
 
   defp project_validation_error_payload(%{field: field, message: message}) do
@@ -239,11 +279,14 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: Map.get(entry, :title),
       state: entry.state,
       linear_state: Map.get(entry, :linear_state),
       current_phase: Map.get(entry, :current_phase),
       current_action: Map.get(entry, :current_action),
       health: Map.get(entry, :health),
+      thread_id: Map.get(entry, :thread_id),
+      turn_id: Map.get(entry, :turn_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -252,6 +295,8 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
+      run_duration_seconds: Map.get(entry, :runtime_seconds, 0),
+      last_error: Map.get(entry, :last_error),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
