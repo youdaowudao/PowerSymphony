@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import asyncio
 import json
-import random
 import re
+import shlex
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 POLL_SECONDS = 10
@@ -15,8 +17,8 @@ CODEX_BOTS = {
     "codex-gc-app[bot]",
     "app/codex-gc-app",
 }
-MAX_GH_RETRIES = 5
-BASE_GH_BACKOFF_SECONDS = 2
+SCRIPT_DIR = Path(__file__).resolve().parent
+GITHUB_API_SCRIPT = SCRIPT_DIR.parent / "github_api.py"
 
 
 @dataclass
@@ -36,39 +38,30 @@ def is_rate_limit_error(error: str) -> bool:
     return "HTTP 429" in error or "rate limit" in error.lower()
 
 
-async def run_gh(*args: str) -> str:
-    max_delay = BASE_GH_BACKOFF_SECONDS * (2 ** (MAX_GH_RETRIES - 1))
-    delay_seconds = BASE_GH_BACKOFF_SECONDS
-    last_error = "gh command failed"
-    for attempt in range(1, MAX_GH_RETRIES + 1):
-        proc = await asyncio.create_subprocess_exec(
-            "gh",
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            return stdout.decode()
-        error = stderr.decode().strip() or "gh command failed"
-        if not is_rate_limit_error(error):
-            raise RuntimeError(error)
-        last_error = error
-        if attempt >= MAX_GH_RETRIES:
-            break
-        jitter = random.uniform(0, delay_seconds)
-        await asyncio.sleep(min(delay_seconds + jitter, max_delay))
-        delay_seconds = min(delay_seconds * 2, max_delay)
-    raise RateLimitError(last_error)
+async def run_github_helper(*args: str) -> str:
+    python = shutil.which("python3")
+    if python is None:
+        raise RuntimeError("python3 is required to run GitHub helper")
+
+    proc = await asyncio.create_subprocess_exec(
+        python,
+        str(GITHUB_API_SCRIPT),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode == 0:
+        return stdout.decode()
+    error = stderr.decode().strip() or "github helper command failed"
+    if is_rate_limit_error(error):
+        raise RateLimitError(error)
+    quoted = " ".join(shlex.quote(part) for part in args)
+    raise RuntimeError(f"{error} (command: github_api.py {quoted})")
 
 
 async def get_pr_info() -> PrInfo:
-    data = await run_gh(
-        "pr",
-        "view",
-        "--json",
-        "number,url,headRefOid,mergeable,mergeStateStatus",
-    )
+    data = await run_github_helper("current-pr")
     parsed = json.loads(data)
     return PrInfo(
         number=parsed["number"],
@@ -80,85 +73,40 @@ async def get_pr_info() -> PrInfo:
 
 
 async def get_paginated_list(endpoint: str) -> list[dict[str, Any]]:
-    page = 1
-    items: list[dict[str, Any]] = []
-    while True:
-        data = await run_gh(
-            "api",
-            "--method",
-            "GET",
-            endpoint,
-            "-f",
-            "per_page=100",
-            "-f",
-            f"page={page}",
-        )
-        batch = json.loads(data)
-        if not batch:
-            break
-        items.extend(batch)
-        page += 1
-    return items
+    raise RuntimeError(f"unsupported generic endpoint lookup: {endpoint}")
 
 
 async def get_issue_comments(pr_number: int) -> list[dict[str, Any]]:
-    return await get_paginated_list(
-        f"repos/{{owner}}/{{repo}}/issues/{pr_number}/comments",
-    )
+    data = await run_github_helper("issue-comments", "--number", str(pr_number))
+    payload = json.loads(data)
+    if not isinstance(payload, list):
+        raise RuntimeError("unexpected issue comments payload")
+    return payload
 
 
 async def get_review_comments(pr_number: int) -> list[dict[str, Any]]:
-    return await get_paginated_list(
-        f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments",
-    )
+    data = await run_github_helper("review-comments", "--number", str(pr_number))
+    payload = json.loads(data)
+    if not isinstance(payload, list):
+        raise RuntimeError("unexpected review comments payload")
+    return payload
 
 
 async def get_reviews(pr_number: int) -> list[dict[str, Any]]:
-    page = 1
-    reviews: list[dict[str, Any]] = []
-    while True:
-        data = await run_gh(
-            "api",
-            "--method",
-            "GET",
-            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
-            "-f",
-            "per_page=100",
-            "-f",
-            f"page={page}",
-        )
-        batch = json.loads(data)
-        if not batch:
-            break
-        reviews.extend(batch)
-        page += 1
-    return reviews
+    data = await run_github_helper("reviews", "--number", str(pr_number))
+    payload = json.loads(data)
+    if not isinstance(payload, list):
+        raise RuntimeError("unexpected reviews payload")
+    return payload
 
 
 async def get_check_runs(head_sha: str) -> list[dict[str, Any]]:
-    page = 1
-    check_runs: list[dict[str, Any]] = []
-    while True:
-        data = await run_gh(
-            "api",
-            "--method",
-            "GET",
-            f"repos/{{owner}}/{{repo}}/commits/{head_sha}/check-runs",
-            "-f",
-            "per_page=100",
-            "-f",
-            f"page={page}",
-        )
-        payload = json.loads(data)
-        batch = payload.get("check_runs", [])
-        if not batch:
-            break
-        check_runs.extend(batch)
-        total_count = payload.get("total_count")
-        if total_count is not None and len(check_runs) >= total_count:
-            break
-        page += 1
-    return check_runs
+    data = await run_github_helper("check-runs", "--sha", head_sha)
+    payload = json.loads(data)
+    batch = payload.get("check_runs", [])
+    if not isinstance(batch, list):
+        raise RuntimeError("unexpected check-runs payload")
+    return batch
 
 
 def parse_time(value: str) -> datetime:

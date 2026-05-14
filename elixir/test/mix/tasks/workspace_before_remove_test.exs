@@ -38,11 +38,11 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
     end)
   end
 
-  test "no-ops when gh is unavailable" do
+  test "no-ops when github helper runtime is unavailable" do
     with_path([], fn ->
       output =
         capture_io(fn ->
-          BeforeRemove.run(["--branch", "feature/no-gh"])
+          BeforeRemove.run(["--branch", "feature/no-helper"])
         end)
 
       assert output == ""
@@ -50,25 +50,23 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
   end
 
   test "uses current branch for lookup when branch option is omitted" do
-    with_fake_gh_and_git(
+    with_fake_helper_and_git(
       """
       #!/bin/sh
-      printf '%s\n' "$*" >> "$GH_LOG"
+      shift
+      printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
 
-      if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+      if [ "$1" = "list-prs" ]; then
+        printf '[{"number":101},{"number":102}]'
         exit 0
       fi
 
-      if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-        printf '101\n102\n'
+      if [ "$1" = "close-pr" ] && [ "$5" = "101" ]; then
+        printf '{}'
         exit 0
       fi
 
-      if [ "$1" = "pr" ] && [ "$2" = "close" ] && [ "$3" = "101" ]; then
-        exit 0
-      fi
-
-      if [ "$1" = "pr" ] && [ "$2" = "close" ] && [ "$3" = "102" ]; then
+      if [ "$1" = "close-pr" ] && [ "$5" = "102" ]; then
         printf 'boom\n' >&2
         exit 17
       fi
@@ -91,17 +89,15 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
         log = File.read!(log_path)
 
-        assert log =~
-                 "pr list --repo openai/symphony --head feature/workpad --state open --json number --jq .[].number"
-
-        assert log =~ "pr close 101 --repo openai/symphony"
-        assert log =~ "pr close 102 --repo openai/symphony"
+        assert log =~ "list-prs --repo openai/symphony --branch feature/workpad --state open"
+        assert log =~ "close-pr --repo openai/symphony --number 101"
+        assert log =~ "close-pr --repo openai/symphony --number 102"
       end
     )
   end
 
   test "closes open pull requests for the branch and tolerates close failures" do
-    with_fake_gh(fn log_path ->
+    with_fake_helper(fn log_path ->
       File.write!(log_path, "")
 
       {output, error_output} =
@@ -114,10 +110,9 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
       log = File.read!(log_path)
 
-      assert log =~ "auth status"
-      assert log =~ "pr list --repo openai/symphony --head feature/workpad --state open --json number --jq .[].number"
-      assert log =~ "pr close 101 --repo openai/symphony"
-      assert log =~ "pr close 102 --repo openai/symphony"
+      assert log =~ "list-prs --repo openai/symphony --branch feature/workpad --state open"
+      assert log =~ "close-pr --repo openai/symphony --number 101"
+      assert log =~ "close-pr --repo openai/symphony --number 102"
 
       {second_output, error_output} =
         capture_task_output(fn ->
@@ -131,21 +126,18 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
   end
 
   test "formats close failures without command stderr output" do
-    with_fake_gh(
+    with_fake_helper(
       """
       #!/bin/sh
-      printf '%s\n' "$*" >> "$GH_LOG"
+      shift
+      printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
 
-      if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+      if [ "$1" = "list-prs" ]; then
+        printf '[{"number":102}]'
         exit 0
       fi
 
-      if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-        printf '102\n'
-        exit 0
-      fi
-
-      if [ "$1" = "pr" ] && [ "$2" = "close" ] && [ "$3" = "102" ]; then
+      if [ "$1" = "close-pr" ] && [ "$5" = "102" ]; then
         exit 17
       fi
 
@@ -161,23 +153,20 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
         assert error_output =~ "Failed to close PR #102 for branch feature/no-output: exit 17"
         refute error_output =~ "output="
         log = File.read!(log_path)
-        assert log =~ "pr list --repo openai/symphony --head feature/no-output --state open --json number --jq .[].number"
-        assert log =~ "pr close 102 --repo openai/symphony"
+        assert log =~ "list-prs --repo openai/symphony --branch feature/no-output --state open"
+        assert log =~ "close-pr --repo openai/symphony --number 102"
       end
     )
   end
 
   test "no-ops when PR list fails for current branch" do
-    with_fake_gh(
+    with_fake_helper(
       """
       #!/bin/sh
-      printf '%s\n' "$*" >> "$GH_LOG"
+      shift
+      printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
 
-      if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-        exit 0
-      fi
-
-      if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+      if [ "$1" = "list-prs" ]; then
         exit 1
       fi
 
@@ -192,26 +181,18 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
         assert output == ""
 
         log = File.read!(log_path)
-        assert log =~ "auth status"
-
-        assert log =~
-                 "pr list --repo openai/symphony --head feature/list-fails --state open --json number --jq .[].number"
-
-        refute log =~ "pr close"
+        assert log =~ "list-prs --repo openai/symphony --branch feature/list-fails --state open"
+        refute log =~ "close-pr"
       end
     )
   end
 
   test "no-ops when git current branch is blank" do
-    with_fake_gh_and_git(
+    with_fake_helper_and_git(
       """
       #!/bin/sh
-      printf '%s\n' "$*" >> "$GH_LOG"
-
-      if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-        exit 0
-      fi
-
+      shift
+      printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
       exit 99
       """,
       """
@@ -229,52 +210,48 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
         log = File.read!(log_path)
         assert log == ""
-        refute log =~ "pr list"
+        refute log =~ "list-prs"
       end
     )
   end
 
-  test "no-ops when gh auth is unavailable" do
-    with_fake_gh(
+  test "no-ops when github helper lookup fails immediately" do
+    with_fake_helper(
       """
       #!/bin/sh
-      printf '%s\n' "$*" >> "$GH_LOG"
-      if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-        exit 1
-      fi
-      exit 99
+      shift
+      printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
+      exit 1
       """,
       fn log_path ->
-        BeforeRemove.run(["--branch", "feature/no-auth"])
+        BeforeRemove.run(["--branch", "feature/no-helper-response"])
 
         log = File.read!(log_path)
-        assert log =~ "auth status"
-        refute log =~ "pr list"
+        assert log =~ "list-prs --repo openai/symphony --branch feature/no-helper-response --state open"
+        refute log =~ "close-pr"
       end
     )
   end
 
-  defp with_fake_gh(fun) do
+  defp with_fake_helper(fun) do
     with_fake_binaries(
       %{
-        "gh" => """
+        "python3" => """
         #!/bin/sh
-        printf '%s\n' "$*" >> "$GH_LOG"
+        shift
+        printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
 
-        if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+        if [ "$1" = "list-prs" ]; then
+          printf '[{"number":101},{"number":102}]'
           exit 0
         fi
 
-        if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-          printf '101\n102\n'
+        if [ "$1" = "close-pr" ] && [ "$5" = "101" ]; then
+          printf '{}'
           exit 0
         fi
 
-        if [ "$1" = "pr" ] && [ "$2" = "close" ] && [ "$3" = "101" ]; then
-          exit 0
-        fi
-
-        if [ "$1" = "pr" ] && [ "$2" = "close" ] && [ "$3" = "102" ]; then
+        if [ "$1" = "close-pr" ] && [ "$5" = "102" ]; then
           printf 'boom\n' >&2
           exit 17
         fi
@@ -286,19 +263,19 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
     )
   end
 
-  defp with_fake_gh(script, fun) do
-    with_fake_binaries(%{"gh" => script}, fun)
+  defp with_fake_helper(script, fun) do
+    with_fake_binaries(%{"python3" => script}, fun)
   end
 
-  defp with_fake_gh_and_git(gh_script, git_script, fun) do
-    with_fake_binaries(%{"gh" => gh_script, "git" => git_script}, fun)
+  defp with_fake_helper_and_git(helper_script, git_script, fun) do
+    with_fake_binaries(%{"python3" => helper_script, "git" => git_script}, fun)
   end
 
   defp with_fake_binaries(scripts, fun) do
     unique = System.unique_integer([:positive, :monotonic])
     root = Path.join(System.tmp_dir!(), "workspace-before-remove-task-test-#{unique}")
     bin_dir = Path.join(root, "bin")
-    log_path = Path.join(root, "gh.log")
+    log_path = Path.join(root, "github-helper.log")
 
     try do
       File.rm_rf!(root)
@@ -315,7 +292,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
       with_env(
         %{
-          "GH_LOG" => log_path,
+          "GITHUB_HELPER_LOG" => log_path,
           "PATH" => path_with_binaries
         },
         fn ->

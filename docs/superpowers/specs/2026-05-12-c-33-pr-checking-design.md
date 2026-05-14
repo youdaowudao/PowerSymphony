@@ -9,6 +9,16 @@
 - `PR` 收口成功条件改为：`PR` 仍然有效，且当前最新 `head SHA` 的 `required checks` 通过。
 - 本卡不再要求 `PR` 已 merge，或 `Merging` 已完成，才算 `PR` 后半段收口成功。
 
+## 2026-05-14 Auto-merge ordering correction
+
+基于这次真实事故，本设计再追加一条更高优先级的执行顺序修正：
+
+- 对 open PR 的任何新提交，必须在 `git push` 成功后的第一时间就尝试开启 auto-merge。
+- 不得先读取 checks、review delta、mergeability 或 `viewerCanEnableAutoMerge` 再决定是否发起 auto-merge。
+- `already enabled` 视为成功。
+- `clean status` 视为“已经来到直接合并阶段”，不是权限错误。
+- 只有 auto-merge 因其他原因失败时，才允许保留手动 merge 作为异常兜底；并且该失败原因必须先写入评论区。
+
 ## Scope Interpretation
 
 ### In Scope

@@ -434,9 +434,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
+                      <span class={state_badge_class(entry.health || entry.current_phase || entry.state)}>
+                        <%= entry.current_phase || entry.state %>
                       </span>
+                      <div class="muted event-meta"><%= entry.linear_state || entry.state %> · <%= entry.health || "unknown" %></div>
                     </td>
                     <td>
                       <div class="session-stack">
@@ -759,6 +760,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp m3_issue_label(_entry), do: "unknown"
 
   defp running_activity_summary(entry) do
+    current_action(entry) || turns_or_session_summary(entry)
+  end
+
+  defp current_action(entry) do
+    if is_binary(entry.current_action) and entry.current_action != "", do: entry.current_action
+  end
+
+  defp turns_or_session_summary(entry) do
     cond do
       is_integer(entry.turn_count) and entry.turn_count > 0 and entry.session_id ->
         "#{entry.turn_count} turns · session id available"
@@ -776,10 +785,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp running_activity_meta(entry) do
     cond do
-      not is_nil(entry.session_id) and activity_summary_present?(entry) -> "session id available · summary withheld"
-      not is_nil(entry.session_id) -> "session id available"
-      activity_summary_present?(entry) -> "summary withheld"
-      true -> "no recent summary"
+      is_binary(entry.current_phase) and is_binary(entry.health) ->
+        "#{entry.current_phase} · #{entry.health}"
+
+      not is_nil(entry.session_id) and activity_summary_present?(entry) ->
+        "session id available · summary withheld"
+
+      not is_nil(entry.session_id) ->
+        "session id available"
+
+      activity_summary_present?(entry) ->
+        "summary withheld"
+
+      true ->
+        "no recent summary"
     end
   end
 

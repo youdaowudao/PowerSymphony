@@ -24,6 +24,10 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 `Checking`, Symphony stops that long-running implementation pass, holds the claim, and schedules a
 single short recheck after the configured cooldown window. That recheck only evaluates three signal
 classes: PR merged state, latest head SHA required checks, and the newest human review delta.
+The expected PR closeout order is: successful push first, immediate auto-merge attempt second,
+and only then checks / merge-state observation. Manual merge is a documented fallback used only when
+that immediate auto-merge attempt did not succeed for a real reason other than the PR already being
+in clean status.
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.

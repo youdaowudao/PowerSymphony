@@ -9,6 +9,15 @@
 
 - 更新 Linear 前，必须确认 required checks 全绿；如 PR 已存在 review/comment，则需确认无未处理的 review delta。未通过时禁止推进 Linear 状态。
 
+## PR收口规则
+
+- 对 open PR 的任何新提交，`git push` 成功后，agent 的第一优先级 GitHub 动作必须是为该 PR 立即尝试开启 auto-merge；不得先读取 checks、review delta 或 mergeability 再决定是否发起。
+- 本仓库的 GitHub 写操作标准路径是 `.codex/skills/github_api.py`；`github-mcp` 默认只承担只读检索，`gh` 不是必需前提。
+- 若 auto-merge 返回 `already enabled`，视为成功。
+- 若 auto-merge 返回 `clean status`，说明 PR 已经来到可直接合并阶段；这不是权限故障，也不是 blocker。此时只要 latest head required checks 全绿，就允许进入手动 merge fallback。
+- 只有 auto-merge 因其他原因未开启成功时，才允许保留手动 merge fallback；且必须先在评论区明确汇报失败原因。
+- 绝大多数情况下都应走 auto-merge；手动 merge 仅是异常兜底路径，不是常规路径。
+
 ## 多 Agent 协作与复核
 
 - 非代码变更默认不要求 reviewer subagent，但提交前仍需完成与改动范围相称的独立验证。

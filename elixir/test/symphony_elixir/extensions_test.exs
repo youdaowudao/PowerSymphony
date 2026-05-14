@@ -409,6 +409,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
                  "state" => "In Progress",
+                 "linear_state" => "In Progress",
+                 "current_phase" => "codex_reasoning",
+                 "current_action" => "reasoning summary streaming",
+                 "health" => "normal",
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
@@ -416,7 +420,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event" => "notification",
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
-                 "last_event_at" => nil,
+                 "last_event_at" => state_payload["running"] |> List.first() |> Map.fetch!("last_event_at"),
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -458,15 +462,25 @@ defmodule SymphonyElixir.ExtensionsTest do
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
+               "linear_state" => "In Progress",
+               "current_phase" => "codex_reasoning",
+               "current_action" => "reasoning summary streaming",
+               "health" => "normal",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",
-               "last_event_at" => nil,
+               "last_event_at" => issue_payload["running"]["last_event_at"],
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
              "logs" => %{"codex_session_logs" => []},
-             "recent_events" => [],
+             "recent_events" => [
+               %{
+                 "at" => issue_payload["running"]["last_event_at"],
+                 "event" => "notification",
+                 "message" => "rendered"
+               }
+             ],
              "last_error" => nil,
              "tracked" => %{}
            }
@@ -1174,8 +1188,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
-    assert html =~ "7 turns"
-    assert html =~ "session id available"
+    assert html =~ "reasoning summary streaming"
+    assert html =~ "codex_reasoning"
+    assert html =~ "normal"
+    assert html =~ "Copy ID"
     refute html =~ "rendered"
     refute html =~ "notification"
     refute html =~ "Timeline"
@@ -1195,8 +1211,13 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "reasoning summary streaming",
+          health: "normal",
           session_id: "thread-http",
           turn_count: 8,
+          codex_app_server_pid: nil,
           last_codex_event: :notification,
           last_codex_message: %{
             event: :notification,
@@ -1230,8 +1251,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       rendered =~ "Running sessions" and
         rendered =~ "In Progress" and
-        rendered =~ "8 turns" and
-        rendered =~ "session id available" and
+        rendered =~ "reasoning summary streaming" and
+        rendered =~ "codex_reasoning" and
+        rendered =~ "normal" and
+        rendered =~ "Copy ID" and
         refute_rendered_raw_activity?(rendered)
     end)
   end
@@ -2174,11 +2197,15 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "reasoning summary streaming",
+          health: "normal",
           session_id: "thread-http",
           turn_count: 7,
           codex_app_server_pid: nil,
           last_codex_message: "rendered",
-          last_codex_timestamp: nil,
+          last_codex_timestamp: DateTime.utc_now(),
           last_codex_event: :notification,
           codex_input_tokens: 4,
           codex_output_tokens: 8,

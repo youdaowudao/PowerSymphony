@@ -265,18 +265,20 @@ If command output is in English, keep the original output first, then add a brie
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop and run a PR feedback sweep before new feature work.
 - `In Progress` -> implementation actively underway.
-  - PR created / updated is only the entry signal into `Checking`, not the completion signal.
+  - PR created / updated is only the entry signal into the PR closeout path, not the completion signal.
+  - After every successful PR creation or branch update push, immediately attempt to enable auto-merge for the current PR before reading checks or mergeability.
 - `Checking` -> stop the current implementation run after the bounded PR closeout pass.
-  - Entry condition: PR already exists and auto-merge has been confirmed enabled successfully.
+  - Entry condition: PR already exists, the latest branch update has already triggered an immediate auto-merge attempt, and the result of that attempt is known.
   - For a ticket already in `Checking`, run one short recheck thread only.
   - Read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
   - If merge is complete, move to `Done`.
   - If checks reached a non-success terminal state, move to `In Progress`.
+  - If the latest auto-merge attempt failed for any reason other than the PR already being in clean status, record the exact failure in the PR or issue comment stream, then allow manual merge only after the latest head SHA required checks are green.
   - If automation cannot safely continue, move to `Human Review`.
   - If none of those exit conditions are hit, keep `Checking` and end the run.
-  - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue.
+  - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue after the auto-merge path and manual-merge fallback have both been evaluated.
 - `Human Review` -> validated work is waiting on human approval unless a new clear human delta or a new unresolved review delta exists, in which case immediately move to `Rework` and run the incremental rework flow.
-- `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
+- `Merging` -> approved by human; execute the `land` skill flow (do not bypass the repo-local GitHub helper path with ad-hoc CLI commands).
 - `Rework` -> reviewer or human requested changes; execute the requested delta by reusing the existing branch, PR, and body workpad when safe.
 - `Done` -> terminal state; no further action required.
 
@@ -293,7 +295,7 @@ Step 0 may only run after the preflight body gate has classified the run as `exe
    - `In Progress` -> continue execution flow from the current issue-body snapshot.
    - `Checking` -> run one bounded recheck pass using only PR merge state, latest head SHA required checks, and newest human review delta; then route to `Done`, `In Progress`, `Human Review`, or stay in `Checking`.
    - `Human Review` -> if a new execute-mode human delta or an active unresolved review delta exists, immediately move to `Rework` and run the incremental rework flow; otherwise stop immediately and resume only on a later explicit trigger.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not bypass the repo-local GitHub helper path with ad-hoc CLI commands.
    - `Rework` -> run the incremental rework flow, reusing the existing branch, PR, and body workpad when safe.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
@@ -338,9 +340,9 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 
 1. Identify the PR number from issue links or attachments.
 2. In review-sensitive states, gather only the new or still-unresolved feedback required for this pass from the necessary channels:
-   - Top-level PR comments (`gh pr view --comments`).
-   - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
-   - Review summaries or states (`gh pr view --json reviews`).
+   - Top-level PR comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
+   - Inline review comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
+   - Review summaries or states (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
    - Only the necessary short current-issue comments that add review context or human decisions not yet reflected in the issue body.
 3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
    - code, test, or docs updated to address it, or
@@ -372,12 +374,17 @@ Use this only when completion is blocked by missing required tools or missing au
 - Checks from an older head SHA do not satisfy the closeout requirement for the latest commit.
 - If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA.
 - Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed.
-- `Checking` entry requires both an attached PR and confirmed successful auto-merge enablement.
+- Every PR create/update push must be followed immediately by an auto-merge attempt for the current PR before reading checks, mergeability, or other closeout signals.
+- Treat `already enabled` as a successful auto-merge outcome.
+- If the auto-merge attempt returns that the PR is already in clean status, do not treat that as a permission blocker; it means the PR has already advanced to the direct-merge stage and can use the manual-merge fallback once latest head SHA required checks are green.
+- Only when the latest auto-merge attempt failed for another reason should the run preserve a manual-merge fallback path, and that fallback must be called out explicitly in a PR or issue comment before any manual merge happens.
 - When an attached PR already exists, do not move to `Human Review` merely because the PR exists.
 - During `Checking`, read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
 - If merge is complete, move to `Done`.
 - If required checks on the latest head SHA reach a non-success terminal state, move to `In Progress`.
-- If checks are green but merge still cannot complete because of permission, conflict, protection-rule, merge-queue, or similar automation blockers, move to `Human Review`.
+- If checks are green and auto-merge is active, prefer the auto-merge path over any manual merge.
+- If checks are green and the latest auto-merge attempt failed for a reason other than clean status, manual merge is allowed only as an explicit fallback and only after the failure reason has been reported in the PR or issue comment stream.
+- If checks are green but neither auto-merge nor the explicit manual-merge fallback can safely complete because of permission, conflict, protection-rule, merge-queue, or similar automation blockers, move to `Human Review`.
 - If a human explicitly asks for more implementation work while in `Checking`, move to `In Progress`.
 - If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure.
 - First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable.
@@ -408,6 +415,8 @@ Use this only when completion is blocked by missing required tools or missing au
 7. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8. Attach PR URL to the issue (prefer attachment; use the issue body only if attachment is unavailable).
    - Ensure the GitHub PR has label `symphony` (add it if missing).
+   - Immediately after PR creation or branch-update push succeeds, attempt to enable auto-merge for the current PR before reading checks, mergeability, or other closeout signals.
+   - If the auto-merge attempt fails for any reason other than `already enabled` or `clean status`, record that exact failure in the PR or issue comment stream and preserve manual merge only as an explicit fallback after latest head SHA required checks are green.
 9. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the execution sections with final checklist status and validation notes.
    - Mark completed items in `## Acceptance Criteria` and `## Codex Workpad` as checked.
@@ -417,6 +426,7 @@ Use this only when completion is blocked by missing required tools or missing au
 11. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
+   - Confirm that the latest PR create/update push already triggered an immediate auto-merge attempt; do not defer that attempt until after checks are read.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
    - If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`.
    - Do not treat checks on an older head SHA as sufficient for closeout after newer commits land.
@@ -424,7 +434,8 @@ Use this only when completion is blocked by missing required tools or missing au
    - If checks fail, keep working in the same branch and PR by default; do not open a new ticket, do not open a new PR, and do not move to `Human Review` after a single failed run.
    - If a new commit lands during `Checking`, restart the closeout decision using only the new head SHA.
    - If new unresolved feedback or failing checks are discovered, handle only the bounded delta for this run or stop with an explicit blocker or handoff; do not remain in an open-ended same-run polling loop.
-   - If the bounded pass succeeds and auto-merge is confirmed enabled successfully, move to `Checking` and stop this implementation run.
+   - If the bounded pass succeeds and auto-merge is active, move to `Checking` and stop this implementation run.
+   - If the bounded pass succeeds, the latest auto-merge attempt reported clean status, and latest head SHA required checks are green, manual merge may proceed as the documented fallback without first treating clean status as a blocker.
    - Refresh `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, `## Blockers`, and `## Codex Workpad` so they reflect the completed work accurately.
 12. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
    - Exception: if blocked by missing required non-GitHub tools or auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
@@ -447,7 +458,8 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If a new execute-mode human delta exists, immediately move the issue to `Rework` and follow the incremental rework flow.
 4. If an active unresolved review delta exists, move the issue to `Rework` and follow the incremental rework flow.
 5. If approved, human moves the issue to `Merging`.
-6. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+6. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not bypass the repo-local GitHub helper path with ad-hoc CLI commands.
+   - In this workflow, `Merging` is the manual fallback lane after the auto-merge path failed or became unnecessary because the PR was already in clean status.
 7. After merge is complete, move the issue to `Done`.
 
 ## Step 4: Rework handling

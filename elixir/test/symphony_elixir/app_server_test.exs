@@ -290,7 +290,7 @@ defmodule SymphonyElixir.AppServerTest do
             ;;
           3)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-89"}}}'
-            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"gh pr view","cwd":"/tmp","reason":"need approval"}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"python3 .codex/skills/github_api.py current-pr","cwd":"/tmp","reason":"need approval"}}'
             ;;
           *)
             sleep 1
@@ -369,7 +369,7 @@ defmodule SymphonyElixir.AppServerTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-89\"}}}'
-            printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"gh pr view\",\"cwd\":\"/tmp\",\"reason\":\"need approval\"}}'
+            printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"python3 .codex/skills/github_api.py current-pr\",\"cwd\":\"/tmp\",\"reason\":\"need approval\"}}'
             ;;
           5)
             printf '%s\\n' '{\"method\":\"turn/completed\"}'

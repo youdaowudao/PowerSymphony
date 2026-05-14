@@ -17,16 +17,19 @@ description:
   unless blocked.
 - No need to delete remote branches after merge; the repo auto-deletes head
   branches.
+- Treat manual merge as a fallback path. The default path should already have
+  attempted auto-merge immediately after the latest successful push.
 
 ## Preconditions
 
-- `gh` CLI is authenticated.
+- `python3` is available to run `.codex/skills/github_api.py` and `.codex/skills/land/land_watch.py`.
+- GitHub token access is available through `git credential fill`.
 - You are on the PR branch with a clean working tree.
 
 ## Steps
 
 1. Locate the PR for the current branch.
-2. Confirm the full gauntlet is green locally before any push.
+2. Confirm the required local validation for this diff is green, following `AGENTS.md`.
 3. If the working tree has uncommitted changes, commit with the `commit` skill
    and push with the `push` skill before proceeding.
 4. Check mergeability and conflicts against main.
@@ -60,42 +63,54 @@ description:
 ```
 # Ensure branch and PR context
 branch=$(git branch --show-current)
-pr_number=$(gh pr view --json number -q .number)
-pr_title=$(gh pr view --json title -q .title)
-pr_body=$(gh pr view --json body -q .body)
+python3 .codex/skills/github_api.py current-pr > /tmp/current_pr.json
+pr_number=$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/current_pr.json").read_text())
+print(payload["number"])
+PY
+)
+pr_title=$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/current_pr.json").read_text())
+print(payload["title"])
+PY
+)
+pr_body=$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/current_pr.json").read_text())
+print(payload["body"])
+PY
+)
 
 # Check mergeability and conflicts
-mergeable=$(gh pr view --json mergeable -q .mergeable)
+mergeable=$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/current_pr.json").read_text())
+print(payload["mergeable"])
+PY
+)
 
 if [ "$mergeable" = "CONFLICTING" ]; then
   # Run the `pull` skill to handle fetch + merge + conflict resolution.
   # Then run the `push` skill to publish the updated branch.
 fi
 
-# Preferred: use the Async Watch Helper below. The manual loop is a fallback
-# when Python cannot run or the helper script is unavailable.
-# Wait for review feedback: Codex reviews arrive as issue comments that start
-# with "## Codex Review — <persona>". Treat them like reviewer feedback: reply
-# with a `[codex]` issue comment acknowledging the findings and whether you're
-# addressing or deferring them.
-while true; do
-  gh api repos/{owner}/{repo}/issues/"$pr_number"/comments \
-    --jq '.[] | select(.body | startswith("## Codex Review")) | .id' | rg -q '.' \
-    && break
-  sleep 10
-done
+# Preferred: use the Async Watch Helper below. It polls review comments, reviews,
+# check-runs, and head updates through `.codex/skills/github_api.py`.
+python3 .codex/skills/land/land_watch.py
 
-# Watch checks
-if ! gh pr checks --watch; then
-  gh pr checks
-  # Identify failing run and inspect logs
-  # gh run list --branch "$branch"
-  # gh run view <run-id> --log
-  exit 1
-fi
-
-# Squash-merge (remote branches auto-delete on merge in this repo)
-gh pr merge --squash --subject "$pr_title" --body "$pr_body"
+# Squash-merge fallback (only after checks are green and auto-merge fallback
+# rules have been satisfied)
+python3 .codex/skills/github_api.py merge-pr \
+  --number "$pr_number" \
+  --method squash \
+  --subject "$pr_title" \
+  --body "$pr_body"
 ```
 
 ## Async Watch Helper
@@ -115,9 +130,10 @@ Exit codes:
 
 ## Failure Handling
 
-- If checks fail, pull details with `gh pr checks` and `gh run view --log`, then
-  fix locally, commit with the `commit` skill, push with the `push` skill, and
-  re-run the watch.
+- If checks fail, pull failing check names from `.codex/skills/land/land_watch.py`,
+  inspect the corresponding GitHub run details or logs through your available
+  GitHub read path, then fix locally, commit with the `commit` skill, push with
+  the `push` skill, and re-run the watch.
 - Use judgment to identify flaky failures. If a failure is a flake (e.g., a
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not
@@ -131,8 +147,14 @@ Exit codes:
 - Codex review jobs retry on failure and are non-blocking; use the presence of
   `## Codex Review — <persona>` issue comments (not job status) as the signal
   that review feedback is available.
-- Do not enable auto-merge; this repo has no required checks so auto-merge can
-  skip tests.
+- If auto-merge is already active, prefer waiting for the auto-merge path over
+  forcing a manual merge.
+- If auto-merge was not activated, manual merge is allowed only after the exact
+  auto-merge failure reason has been reported in the PR or issue comment stream
+  and the latest head SHA required checks are green.
+- If the latest auto-merge attempt failed only because the PR was already in
+  clean status, treat that as “auto-merge no longer necessary”, not as a
+  permission blocker.
 - If the remote PR branch advanced due to your own prior force-push or merge,
   avoid redundant merges; re-run the formatter locally if needed and
   `git push --force-with-lease`.
@@ -147,20 +169,23 @@ Exit codes:
   resolved) before requesting a new review or merging.
 - If multiple reviewers comment in the same thread, respond to each comment
   (batching is fine) before closing the thread.
-- Fetch review comments via `gh api` and reply with a prefixed comment.
+- Fetch review comments via `.codex/skills/github_api.py` and reply with a
+  prefixed comment.
 - Use review comment endpoints (not issue comments) to find inline feedback:
   - List PR review comments:
     ```
-    gh api repos/{owner}/{repo}/pulls/<pr_number>/comments
+    python3 .codex/skills/github_api.py review-comments --number <pr_number>
     ```
   - PR issue comments (top-level discussion):
     ```
-    gh api repos/{owner}/{repo}/issues/<pr_number>/comments
+    python3 .codex/skills/github_api.py issue-comments --number <pr_number>
     ```
   - Reply to a specific review comment:
     ```
-    gh api -X POST /repos/{owner}/{repo}/pulls/<pr_number>/comments \
-      -f body='[codex] <response>' -F in_reply_to=<comment_id>
+    python3 .codex/skills/github_api.py review-comment-reply \
+      --number <pr_number> \
+      --comment-id <comment_id> \
+      --body '[codex] <response>'
     ```
 - `in_reply_to` must be the numeric review comment id (e.g., `2710521800`), not
   the GraphQL node id (e.g., `PRRC_...`), and the endpoint must include the PR

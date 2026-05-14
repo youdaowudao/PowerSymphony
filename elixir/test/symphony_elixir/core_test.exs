@@ -1611,8 +1611,9 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is retry attempt #2 because the ticket is still in an active state."
     assert prompt =~ "Do not end the turn while the issue remains in an active state"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "PR created / updated is only the entry signal into `Checking`, not the completion signal."
+    assert prompt =~ "Do not bypass the repo-local GitHub helper path with ad-hoc CLI commands"
+    assert prompt =~ "PR created / updated is only the entry signal into the PR closeout path, not the completion signal."
+    assert prompt =~ "After every successful PR creation or branch update push, immediately attempt to enable auto-merge for the current PR before reading checks or mergeability."
     assert prompt =~ "`Checking` -> stop the current implementation run after the bounded PR closeout pass."
     assert prompt =~ "For a ticket already in `Checking`, run one short recheck thread only."
     assert prompt =~ "Read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta."
@@ -1621,6 +1622,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "If automation cannot safely continue, move to `Human Review`."
     assert prompt =~ "When an attached PR already exists, do not move to `Human Review` merely because the PR exists."
     assert prompt =~ "Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing."
+    assert prompt =~ "Every PR create/update push must be followed immediately by an auto-merge attempt for the current PR before reading checks, mergeability, or other closeout signals."
+    assert prompt =~ "If the auto-merge attempt returns that the PR is already in clean status, do not treat that as a permission blocker"
 
     assert prompt =~
              "If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`."
@@ -1632,9 +1635,11 @@ defmodule SymphonyElixir.CoreTest do
              "If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure."
 
     assert prompt =~ "If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA."
+    assert prompt =~ "If checks are green and auto-merge is active, prefer the auto-merge path over any manual merge."
+    assert prompt =~ "manual merge is allowed only as an explicit fallback"
 
     assert prompt =~
-             "In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue."
+             "In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue after the auto-merge path and manual-merge fallback have both been evaluated."
 
     assert prompt =~
              "First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable."
