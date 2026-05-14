@@ -509,19 +509,14 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
 
     assert_eventually(
       fn ->
-        case Agent.get(result_agent, & &1) do
-          {:ok, %DateTime{}} -> true
-          _other -> false
-        end
+        match?({:ok, %DateTime{}}, Agent.get(result_agent, & &1)) and
+          MapSet.size(:sys.get_state(poller_name).in_flight_projects) == 0 and
+          Agent.get(crash_once_agent, & &1) == false
       end,
       40
     )
 
     assert Process.alive?(poller_pid)
-
-    poller_state = :sys.get_state(poller_name)
-    assert MapSet.size(poller_state.in_flight_projects) == 0
-    assert Agent.get(crash_once_agent, & &1) == false
   end
 
   defp fetch_entry!(manager_name, project_id) do
