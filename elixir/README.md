@@ -199,6 +199,11 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 
+In control-plane mode, the homepage stays lightweight and only provides project-level entry
+points. Project details live at `/projects/:project_id`, and the run deep-view skeleton lives at
+`/projects/:project_id/runs/:issue_identifier`. The run deep view does not load heavy data by
+default on first open.
+
 ## Project Layout
 
 - `lib/`: application code and Mix tasks

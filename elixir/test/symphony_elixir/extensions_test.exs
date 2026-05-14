@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias Floki
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.ProjectProcessManager
   alias SymphonyElixir.Tracker.Memory
@@ -1473,7 +1474,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "/api/v1/projects//summary"
   end
 
-  test "control-plane dashboard renders run summaries in an explicit thread status section" do
+  test "control-plane dashboard keeps run details out of the homepage" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -1510,7 +1511,87 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "线程状态"
+    assert html =~ "View details"
+    assert html =~ "/projects/alpha"
+    refute html =~ "线程状态"
+    refute html =~ "MT-ALPHA-1"
+    refute html =~ "Alpha task"
+    refute html =~ "codex_waiting_next_event"
+    refute html =~ "最近一段时间没有新事件"
+    refute html =~ "possibly_stalled"
+    refute html =~ "thread-alpha"
+    refute html =~ "turn-9"
+    refute html =~ "thread-alpha-turn-9"
+    refute html =~ "960s"
+    refute html =~ "tool_call_failed"
+    refute html =~ "Recent events"
+    refute html =~ "Prompt"
+    refute html =~ "Shell output"
+    refute html =~ "Timeline"
+  end
+
+  test "control-plane dashboard exposes a clear entry to project detail pages" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "/projects/alpha"
+    assert html =~ "View details"
+    refute html =~ "/projects/alpha/runs/"
+  end
+
+  test "project detail page stays lightweight and links each run to a deep view" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  session_id: "thread-alpha-turn-9",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  turn_count: 9,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960,
+                  last_error: "tool_call_failed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    assert html =~ "Alpha"
     assert html =~ "MT-ALPHA-1"
     assert html =~ "Alpha task"
     assert html =~ "codex_waiting_next_event"
@@ -1518,13 +1599,251 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "possibly_stalled"
     assert html =~ "thread-alpha"
     assert html =~ "turn-9"
-    assert html =~ "thread-alpha-turn-9"
     assert html =~ "960s"
-    assert html =~ "tool_call_failed"
-    refute html =~ "Recent events"
+    assert html =~ "/projects/alpha/runs/MT-ALPHA-1"
+    assert html =~ "Open run"
+    refute html =~ "Timeline"
+    refute html =~ "Shell output"
+    refute html =~ "Prompt"
+    refute html =~ "Raw event"
+  end
+
+  test "project detail page shows unavailable state when project summary is missing" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{entries: []}
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/missing")
+    assert html =~ "Project unavailable"
+    assert html =~ "No lightweight project summary matched"
+    assert html =~ "missing"
+  end
+
+  test "project detail page renders presenter-backed empty summary fields as n/a and keeps empty run lists lightweight" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: ""},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, last_seen_at: "", last_error: "", run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert project_section_texts(document, "Project summary") |> Enum.member?("worker port: n/a")
+    assert project_section_texts(document, "Project summary") |> Enum.member?("last seen: n/a")
+    assert project_section_texts(document, "Project summary") |> Enum.member?("last error: n/a")
+    assert run_summaries_empty_state_text(document) == "No run summaries available."
+  end
+
+  test "project detail page renders empty run action text as n/a" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "",
+                  health: "normal",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert [
+             {"article", _, _} = article
+           ] = Floki.find(document, "article.section-card")
+
+    assert Floki.text(article) =~ "MT-ALPHA-1"
+    assert Floki.text(article) =~ "Alpha task"
+    assert article_mono_texts(article) |> Enum.member?("n/a")
+  end
+
+  test "run deep view renders summary fields and skeleton sections without heavy content by default" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  session_id: "thread-alpha-turn-9",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  turn_count: 9,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960,
+                  last_error: "tool_call_failed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "Alpha task"
+    assert html =~ "In Progress"
+    assert html =~ "codex_waiting_next_event"
+    assert html =~ "最近一段时间没有新事件"
+    assert html =~ "possibly_stalled"
+    assert html =~ "thread-alpha"
+    assert html =~ "turn-9"
+    assert html =~ "2026-05-14T02:00:00Z"
+    assert html =~ "960s"
+    assert html =~ "Timeline"
+    assert html =~ "Event detail"
+    assert html =~ "Thread"
+    assert html =~ "Turn"
+    assert html =~ "Conversation"
+    assert html =~ "Tools"
+    assert html =~ "Sub-agent context"
+    assert html =~ "Dependencies"
+    assert html =~ "Attention"
+    assert html =~ "Not loaded by default"
+    refute html =~ "Raw event"
     refute html =~ "Prompt"
     refute html =~ "Shell output"
+    refute html =~ "notification"
+    refute html =~ "rendered"
+  end
+
+  test "run deep view shows project unavailable when the project is missing" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{entries: []}
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/missing/runs/MT-ALPHA-1")
+    assert html =~ "Project unavailable"
+    assert html =~ "No project matched"
+    assert html =~ "missing"
+  end
+
+  test "run deep view renders integer and empty summary values with active badge state" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "running",
+                  current_phase: nil,
+                  current_action: "",
+                  health: nil,
+                  thread_id: nil,
+                  turn_id: 7,
+                  last_event_at: nil,
+                  run_duration_seconds: 960
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert [
+             {"span", attributes, _}
+           ] = Floki.find(document, "header.hero-card div.status-stack span.state-badge")
+
+    assert attributes |> Enum.into(%{}) |> Map.fetch!("class") =~ "state-badge-active"
+    assert summary_row_text(document, "linear_state") == "linear_state: running"
+    assert summary_row_text(document, "current_phase") == "current_phase: n/a"
+    assert summary_row_text(document, "current_action") == "current_action: n/a"
+    assert summary_row_text(document, "health") == "health: n/a"
+    assert summary_row_text(document, "thread_id") == "thread_id: n/a"
+    assert summary_row_text(document, "turn_id") == "turn_id: 7"
+    assert summary_row_text(document, "last_event_at") == "last_event_at: n/a"
+    assert summary_row_text(document, "run_duration_seconds") == "run_duration_seconds: 960s"
+  end
+
+  test "run deep view stays lightweight when the run summary is unavailable" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-MISSING")
+    assert html =~ "Run unavailable"
+    assert html =~ "MT-MISSING"
     refute html =~ "Timeline"
+    refute html =~ "Shell output"
+    refute html =~ "Prompt"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -2592,6 +2911,61 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp summary_row_text(document, label) do
+    document
+    |> find_section_by_title("Summary")
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.mono")
+    end)
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.replace(&1, ~r/\s*:\s*/, ": "))
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&String.starts_with?(&1, "#{label}:"))
+  end
+
+  defp project_section_texts(document, title) do
+    document
+    |> find_section_by_title(title)
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.mono")
+    end)
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.trim/1)
+  end
+
+  defp run_summaries_empty_state_text(document) do
+    document
+    |> find_section_by_title("Run summaries")
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "p.empty-state")
+    end)
+    |> Floki.text()
+    |> String.trim()
+  end
+
+  defp find_section_by_title(document, title) do
+    document
+    |> Floki.find("section.section-card")
+    |> Enum.find(fn section ->
+      Floki.find(section, "h2.section-title")
+      |> Floki.text()
+      |> String.trim() == title
+    end)
+  end
+
+  defp article_mono_texts(article) do
+    article
+    |> Floki.find("p.mono")
+    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
+    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
+    |> Enum.map(&String.trim/1)
   end
 
   defp fake_worker_builder(modes) do

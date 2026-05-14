@@ -126,6 +126,85 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec project_run_summary_payload(
+          String.t(),
+          String.t(),
+          ProjectRegistry.t() | %{entries: [map()]}
+        ) :: {:ok, map()} | {:error, :project_not_found | :run_not_found}
+  def project_run_summary_payload(project_id, issue_identifier, registry)
+      when is_binary(project_id) and is_binary(issue_identifier) do
+    with {:ok, %{project: project} = payload} <- project_summary_payload(project_id, registry),
+         %{} = run_summary <- find_project_run_summary(project, issue_identifier) do
+      {:ok, Map.put(payload, :run, run_summary)}
+    else
+      {:error, :project_not_found} -> {:error, :project_not_found}
+      nil -> {:error, :run_not_found}
+    end
+  end
+
+  @spec find_project_run_summary(map(), String.t()) :: map() | nil
+  def find_project_run_summary(project, issue_identifier)
+      when is_map(project) and is_binary(issue_identifier) do
+    project
+    |> map_value(:run_summaries)
+    |> List.wrap()
+    |> Enum.find(fn summary -> map_value(summary, :issue_identifier) == issue_identifier end)
+  end
+
+  @spec project_runtime_or_validation_error(map()) :: String.t() | nil
+  def project_runtime_or_validation_error(project) when is_map(project) do
+    map_value(project, :last_error) || project_validation_error_summary(map_value(project, :validation_errors))
+  end
+
+  @spec project_validation_error_label(map()) :: String.t()
+  def project_validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
+  def project_validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
+  def project_validation_error_label(_error), do: "invalid"
+
+  @spec project_run_summary_title(map()) :: String.t()
+  def project_run_summary_title(summary) when is_map(summary) do
+    case map_value(summary, :title) do
+      value when is_binary(value) and value != "" -> value
+      _ -> "未提供标题"
+    end
+  end
+
+  @spec project_run_summary_health_meta(map()) :: String.t()
+  def project_run_summary_health_meta(summary) when is_map(summary) do
+    [map_value(summary, :linear_state), map_value(summary, :health)]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.join(" · ")
+    |> blank_to_na()
+  end
+
+  @spec project_run_summary_ids(map()) :: String.t()
+  def project_run_summary_ids(summary) when is_map(summary) do
+    [
+      summary_text(summary, :thread_id, "thread"),
+      summary_text(summary, :turn_id, "turn"),
+      summary_text(summary, :session_id, "session")
+    ]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" · ")
+    |> blank_to_na()
+  end
+
+  @spec project_run_summary_runtime(map()) :: String.t()
+  def project_run_summary_runtime(summary) when is_map(summary) do
+    parts =
+      [
+        run_turn_count_text(summary),
+        run_last_event_text(summary),
+        run_duration_text(summary)
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    case parts do
+      [] -> "n/a"
+      _ -> Enum.join(parts, " · ")
+    end
+  end
+
   defp issue_payload_body(issue_identifier, running, retry) do
     %{
       issue_identifier: issue_identifier,
@@ -251,7 +330,38 @@ defmodule SymphonyElixirWeb.Presenter do
     |> runtime_state_value(key)
   end
 
+  defp summary_text(summary, key, label) do
+    case map_value(summary, key) do
+      value when is_binary(value) and value != "" -> "#{label} #{value}"
+      _ -> nil
+    end
+  end
+
+  defp run_turn_count_text(summary) do
+    case map_integer_value(summary, :turn_count) do
+      value when is_integer(value) -> "#{value} turns"
+      _ -> nil
+    end
+  end
+
+  defp run_last_event_text(summary) do
+    case map_value(summary, :last_event_at) do
+      value when is_binary(value) and value != "" -> "last event #{value}"
+      _ -> nil
+    end
+  end
+
+  defp run_duration_text(summary) do
+    case map_integer_value(summary, :run_duration_seconds) do
+      value when is_integer(value) -> "#{value}s"
+      _ -> nil
+    end
+  end
+
   defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
+  defp blank_to_na(""), do: "n/a"
+  defp blank_to_na(value), do: value
 
   defp map_integer_value(map, key) do
     case map_value(map, key) do
@@ -360,6 +470,19 @@ defmodule SymphonyElixirWeb.Presenter do
     |> maybe_put_payload_value("issue_id", Map.get(entry, :id, Map.get(entry, "issue_id")))
     |> maybe_put_payload_value("state", Map.get(entry, :state, Map.get(entry, "state")))
   end
+
+  defp project_validation_error_summary(errors) when is_list(errors) do
+    errors
+    |> Enum.map(&project_validation_error_label/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(", ")
+    |> case do
+      "" -> nil
+      summary -> summary
+    end
+  end
+
+  defp project_validation_error_summary(_errors), do: nil
 
   defp m3_generated_at(payload) do
     case m3_payload_value(payload, :generated_at) do
