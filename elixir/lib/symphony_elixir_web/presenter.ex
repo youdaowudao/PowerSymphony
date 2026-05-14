@@ -361,7 +361,6 @@ defmodule SymphonyElixirWeb.Presenter do
   defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
 
   defp blank_to_na(""), do: "n/a"
-  defp blank_to_na(nil), do: "n/a"
   defp blank_to_na(value), do: value
 
   defp map_integer_value(map, key) do
