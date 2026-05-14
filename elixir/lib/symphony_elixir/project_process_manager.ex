@@ -158,15 +158,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   @impl true
-  def terminate(_reason, state) do
-    Enum.each(state.active_ports, fn {_key, %{project_id: project_id}} ->
-      stop_runtime_on_shutdown(project_id, state)
-    end)
-
-    :ok
-  end
-
-  @impl true
   def handle_call(:project_registry, _from, state) do
     registry =
       project_static_registry()
@@ -442,7 +433,14 @@ defmodule SymphonyElixir.ProjectProcessManager do
       |> Map.put(:status, :stopping)
       |> persist_runtime(runtime_dir)
 
-    stop_pid(runtime_state.pid)
+    if is_integer(runtime_state.pid) and process_alive?(runtime_state.pid) do
+      _ = System.cmd("kill", ["-TERM", Integer.to_string(runtime_state.pid)])
+
+      unless wait_until_dead(runtime_state.pid, @stop_wait_ms) do
+        _ = System.cmd("kill", ["-KILL", Integer.to_string(runtime_state.pid)])
+        _ = wait_until_dead(runtime_state.pid, @stop_wait_ms)
+      end
+    end
 
     remaining_ports =
       Enum.reject(state.active_ports, fn {_key, active} ->
@@ -464,24 +462,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
     {{:ok, stopped_state}, %{state | active_ports: remaining_ports, runtimes: Map.put(state.runtimes, entry.project_id, stopped_state)}}
   end
-
-  defp stop_runtime_on_shutdown(project_id, state) when is_binary(project_id) do
-    case find_entry(project_static_registry(), project_id) do
-      {:ok, entry} ->
-        _ = stop_project_runtime(entry, state, allow_not_running: true)
-        :ok
-
-      {:error, _reason} ->
-        state.runtimes
-        |> Map.get(project_id)
-        |> case do
-          %{pid: pid} -> stop_pid(pid)
-          _other -> :ok
-        end
-    end
-  end
-
-  defp stop_runtime_on_shutdown(_project_id, _state), do: :ok
 
   defp open_worker_port(entry, command_builder, stdout_path, stderr_path) do
     executable = System.find_executable("bash")
@@ -841,21 +821,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
         wait_until_dead(pid, timeout_ms, started_ms)
     end
   end
-
-  defp stop_pid(pid) when is_integer(pid) do
-    if process_alive?(pid) do
-      _ = System.cmd("kill", ["-TERM", Integer.to_string(pid)])
-
-      unless wait_until_dead(pid, @stop_wait_ms) do
-        _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)])
-        _ = wait_until_dead(pid, @stop_wait_ms)
-      end
-    end
-
-    :ok
-  end
-
-  defp stop_pid(_pid), do: :ok
 
   defp parse_datetime(nil), do: nil
 
