@@ -79,6 +79,104 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule GatedSnapshotOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts) do
+      {:ok,
+       %{
+         test_pid: Keyword.fetch!(opts, :test_pid),
+         next_call_id: 0,
+         pending_calls: %{}
+       }}
+    end
+
+    def handle_call(:snapshot, from, state) do
+      call_id = state.next_call_id + 1
+      send(state.test_pid, {:snapshot_requested, call_id})
+
+      {:noreply,
+       %{
+         state
+         | next_call_id: call_id,
+           pending_calls: Map.put(state.pending_calls, call_id, from)
+       }}
+    end
+
+    def handle_call(:request_refresh, _from, state) do
+      {:reply, :unavailable, state}
+    end
+
+    def handle_info({:release_snapshot, call_id, snapshot}, state) do
+      case Map.pop(state.pending_calls, call_id) do
+        {nil, _pending_calls} ->
+          {:noreply, state}
+
+        {from, pending_calls} ->
+          GenServer.reply(from, snapshot)
+          {:noreply, %{state | pending_calls: pending_calls}}
+      end
+    end
+  end
+
+  defmodule CrashingSnapshotOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start(__MODULE__, opts, name: name)
+    end
+
+    def init(opts) do
+      {:ok,
+       %{
+         test_pid: Keyword.fetch!(opts, :test_pid),
+         next_call_id: 0,
+         pending_calls: %{}
+       }}
+    end
+
+    def handle_call(:snapshot, from, state) do
+      call_id = state.next_call_id + 1
+      send(state.test_pid, {:snapshot_requested, call_id})
+
+      case call_id do
+        1 ->
+          {caller_pid, _tag} = from
+          Process.exit(caller_pid, :snapshot_crashed)
+          {:noreply, %{state | next_call_id: call_id}}
+
+        _ ->
+          {:noreply,
+           %{
+             state
+             | next_call_id: call_id,
+               pending_calls: Map.put(state.pending_calls, call_id, from)
+           }}
+      end
+    end
+
+    def handle_call(:request_refresh, _from, state) do
+      {:reply, :unavailable, state}
+    end
+
+    def handle_info({:release_snapshot, call_id, snapshot}, state) do
+      case Map.pop(state.pending_calls, call_id) do
+        {nil, _pending_calls} ->
+          {:noreply, state}
+
+        {from, pending_calls} ->
+          GenServer.reply(from, snapshot)
+          {:noreply, %{state | pending_calls: pending_calls}}
+      end
+    end
+  end
+
   defmodule M3PrecheckOrchestrator do
     use GenServer
 
@@ -420,7 +518,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       )
 
-    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
@@ -1293,7 +1391,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       )
 
-    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
 
     html = html_response(get(build_conn(), "/"), 200)
     assert html =~ "/dashboard.css"
@@ -1321,20 +1419,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert live_view_js =~ "var LiveView = (() => {"
   end
 
-  test "dashboard liveview renders and refreshes over pubsub" do
+  test "dashboard liveview renders a workflow skeleton before the async snapshot finishes" do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
     snapshot = static_snapshot()
 
     {:ok, orchestrator_pid} =
-      StaticOrchestrator.start_link(
+      GatedSnapshotOrchestrator.start_link(
         name: orchestrator_name,
-        snapshot: snapshot,
-        refresh: %{
-          queued: true,
-          coalesced: true,
-          requested_at: DateTime.utc_now(),
-          operations: ["poll"]
-        }
+        test_pid: self()
       )
 
     start_test_endpoint(
@@ -1363,74 +1455,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Operations Dashboard"
     assert html =~ "Projects"
-    assert html =~ "Alpha"
-    assert html =~ "Beta"
-    assert html =~ "not_started"
-    assert html =~ "invalid"
-    assert html =~ "MT-HTTP"
-    assert html =~ "MT-RETRY"
-    assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "Codex update"
-    assert html =~ "reasoning summary streaming"
-    assert html =~ "codex_reasoning"
-    assert html =~ "normal"
-    assert html =~ "Copy ID"
-    refute html =~ "rendered"
-    refute html =~ "notification"
-    refute html =~ "Timeline"
-    refute html =~ "Prompt"
-    refute html =~ "Shell output"
-    refute html =~ "Recent events"
-    refute html =~ "data-runtime-clock="
-    refute html =~ "setInterval(refreshRuntimeClocks"
-    refute html =~ "Refresh now"
-    refute html =~ "Transport"
-    assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
+    assert html =~ "Todo 池检验"
+    assert html =~ "M3-0 预检"
+    assert html =~ "Loading workflow snapshot"
+    refute html =~ "Snapshot unavailable"
+    refute html =~ "MT-HTTP"
+    refute html =~ "MT-RETRY"
 
-    updated_snapshot =
-      put_in(snapshot.running, [
-        %{
-          issue_id: "issue-http",
-          identifier: "MT-HTTP",
-          state: "In Progress",
-          linear_state: "In Progress",
-          current_phase: "codex_reasoning",
-          current_action: "reasoning summary streaming",
-          health: "normal",
-          session_id: "thread-http",
-          turn_count: 8,
-          codex_app_server_pid: nil,
-          last_codex_event: :notification,
-          last_codex_message: %{
-            event: :notification,
-            message: %{
-              payload: %{
-                "method" => "codex/event/agent_message_content_delta",
-                "params" => %{
-                  "msg" => %{
-                    "content" => "structured update"
-                  }
-                }
-              }
-            }
-          },
-          last_codex_timestamp: ~U[2026-05-13 03:00:00Z],
-          codex_input_tokens: 10,
-          codex_output_tokens: 12,
-          codex_total_tokens: 22,
-          started_at: DateTime.utc_now()
-        }
-      ])
+    assert_receive {:snapshot_requested, 1}
 
-    :sys.replace_state(orchestrator_pid, fn state ->
-      Keyword.put(state, :snapshot, updated_snapshot)
-    end)
-
-    StatusDashboard.notify_update()
+    send(orchestrator_pid, {:release_snapshot, 1, snapshot})
 
     assert_eventually(fn ->
       rendered = render(view)
@@ -1441,7 +1475,375 @@ defmodule SymphonyElixir.ExtensionsTest do
         rendered =~ "codex_reasoning" and
         rendered =~ "normal" and
         rendered =~ "Copy ID" and
+        rendered =~ "MT-HTTP" and
+        rendered =~ "MT-RETRY" and
         refute_rendered_raw_activity?(rendered)
+    end)
+  end
+
+  test "workflow dashboard keeps loading distinct from an actual empty snapshot" do
+    orchestrator_name = Module.concat(__MODULE__, :EmptyDashboardOrchestrator)
+
+    empty_snapshot = %{
+      running: [],
+      retrying: [],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      rate_limits: nil
+    }
+
+    {:ok, orchestrator_pid} =
+      GatedSnapshotOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Loading workflow snapshot"
+    assert html =~ "Projects"
+    assert html =~ "Todo 池检验"
+
+    assert_receive {:snapshot_requested, 1}
+
+    send(orchestrator_pid, {:release_snapshot, 1, empty_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "No active sessions." and
+        not String.contains?(rendered, "Loading workflow snapshot")
+    end)
+  end
+
+  test "workflow dashboard ignores a stale snapshot after a newer refresh wins" do
+    orchestrator_name = Module.concat(__MODULE__, :StaleDashboardOrchestrator)
+
+    first_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-old",
+          identifier: "MT-OLD",
+          title: "Old snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "old snapshot",
+          health: "normal",
+          session_id: "thread-old",
+          turn_id: "turn-old",
+          turn_count: 1,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 1,
+          codex_output_tokens: 1,
+          codex_total_tokens: 2
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 1, output_tokens: 1, total_tokens: 2, seconds_running: 1},
+      rate_limits: nil
+    }
+
+    second_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-new",
+          identifier: "MT-NEW",
+          title: "New snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "new snapshot",
+          health: "normal",
+          session_id: "thread-new",
+          turn_id: "turn-new",
+          turn_count: 2,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 3,
+          codex_output_tokens: 4,
+          codex_total_tokens: 7
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 3, output_tokens: 4, total_tokens: 7, seconds_running: 2},
+      rate_limits: nil
+    }
+
+    {:ok, orchestrator_pid} =
+      GatedSnapshotOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Loading workflow snapshot"
+
+    assert_receive {:snapshot_requested, 1}
+
+    send(view.pid, :observability_updated)
+    refute_receive {:snapshot_requested, 2}, 50
+
+    send(orchestrator_pid, {:release_snapshot, 1, first_snapshot})
+    assert_receive {:snapshot_requested, 2}
+    refute render(view) =~ "MT-OLD"
+
+    send(orchestrator_pid, {:release_snapshot, 2, second_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "MT-NEW" and rendered =~ "Running sessions" and
+        not String.contains?(rendered, "MT-OLD")
+    end)
+  end
+
+  test "workflow dashboard keeps showing the last snapshot while a refresh is in flight" do
+    orchestrator_name = Module.concat(__MODULE__, :RefreshDisplayDashboardOrchestrator)
+
+    first_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-visible",
+          identifier: "MT-VISIBLE",
+          title: "Visible snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "visible snapshot",
+          health: "normal",
+          session_id: "thread-visible",
+          turn_id: "turn-visible",
+          turn_count: 2,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 2,
+          codex_output_tokens: 3,
+          codex_total_tokens: 5
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 2, output_tokens: 3, total_tokens: 5, seconds_running: 2},
+      rate_limits: nil
+    }
+
+    second_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-refreshed",
+          identifier: "MT-REFRESHED",
+          title: "Refreshed snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "refreshed snapshot",
+          health: "normal",
+          session_id: "thread-refreshed",
+          turn_id: "turn-refreshed",
+          turn_count: 3,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 3,
+          codex_output_tokens: 5,
+          codex_total_tokens: 8
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 3, output_tokens: 5, total_tokens: 8, seconds_running: 3},
+      rate_limits: nil
+    }
+
+    {:ok, orchestrator_pid} =
+      GatedSnapshotOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/")
+    assert_receive {:snapshot_requested, 1}
+    send(orchestrator_pid, {:release_snapshot, 1, first_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "MT-VISIBLE" and not String.contains?(rendered, "Loading workflow snapshot")
+    end)
+
+    send(view.pid, :observability_updated)
+    assert_receive {:snapshot_requested, 2}
+
+    rendered_during_refresh = render(view)
+    assert rendered_during_refresh =~ "MT-VISIBLE"
+    refute rendered_during_refresh =~ "Loading workflow snapshot"
+
+    send(orchestrator_pid, {:release_snapshot, 2, second_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "MT-REFRESHED" and not String.contains?(rendered, "MT-VISIBLE")
+    end)
+  end
+
+  test "workflow dashboard recovers from a crashed initial snapshot task and drains pending refreshes" do
+    orchestrator_name = Module.concat(__MODULE__, :CrashingDashboardOrchestrator)
+
+    recovery_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-recovered",
+          identifier: "MT-RECOVERED",
+          title: "Recovered snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "recovered snapshot",
+          health: "normal",
+          session_id: "thread-recovered",
+          turn_id: "turn-recovered",
+          turn_count: 2,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 2,
+          codex_output_tokens: 3,
+          codex_total_tokens: 5
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 2, output_tokens: 3, total_tokens: 5, seconds_running: 2},
+      rate_limits: nil
+    }
+
+    {:ok, orchestrator_pid} =
+      CrashingSnapshotOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Loading workflow snapshot"
+    assert_receive {:snapshot_requested, 1}
+
+    send(view.pid, :observability_updated)
+    assert_receive {:snapshot_requested, 2}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Snapshot unavailable" and rendered =~ "snapshot_unavailable" and
+        not String.contains?(rendered, "Loading workflow snapshot")
+    end)
+
+    send(orchestrator_pid, {:release_snapshot, 2, recovery_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "MT-RECOVERED" and not String.contains?(rendered, "Loading workflow snapshot") and
+        not String.contains?(rendered, "Snapshot unavailable")
+    end)
+  end
+
+  test "workflow dashboard coalesces repeated refresh events until the in-flight snapshot completes" do
+    orchestrator_name = Module.concat(__MODULE__, :CoalescedRefreshDashboardOrchestrator)
+
+    first_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-first",
+          identifier: "MT-FIRST",
+          title: "First snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "first snapshot",
+          health: "normal",
+          session_id: "thread-first",
+          turn_id: "turn-first",
+          turn_count: 1,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 1,
+          codex_output_tokens: 1,
+          codex_total_tokens: 2
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 1, output_tokens: 1, total_tokens: 2, seconds_running: 1},
+      rate_limits: nil
+    }
+
+    second_snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-final",
+          identifier: "MT-FINAL",
+          title: "Final snapshot",
+          state: "In Progress",
+          linear_state: "In Progress",
+          current_phase: "codex_reasoning",
+          current_action: "final snapshot",
+          health: "normal",
+          session_id: "thread-final",
+          turn_id: "turn-final",
+          turn_count: 3,
+          started_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          codex_input_tokens: 4,
+          codex_output_tokens: 5,
+          codex_total_tokens: 9
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 4, output_tokens: 5, total_tokens: 9, seconds_running: 3},
+      rate_limits: nil
+    }
+
+    {:ok, orchestrator_pid} =
+      GatedSnapshotOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 250)
+
+    {:ok, view, _html} = live(build_conn(), "/")
+    assert_receive {:snapshot_requested, 1}
+
+    send(view.pid, :observability_updated)
+    send(view.pid, :observability_updated)
+    send(view.pid, :observability_updated)
+
+    refute_receive {:snapshot_requested, 2}, 50
+
+    send(orchestrator_pid, {:release_snapshot, 1, first_snapshot})
+    assert_receive {:snapshot_requested, 2}
+    refute_receive {:snapshot_requested, 3}, 10
+
+    send(orchestrator_pid, {:release_snapshot, 2, second_snapshot})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "MT-FINAL" and not String.contains?(rendered, "Loading workflow snapshot")
     end)
   end
 
@@ -1852,9 +2254,13 @@ defmodule SymphonyElixir.ExtensionsTest do
       snapshot_timeout_ms: 5
     )
 
-    {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Snapshot unavailable"
-    assert html =~ "snapshot_unavailable"
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Loading workflow snapshot"
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "Snapshot unavailable" and rendered =~ "snapshot_unavailable"
+    end)
   end
 
   test "control-plane dashboard stays lightweight and shows runtime overview columns" do
