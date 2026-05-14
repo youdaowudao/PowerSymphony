@@ -61,6 +61,12 @@ case mode do
 
                 "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
 
+              "/api/v1/state" ->
+                body =
+                  ~s({"generated_at":"2026-05-12T00:00:00Z","counts":{"running":1,"retrying":0},"running":[{"issue_id":"cp-run-1","issue_identifier":"MT-CP-RUN-1","title":"Fake worker summary","state":"In Progress","linear_state":"In Progress","current_phase":"codex_reasoning","current_action":"reasoning summary streaming","health":"normal","worker_host":null,"workspace_path":null,"session_id":"thread-cp-turn-7","thread_id":"thread-cp","turn_id":"turn-7","turn_count":7,"last_event":"notification","last_message":"rendered","started_at":"2026-05-12T00:00:00Z","last_event_at":"2026-05-12T00:08:00Z","run_duration_seconds":480,"last_error":null,"tokens":{"input_tokens":4,"output_tokens":8,"total_tokens":12}}],"retrying":[],"codex_totals":{"input_tokens":4,"output_tokens":8,"total_tokens":12,"seconds_running":480},"rate_limits":null})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
               _other ->
                 "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
             end

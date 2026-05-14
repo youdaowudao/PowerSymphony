@@ -431,6 +431,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
+                 "title" => "HTTP issue",
                  "state" => "In Progress",
                  "linear_state" => "In Progress",
                  "current_phase" => "codex_reasoning",
@@ -439,11 +440,15 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
+                 "thread_id" => "thread-http",
+                 "turn_id" => "turn-http",
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => state_payload["running"] |> List.first() |> Map.fetch!("last_event_at"),
+                 "run_duration_seconds" => 0,
+                 "last_error" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -535,7 +540,26 @@ defmodule SymphonyElixir.ExtensionsTest do
             normalized_config: %{enabled: true, worker_port: 4101},
             validation_result: :valid,
             validation_errors: [],
-            runtime_state: %{status: :not_started}
+            runtime_state: %{
+              status: :not_started,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_editing_files",
+                  current_action: "Codex 正在修改文件",
+                  health: "normal",
+                  session_id: "thread-alpha-turn-1",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-1",
+                  turn_count: 3,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 480,
+                  last_error: nil
+                }
+              ]
+            }
           },
           %{
             project_id: "Beta",
@@ -579,7 +603,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: 4101,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-ALPHA-1",
+          "title" => "Alpha task",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_editing_files",
+          "current_action" => "Codex 正在修改文件",
+          "health" => "normal",
+          "session_id" => "thread-alpha-turn-1",
+          "thread_id" => "thread-alpha",
+          "turn_id" => "turn-1",
+          "turn_count" => 3,
+          "last_event_at" => "2026-05-14T02:00:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
 
     assert_project_summary_shape(Enum.at(payload["projects"], 1),
@@ -633,7 +674,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: 4101,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-ALPHA-1",
+          "title" => "Alpha task",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_editing_files",
+          "current_action" => "Codex 正在修改文件",
+          "health" => "normal",
+          "session_id" => "thread-alpha-turn-1",
+          "thread_id" => "thread-alpha",
+          "turn_id" => "turn-1",
+          "turn_count" => 3,
+          "last_event_at" => "2026-05-14T02:00:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
 
     assert json_response(post(build_conn(), "/api/v1/projects", %{}), 405) == %{
@@ -647,6 +705,42 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/projects/missing/summary"), 404) == %{
              "error" => %{"code" => "project_not_found", "message" => "Project not found"}
            }
+  end
+
+  test "project summary preserves string-keyed run summaries and missing numeric fields stay nil" do
+    start_test_endpoint(
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              "status" => "running",
+              "run_summaries" => [
+                %{
+                  "issue_identifier" => "MT-STRING-1",
+                  "title" => "String keyed summary",
+                  "current_phase" => "codex_reasoning",
+                  "current_action" => "thinking",
+                  "health" => "normal"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    assert detail["project"]["runtime_state"]["status"] == "running"
+    [summary] = detail["project"]["run_summaries"]
+
+    assert summary["issue_identifier"] == "MT-STRING-1"
+    assert summary["title"] == "String keyed summary"
+    assert summary["turn_count"] == nil
+    assert summary["run_duration_seconds"] == nil
   end
 
   test "projects api reads dynamic runtime state from project process manager" do
@@ -700,7 +794,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: port,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-CP-RUN-1",
+          "title" => "Fake worker summary",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_reasoning",
+          "current_action" => "reasoning summary streaming",
+          "health" => "normal",
+          "session_id" => "thread-cp-turn-7",
+          "thread_id" => "thread-cp",
+          "turn_id" => "turn-7",
+          "turn_count" => 7,
+          "last_event_at" => "2026-05-12T00:08:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
 
     detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
@@ -715,7 +826,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: port,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-CP-RUN-1",
+          "title" => "Fake worker summary",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_reasoning",
+          "current_action" => "reasoning summary streaming",
+          "health" => "normal",
+          "session_id" => "thread-cp-turn-7",
+          "thread_id" => "thread-cp",
+          "turn_id" => "turn-7",
+          "turn_count" => 7,
+          "last_event_at" => "2026-05-12T00:08:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
 
     {:ok, view, html} = live(build_conn(), "/")
@@ -900,7 +1028,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: alpha_port,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-CP-RUN-1",
+          "title" => "Fake worker summary",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_reasoning",
+          "current_action" => "reasoning summary streaming",
+          "health" => "normal",
+          "session_id" => "thread-cp-turn-7",
+          "thread_id" => "thread-cp",
+          "turn_id" => "turn-7",
+          "turn_count" => 7,
+          "last_event_at" => "2026-05-12T00:08:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
 
     beta_detail = json_response(get(build_conn(), "/api/v1/projects/beta/summary"), 200)
@@ -953,7 +1098,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       worker_port: alpha_port,
       last_seen_at: nil,
       last_health_check_at: nil,
-      last_error: nil
+      last_error: nil,
+      run_summaries: [
+        %{
+          "issue_identifier" => "MT-CP-RUN-1",
+          "title" => "Fake worker summary",
+          "linear_state" => "In Progress",
+          "current_phase" => "codex_reasoning",
+          "current_action" => "reasoning summary streaming",
+          "health" => "normal",
+          "session_id" => "thread-cp-turn-7",
+          "thread_id" => "thread-cp",
+          "turn_id" => "turn-7",
+          "turn_count" => 7,
+          "last_event_at" => "2026-05-12T00:08:00Z",
+          "run_duration_seconds" => 480,
+          "last_error" => nil
+        }
+      ]
     )
   end
 
@@ -1309,6 +1471,60 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "/api/v1/projects/alpha/summary"
     refute html =~ "/api/v1/projects//summary"
+  end
+
+  test "control-plane dashboard renders run summaries in an explicit thread status section" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  session_id: "thread-alpha-turn-9",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  turn_count: 9,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960,
+                  last_error: "tool_call_failed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "线程状态"
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "Alpha task"
+    assert html =~ "codex_waiting_next_event"
+    assert html =~ "最近一段时间没有新事件"
+    assert html =~ "possibly_stalled"
+    assert html =~ "thread-alpha"
+    assert html =~ "turn-9"
+    assert html =~ "thread-alpha-turn-9"
+    assert html =~ "960s"
+    assert html =~ "tool_call_failed"
+    refute html =~ "Recent events"
+    refute html =~ "Prompt"
+    refute html =~ "Shell output"
+    refute html =~ "Timeline"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -2324,12 +2540,15 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          title: "HTTP issue",
           state: "In Progress",
           linear_state: "In Progress",
           current_phase: "codex_reasoning",
           current_action: "reasoning summary streaming",
           health: "normal",
           session_id: "thread-http",
+          thread_id: "thread-http",
+          turn_id: "turn-http",
           turn_count: 7,
           codex_app_server_pid: nil,
           last_codex_message: "rendered",
@@ -2338,7 +2557,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
-          started_at: DateTime.utc_now()
+          started_at: DateTime.utc_now(),
+          last_error: nil
         }
       ],
       retrying: [
@@ -2610,6 +2830,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp assert_project_summary_shape(project, expected) do
     expected_validation_errors = Keyword.fetch!(expected, :validation_errors)
+    expected_run_summaries = Keyword.get(expected, :run_summaries, [])
 
     expected_keys = [
       "project_id",
@@ -2622,7 +2843,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       "last_seen_at",
       "last_health_check_at",
       "last_error",
-      "runtime_state"
+      "runtime_state",
+      "run_summaries"
     ]
 
     assert Map.keys(project) |> Enum.sort() == Enum.sort(expected_keys)
@@ -2651,6 +2873,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_validation_errors_shape(project["validation_errors"], expected_validation_errors)
     assert project["runtime_state"] == %{"status" => Keyword.fetch!(expected, :worker_status)}
+    assert project["run_summaries"] == expected_run_summaries
     assert_optional_iso8601(project["last_seen_at"], Keyword.fetch!(expected, :last_seen_at))
 
     assert_optional_iso8601(
@@ -2668,6 +2891,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute Map.has_key?(project, "prompt_body")
     refute Map.has_key?(project, "shell_output")
   end
+
 
   defp assert_validation_errors_shape(actual, expected) do
     assert length(actual) == length(expected)

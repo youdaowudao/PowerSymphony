@@ -1159,6 +1159,127 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert entry.runtime_state.health_check_timeout_ms == 250
   end
 
+  test "stopped worker clears stale run summaries" do
+    test_root = temp_root!("stop-clears-run-summaries")
+    manager_name = Module.concat(__MODULE__, StopClearsRunSummariesManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    running_entry = fetch_entry!(manager_name, "alpha")
+    assert running_entry.runtime_state.run_summaries != []
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+
+    stopped_entry = fetch_entry!(manager_name, "alpha")
+    assert stopped_entry.runtime_state.status == :stopped
+    assert stopped_entry.runtime_state.run_summaries == []
+  end
+
+  test "worker state 503 clears stale run summaries" do
+    test_root = temp_root!("state-503-clears-run-summaries")
+    manager_name = Module.concat(__MODULE__, State503ClearsRunSummariesManager)
+    port = reserve_tcp_port!()
+    request_log = Path.join(test_root, "state-503.requests.log")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder: fake_worker_builder(%{"alpha" => {"status_503", request_log}})}
+    )
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    inject_runtime!(manager_name, "alpha", fn runtime_state ->
+      runtime_state
+      |> Map.put(:status, :running)
+      |> Map.put(:run_summaries, [%{issue_identifier: "STALE-503"}])
+    end)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.run_summaries == []
+    assert_eventually(fn -> state_request_logged?(request_log) end)
+  end
+
+  test "worker state timeout clears stale run summaries" do
+    test_root = temp_root!("state-timeout-clears-run-summaries")
+    manager_name = Module.concat(__MODULE__, StateTimeoutClearsRunSummariesManager)
+    port = reserve_tcp_port!()
+    request_log = Path.join(test_root, "state-timeout.requests.log")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder: fake_worker_builder(%{"alpha" => {"hang", request_log}})}
+    )
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    inject_runtime!(manager_name, "alpha", fn runtime_state ->
+      runtime_state
+      |> Map.put(:status, :running)
+      |> Map.put(:run_summaries, [%{issue_identifier: "STALE-TIMEOUT"}])
+    end)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.run_summaries == []
+    assert_eventually(fn -> state_request_logged?(request_log) end)
+  end
+
+  test "runtime reload does not restore persisted run summaries" do
+    test_root = temp_root!("reload-without-run-summaries")
+    manager_name = Module.concat(__MODULE__, ReloadWithoutRunSummariesManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_runtime_json!(test_root, "alpha", %{
+      status: "stopped",
+      pid: nil,
+      worker_port: port,
+      run_summaries: [%{"issue_identifier" => "STALE-RELOAD"}]
+    })
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    internal_state = :sys.get_state(manager_name)
+    assert internal_state.runtimes["alpha"].run_summaries == []
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.run_summaries == []
+  end
+
   test "health updates do not cross projects" do
     test_root = temp_root!("health-isolation")
     manager_name = Module.concat(__MODULE__, HealthIsolationManager)
@@ -1791,13 +1912,31 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     entry
   end
 
+  defp inject_runtime!(manager_name, project_id, updater) when is_function(updater, 1) do
+    :sys.replace_state(manager_name, fn state ->
+      runtime_state = Map.fetch!(state.runtimes, project_id)
+      %{state | runtimes: Map.put(state.runtimes, project_id, updater.(runtime_state))}
+    end)
+  end
+
   defp fake_worker_builder(modes) do
     fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
 
     fn entry ->
-      mode = Map.get(modes, entry.project_id, "normal")
+      case Map.get(modes, entry.project_id, "normal") do
+        {mode, request_log} ->
+          "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port} --request-log #{shell_escape(request_log)}"
 
-      "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+        mode ->
+          "elixir #{shell_escape(fake_worker_path)} --mode #{mode} --port #{entry.normalized_config.worker_port}"
+      end
+    end
+  end
+
+  defp state_request_logged?(request_log) do
+    case File.read(request_log) do
+      {:ok, contents} -> String.contains?(contents, "/api/v1/state")
+      _other -> false
     end
   end
 

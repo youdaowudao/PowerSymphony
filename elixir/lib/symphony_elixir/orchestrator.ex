@@ -1958,11 +1958,14 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
+          title: metadata.issue.title,
           state: metadata.issue.state,
           linear_state: summary.linear_state,
           current_phase: summary.current_phase,
           current_action: summary.current_action,
           health: summary.health,
+          thread_id: summary.thread_id,
+          turn_id: summary.turn_id,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
@@ -1975,7 +1978,8 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: summary.last_event_at || metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: summary.last_event_type || metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          last_error: summary.last_error
         }
       end)
 

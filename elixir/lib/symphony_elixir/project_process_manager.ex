@@ -46,7 +46,8 @@ defmodule SymphonyElixir.ProjectProcessManager do
           last_seen_at: DateTime.t() | nil,
           last_health_check_at: DateTime.t() | nil,
           last_error: String.t() | nil,
-          health_check_timeout_ms: pos_integer()
+          health_check_timeout_ms: pos_integer(),
+          run_summaries: [map()]
         }
 
   @type state :: %{
@@ -546,6 +547,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
         merged_runtime =
           entry
           |> merge_runtime_state(Map.get(runtime_map, entry.project_id))
+          |> refresh_run_summaries()
           |> reconcile_project_runtime(entry)
 
         %{entry | runtime_state: merged_runtime}
@@ -613,6 +615,59 @@ defmodule SymphonyElixir.ProjectProcessManager do
     do: %{runtime_state | status: :unreachable}
 
   defp project_health_status(runtime_state), do: runtime_state
+
+  defp refresh_run_summaries(%{status: status, worker_port: worker_port} = runtime_state)
+       when status in [:running, :unreachable] and is_integer(worker_port) do
+    case Req.get("http://127.0.0.1:#{worker_port}/api/v1/state",
+           retry: false,
+           receive_timeout: runtime_state.health_check_timeout_ms
+         ) do
+      {:ok, %Req.Response{status: http_status, body: body}}
+      when http_status in 200..299 and is_map(body) ->
+        Map.put(runtime_state, :run_summaries, project_run_summaries_from_state(body))
+
+      _ ->
+        Map.put(runtime_state, :run_summaries, [])
+    end
+  end
+
+  defp refresh_run_summaries(runtime_state), do: Map.put(runtime_state, :run_summaries, [])
+
+  defp project_run_summaries_from_state(body) when is_map(body) do
+    body
+    |> loaded_runtime_value(:running)
+    |> List.wrap()
+    |> Enum.map(&project_run_summary_from_running_entry/1)
+    |> Enum.filter(&summary_present?/1)
+  end
+
+  defp project_run_summaries_from_state(_body), do: []
+
+  defp project_run_summary_from_running_entry(entry) when is_map(entry) do
+    %{
+      issue_identifier: loaded_runtime_value(entry, :issue_identifier),
+      title: loaded_runtime_value(entry, :title),
+      linear_state: loaded_runtime_value(entry, :linear_state),
+      current_phase: loaded_runtime_value(entry, :current_phase),
+      current_action: loaded_runtime_value(entry, :current_action),
+      health: loaded_runtime_value(entry, :health),
+      session_id: loaded_runtime_value(entry, :session_id),
+      thread_id: loaded_runtime_value(entry, :thread_id),
+      turn_id: loaded_runtime_value(entry, :turn_id),
+      turn_count: loaded_runtime_value(entry, :turn_count),
+      last_event_at: loaded_runtime_value(entry, :last_event_at) |> parse_datetime(),
+      run_duration_seconds: loaded_runtime_value(entry, :run_duration_seconds),
+      last_error: loaded_runtime_value(entry, :last_error)
+    }
+  end
+
+  defp project_run_summary_from_running_entry(_entry), do: %{}
+
+  defp summary_present?(summary) when is_map(summary) do
+    Enum.any?(summary, fn {_key, value} -> not is_nil(value) end)
+  end
+
+  defp summary_present?(_summary), do: false
 
   defp refresh_runtime_truth(runtime_map, %ProjectRegistry{entries: entries}) do
     Enum.reduce(entries, runtime_map, fn
@@ -766,7 +821,8 @@ defmodule SymphonyElixir.ProjectProcessManager do
       last_seen_at: nil,
       last_health_check_at: nil,
       last_error: nil,
-      health_check_timeout_ms: current_health_check_timeout_ms()
+      health_check_timeout_ms: current_health_check_timeout_ms(),
+      run_summaries: []
     }
   end
 

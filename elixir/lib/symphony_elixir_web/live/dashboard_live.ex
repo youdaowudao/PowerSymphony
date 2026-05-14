@@ -225,6 +225,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <summary>M3-0 预检</summary>
                         <.m3_precheck_result result={Map.get(@m3_precheck_results, project.project_id, %{})} />
                       </details>
+                      <details :if={project.run_summaries != []} class="session-stack">
+                        <summary>线程状态</summary>
+                        <div class="session-stack">
+                          <article :for={summary <- project.run_summaries} class="detail-stack">
+                            <div class="issue-stack">
+                              <span class="issue-id"><%= summary.issue_identifier || "n/a" %></span>
+                              <span class="muted"><%= project_run_summary_title(summary) %></span>
+                            </div>
+                            <div>
+                              <span class={state_badge_class(summary.health || summary.current_phase || summary.linear_state)}>
+                                <%= summary.current_phase || "unknown" %>
+                              </span>
+                              <span class="muted event-meta">
+                                <%= project_run_summary_health_meta(summary) %>
+                              </span>
+                            </div>
+                            <div class="mono"><%= summary.current_action || "n/a" %></div>
+                            <div class="muted event-meta"><%= project_run_summary_ids(summary) %></div>
+                            <div class="muted event-meta"><%= project_run_summary_runtime(summary) %></div>
+                            <p :if={is_binary(summary.last_error) and summary.last_error != ""} class="mono">
+                              <%= summary.last_error %>
+                            </p>
+                          </article>
+                        </div>
+                      </details>
                     </td>
                   </tr>
                 </tbody>
@@ -884,6 +909,46 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+
+  defp project_run_summary_title(summary) do
+    case summary.title do
+      value when is_binary(value) and value != "" -> value
+      _ -> "未提供标题"
+    end
+  end
+
+  defp project_run_summary_health_meta(summary) do
+    [summary.linear_state, summary.health]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.join(" · ")
+    |> blank_to_na()
+  end
+
+  defp project_run_summary_ids(summary) do
+    [
+      summary.thread_id && "thread #{summary.thread_id}",
+      summary.turn_id && "turn #{summary.turn_id}",
+      summary.session_id && "session #{summary.session_id}"
+    ]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" · ")
+    |> blank_to_na()
+  end
+
+  defp project_run_summary_runtime(summary) do
+    parts =
+      [
+        if(is_integer(summary.turn_count), do: "#{summary.turn_count} turns"),
+        if(is_binary(summary.last_event_at), do: "last event #{summary.last_event_at}"),
+        if(is_integer(summary.run_duration_seconds), do: "#{summary.run_duration_seconds}s")
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    case parts do
+      [] -> "n/a"
+      _ -> Enum.join(parts, " · ")
+    end
+  end
 
   defp project_validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
   defp project_validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
