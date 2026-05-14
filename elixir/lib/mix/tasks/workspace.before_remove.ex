@@ -68,15 +68,19 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
            "open"
          ]) do
       {:ok, output} ->
-        case Jason.decode(output) do
-          {:ok, prs} when is_list(prs) ->
-            Enum.map(prs, fn pr -> to_string(pr["number"]) end)
-
-          _ ->
-            []
-        end
+        decode_pull_request_numbers(output)
 
       {:error, _reason} ->
+        []
+    end
+  end
+
+  defp decode_pull_request_numbers(output) do
+    case Jason.decode(output) do
+      {:ok, prs} when is_list(prs) ->
+        Enum.map(prs, fn pr -> to_string(pr["number"]) end)
+
+      _ ->
         []
     end
   end
