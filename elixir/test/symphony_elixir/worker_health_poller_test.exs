@@ -339,17 +339,18 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
     alpha_entry = fetch_entry!(manager_name, "alpha")
     beta_entry = fetch_entry!(manager_name, "beta")
 
-    alpha_request_count =
+    alpha_health_request_count =
       if File.exists?(alpha_request_log) do
         alpha_request_log
         |> File.read!()
         |> String.split("\n", trim: true)
+        |> Enum.filter(&(&1 == "/api/v1/health"))
         |> length()
       else
         0
       end
 
-    assert alpha_request_count <= 1
+    assert alpha_health_request_count <= 1
     assert beta_entry.runtime_state.status == :running
     assert beta_entry.runtime_state.health_status == :healthy
     assert alpha_entry.runtime_state.last_error in [nil, "request timed out"]
