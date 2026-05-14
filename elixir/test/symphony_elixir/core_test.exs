@@ -1611,7 +1611,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is retry attempt #2 because the ticket is still in an active state."
     assert prompt =~ "Do not end the turn while the issue remains in an active state"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "Do not bypass the repo-local GitHub helper path with ad-hoc CLI commands"
     assert prompt =~ "PR created / updated is only the entry signal into the PR closeout path, not the completion signal."
     assert prompt =~ "After every successful PR creation or branch update push, immediately attempt to enable auto-merge for the current PR before reading checks or mergeability."
     assert prompt =~ "`Checking` -> stop the current implementation run after the bounded PR closeout pass."

@@ -278,7 +278,7 @@ If command output is in English, keep the original output first, then add a brie
   - If none of those exit conditions are hit, keep `Checking` and end the run.
   - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue after the auto-merge path and manual-merge fallback have both been evaluated.
 - `Human Review` -> validated work is waiting on human approval unless a new clear human delta or a new unresolved review delta exists, in which case immediately move to `Rework` and run the incremental rework flow.
-- `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
+- `Merging` -> approved by human; execute the `land` skill flow (do not bypass the repo-local GitHub helper path with ad-hoc CLI commands).
 - `Rework` -> reviewer or human requested changes; execute the requested delta by reusing the existing branch, PR, and body workpad when safe.
 - `Done` -> terminal state; no further action required.
 
@@ -295,7 +295,7 @@ Step 0 may only run after the preflight body gate has classified the run as `exe
    - `In Progress` -> continue execution flow from the current issue-body snapshot.
    - `Checking` -> run one bounded recheck pass using only PR merge state, latest head SHA required checks, and newest human review delta; then route to `Done`, `In Progress`, `Human Review`, or stay in `Checking`.
    - `Human Review` -> if a new execute-mode human delta or an active unresolved review delta exists, immediately move to `Rework` and run the incremental rework flow; otherwise stop immediately and resume only on a later explicit trigger.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not bypass the repo-local GitHub helper path with ad-hoc CLI commands.
    - `Rework` -> run the incremental rework flow, reusing the existing branch, PR, and body workpad when safe.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
@@ -340,9 +340,9 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 
 1. Identify the PR number from issue links or attachments.
 2. In review-sensitive states, gather only the new or still-unresolved feedback required for this pass from the necessary channels:
-   - Top-level PR comments (`gh pr view --comments`).
-   - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
-   - Review summaries or states (`gh pr view --json reviews`).
+   - Top-level PR comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
+   - Inline review comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
+   - Review summaries or states (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
    - Only the necessary short current-issue comments that add review context or human decisions not yet reflected in the issue body.
 3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
    - code, test, or docs updated to address it, or
@@ -458,7 +458,7 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If a new execute-mode human delta exists, immediately move the issue to `Rework` and follow the incremental rework flow.
 4. If an active unresolved review delta exists, move the issue to `Rework` and follow the incremental rework flow.
 5. If approved, human moves the issue to `Merging`.
-6. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+6. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not bypass the repo-local GitHub helper path with ad-hoc CLI commands.
    - In this workflow, `Merging` is the manual fallback lane after the auto-merge path failed or became unnecessary because the PR was already in clean status.
 7. After merge is complete, move the issue to `Done`.
 

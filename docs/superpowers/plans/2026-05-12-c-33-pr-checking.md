@@ -155,7 +155,7 @@ Expected:
 Run:
 
 ```bash
-rg -n "Merging|gh pr merge|land|Human Review|required checks|head SHA|PR created / updated" \
+rg -n "Merging|land|Human Review|required checks|head SHA|PR created / updated|helper path" \
   elixir/WORKFLOW.md
 ```
 

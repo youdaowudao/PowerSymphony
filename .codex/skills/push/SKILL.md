@@ -9,8 +9,9 @@ description:
 
 ## Prerequisites
 
-- `gh` CLI is installed and available in `PATH`.
-- `gh auth status` succeeds for GitHub operations in this repo.
+- `git` is installed and authenticated for pushes to this repo.
+- `python3` is available to run `.codex/skills/github_api.py`.
+- GitHub token access is available through `git credential fill`.
 
 ## Goals
 
@@ -27,7 +28,7 @@ description:
 ## Steps
 
 1. Identify current branch and confirm remote state.
-2. Run local validation (`make -C elixir all`) before pushing.
+2. Run the lightest local validation that matches the diff, following `AGENTS.md`.
 3. Push branch to `origin` with upstream tracking if needed, using whatever
    remote URL is already configured.
 4. If push is not clean/rejected:
@@ -58,7 +59,7 @@ description:
      including newly added work, removed work, or changed approach.
    - Do not reuse stale description text from earlier iterations.
 8. Validate PR body with `mix pr_body.check` and fix all reported issues.
-9. Reply with the PR URL from `gh pr view`.
+9. Reply with the PR URL returned by `.codex/skills/github_api.py`.
 
 ## Commands
 
@@ -67,7 +68,10 @@ description:
 branch=$(git branch --show-current)
 
 # Minimal validation gate
-make -C elixir all
+# Choose the lightest validation that matches the change scope per AGENTS.md.
+# Examples:
+# cd elixir && mise exec -- mix format --check-formatted path/to/file.ex
+# cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test test/path/to_test.exs
 
 # Initial push: respect the current origin remote.
 git push -u origin HEAD
@@ -82,39 +86,38 @@ git push -u origin HEAD
 # Only if history was rewritten locally:
 git push --force-with-lease origin HEAD
 
-# Ensure a PR exists (create only if missing)
-pr_state=$(gh pr view --json state -q .state 2>/dev/null || true)
-if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
-  echo "Current branch is tied to a closed PR; create a new branch + PR." >&2
-  exit 1
-fi
-
 # Write a clear, human-friendly title that summarizes the shipped change.
 pr_title="<clear PR title written for this change>"
-if [ -z "$pr_state" ]; then
-  gh pr create --title "$pr_title"
-else
-  # Reconsider title on every branch update; edit if scope shifted.
-  gh pr edit --title "$pr_title"
-fi
+python3 .codex/skills/github_api.py ensure-pr \
+  --title "$pr_title" \
+  --body-file /tmp/pr_body.md > /tmp/pr_info.json
 
 # Attempt auto-merge immediately after push + PR create/update, before reading
 # checks or mergeability.
-gh pr merge --auto --squash || true
+pr_number=$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/pr_info.json").read_text())
+print(payload["pull_request"]["number"])
+PY
+)
+python3 .codex/skills/github_api.py enable-auto-merge --number "$pr_number" || true
 
 # Write/edit PR body to match .github/pull_request_template.md before validation.
 # Example workflow:
-# 1) open the template and draft body content for this PR
-# 2) gh pr edit --body-file /tmp/pr_body.md
+# 1) open the template and draft body content for this PR into /tmp/pr_body.md
+# 2) ensure-pr will create or refresh title/body using that file
 # 3) for branch updates, re-check that title/body still match current diff
 
-tmp_pr_body=$(mktemp)
-gh pr view --json body -q .body > "$tmp_pr_body"
-(cd elixir && mix pr_body.check --file "$tmp_pr_body")
-rm -f "$tmp_pr_body"
+(cd elixir && mix pr_body.check --file /tmp/pr_body.md)
 
 # Show PR URL for the reply
-gh pr view --json url -q .url
+python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("/tmp/pr_info.json").read_text())
+print(payload["pull_request"]["url"])
+PY
 ```
 
 ## Notes
@@ -122,6 +125,8 @@ gh pr view --json url -q .url
 - Do not use `--force`; only use `--force-with-lease` as the last resort.
 - Do not defer the auto-merge attempt until after reading checks. The default
   order is push first, auto-merge attempt second, signal inspection third.
+- Use `.codex/skills/github_api.py` as the standard GitHub write path. `gh` is
+  not part of the required workflow contract in this repo.
 - Distinguish sync problems from remote auth/permission problems:
   - Use the `pull` skill for non-fast-forward or stale-branch issues.
   - Surface auth, permissions, or workflow restrictions directly instead of

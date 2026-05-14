@@ -16,6 +16,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
   """
 
   @default_repo "openai/symphony"
+  @github_api_script Path.expand("../../../../.codex/skills/github_api.py", __DIR__)
 
   @impl Mix.Task
   def run(args) do
@@ -43,7 +44,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
   defp maybe_close_open_pull_requests(_repo, nil), do: :ok
 
   defp maybe_close_open_pull_requests(repo, branch) do
-    if gh_available?() and gh_authenticated?() do
+    if github_helper_available?() do
       repo
       |> list_open_pull_request_numbers(branch)
       |> Enum.each(&close_pull_request(repo, branch, &1))
@@ -52,33 +53,28 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
     :ok
   end
 
-  defp gh_available? do
-    not is_nil(System.find_executable("gh"))
-  end
-
-  defp gh_authenticated? do
-    match?({:ok, _output}, run_command("gh", ["auth", "status"]))
+  defp github_helper_available? do
+    File.exists?(@github_api_script) and not is_nil(System.find_executable("python3"))
   end
 
   defp list_open_pull_request_numbers(repo, branch) do
-    case run_command("gh", [
-           "pr",
-           "list",
+    case run_github_helper([
+           "list-prs",
            "--repo",
            repo,
-           "--head",
+           "--branch",
            branch,
            "--state",
-           "open",
-           "--json",
-           "number",
-           "--jq",
-           ".[].number"
+           "open"
          ]) do
       {:ok, output} ->
-        output
-        |> String.split("\n", trim: true)
-        |> Enum.reject(&(&1 == ""))
+        case Jason.decode(output) do
+          {:ok, prs} when is_list(prs) ->
+            Enum.map(prs, fn pr -> to_string(pr["number"]) end)
+
+          _ ->
+            []
+        end
 
       {:error, _reason} ->
         []
@@ -86,12 +82,12 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
   end
 
   defp close_pull_request(repo, branch, pr_number) do
-    case run_command("gh", [
-           "pr",
-           "close",
-           pr_number,
+    case run_github_helper([
+           "close-pr",
            "--repo",
            repo,
+           "--number",
+           pr_number,
            "--comment",
            closing_comment(branch)
          ]) do
@@ -123,6 +119,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
       {:error, _reason} ->
         nil
     end
+  end
+
+  defp run_github_helper(args) do
+    run_command("python3", [@github_api_script | args])
   end
 
   defp run_command(command, args) do

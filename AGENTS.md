@@ -12,6 +12,7 @@
 ## PR收口规则
 
 - 对 open PR 的任何新提交，`git push` 成功后，agent 的第一优先级 GitHub 动作必须是为该 PR 立即尝试开启 auto-merge；不得先读取 checks、review delta 或 mergeability 再决定是否发起。
+- 本仓库的 GitHub 写操作标准路径是 `.codex/skills/github_api.py`；`github-mcp` 默认只承担只读检索，`gh` 不是必需前提。
 - 若 auto-merge 返回 `already enabled`，视为成功。
 - 若 auto-merge 返回 `clean status`，说明 PR 已经来到可直接合并阶段；这不是权限故障，也不是 blocker。此时只要 latest head required checks 全绿，就允许进入手动 merge fallback。
 - 只有 auto-merge 因其他原因未开启成功时，才允许保留手动 merge fallback；且必须先在评论区明确汇报失败原因。

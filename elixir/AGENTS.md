@@ -75,6 +75,7 @@ mix specs.check
 ## PR Requirements
 
 - PR body must follow `../.github/pull_request_template.md` exactly.
+- GitHub write actions for repo-local workflows should go through `../.codex/skills/github_api.py`; do not require `gh` as a precondition.
 - After every successful PR creation or branch-update push, immediately attempt
   to enable auto-merge before reading checks or mergeability.
 - Treat `already enabled` as success.
