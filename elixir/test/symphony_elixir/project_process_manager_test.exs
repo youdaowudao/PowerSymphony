@@ -1198,12 +1198,10 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    command_builder = fake_worker_builder(%{"alpha" => {"normal", request_log}})
+    child_spec = {ProjectProcessManager, name: manager_name, command_builder: command_builder}
 
-    start_supervised!(
-      {ProjectProcessManager,
-       name: manager_name,
-       command_builder: fake_worker_builder(%{"alpha" => {"normal", request_log}})}
-    )
+    start_supervised!(child_spec)
 
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
