@@ -121,6 +121,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     defstruct entries: []
   end
 
+  defmodule FailingTrackerAdapter do
+    def fetch_candidate_issues, do: {:error, :tracker_unavailable}
+    def fetch_issues_by_states(_states), do: {:error, :tracker_unavailable}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:error, :tracker_unavailable}
+    def create_comment(_issue_id, _body), do: {:error, :tracker_unavailable}
+    def update_issue_state(_issue_id, _state_name), do: {:error, :tracker_unavailable}
+  end
+
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
 
@@ -2045,7 +2053,23 @@ defmodule SymphonyElixir.ExtensionsTest do
       max_concurrent_agents: 2
     )
 
-    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :MissingWorkflowM3PrecheckOrchestrator))
+    previous_override = Application.get_env(:symphony_elixir, :tracker_adapter_override)
+
+    on_exit(fn ->
+      if is_nil(previous_override) do
+        Application.delete_env(:symphony_elixir, :tracker_adapter_override)
+      else
+        Application.put_env(:symphony_elixir, :tracker_adapter_override, previous_override)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :tracker_adapter_override, FailingTrackerAdapter)
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkflowDashboardM3PrecheckFailureOrchestrator)
+
+    start_supervised!({M3PrecheckOrchestrator, name: orchestrator_name, max_concurrent_agents: 2})
+
+    start_test_endpoint(orchestrator: orchestrator_name)
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Todo 池检验"

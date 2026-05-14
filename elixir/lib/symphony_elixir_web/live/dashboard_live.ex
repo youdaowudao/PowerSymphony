@@ -546,7 +546,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </p>
       </section>
 
-      <p :if={m3_result_empty?(@result)} class="mono">(none)</p>
+      <p :if={m3_result_empty?(@result) and is_binary(m3_result_text(@result)) and m3_result_text(@result) != ""} class="mono">
+        <%= m3_result_text(@result) %>
+      </p>
+
+      <p :if={m3_result_empty?(@result) and m3_result_text(@result) in [nil, ""]} class="mono">(none)</p>
     </div>
     """
   end
@@ -782,8 +786,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp m3_result_unavailable?(result) do
     m3_result_empty?(result) and
-      not is_binary(Map.get(result, :text, Map.get(result, "text")))
+      not is_binary(m3_result_text(result))
   end
+
+  defp m3_result_text(result) when is_map(result) do
+    Map.get(result, :text, Map.get(result, "text"))
+  end
+
+  defp m3_result_text(_result), do: nil
 
   defp m3_issue_label(%{"issue_identifier" => identifier, "state" => state})
        when is_binary(identifier) and is_binary(state),
