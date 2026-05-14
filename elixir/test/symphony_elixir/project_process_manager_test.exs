@@ -643,6 +643,12 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert fallback_entry.runtime_state.status == :not_started
     assert fallback_entry.runtime_state.worker_port == port
 
+    fallback_display_entry = ProjectProcessManager.project_registry_for_display() |> find_entry!("alpha")
+    assert fallback_display_entry.runtime_state.status == :not_started
+    assert fallback_display_entry.runtime_state.pid == nil
+    assert fallback_display_entry.runtime_state.worker_port == port
+    assert fallback_display_entry.runtime_state.run_summaries == []
+
     start_supervised!({ProjectProcessManager, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
 
     assert {:ok, started_state} = ProjectProcessManager.start_project("alpha")
@@ -1213,6 +1219,32 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     display_entry = fetch_display_entry!(manager_name, "alpha")
     assert display_entry.runtime_state.run_summaries != []
     assert_eventually(fn -> state_request_logged?(request_log) end)
+  end
+
+  test "display registry filters malformed worker run summaries" do
+    test_root = temp_root!("display-filters-malformed-run-summaries")
+    manager_name = Module.concat(__MODULE__, MalformedRunSummariesManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "malformed_run_summaries"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    [summary] = entry.runtime_state.run_summaries
+    assert summary.issue_identifier == "MT-PPM-1"
+    assert summary.turn_count == 3
+    assert %DateTime{} = summary.last_event_at
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
   end
 
   test "worker state 503 clears stale run summaries" do

@@ -666,8 +666,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
     |> Enum.filter(&summary_present?/1)
   end
 
-  defp project_run_summaries_from_state(_body), do: []
-
   defp project_run_summary_from_running_entry(entry) when is_map(entry) do
     %{
       issue_identifier: loaded_runtime_value(entry, :issue_identifier),
@@ -691,8 +689,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
   defp summary_present?(summary) when is_map(summary) do
     Enum.any?(summary, fn {_key, value} -> not is_nil(value) end)
   end
-
-  defp summary_present?(_summary), do: false
 
   defp refresh_runtime_truth(runtime_map, %ProjectRegistry{entries: entries}) do
     Enum.reduce(entries, runtime_map, fn

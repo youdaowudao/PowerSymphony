@@ -252,7 +252,6 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
-  defp map_value(_map, _key), do: nil
 
   defp map_integer_value(map, key) do
     case map_value(map, key) do
