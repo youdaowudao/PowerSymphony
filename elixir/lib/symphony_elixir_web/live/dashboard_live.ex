@@ -159,6 +159,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </span>
                         <%= if is_binary(project.project_id) and project.project_id != "" do %>
                           <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
+                          <a class="issue-link" href={"/projects/#{project.project_id}"}>View details</a>
                         <% end %>
                       </div>
                     </td>
@@ -224,31 +225,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <details class="session-stack">
                         <summary>M3-0 预检</summary>
                         <.m3_precheck_result result={Map.get(@m3_precheck_results, project.project_id, %{})} />
-                      </details>
-                      <details :if={project.run_summaries != []} class="session-stack">
-                        <summary>线程状态</summary>
-                        <div class="session-stack">
-                          <article :for={summary <- project.run_summaries} class="detail-stack">
-                            <div class="issue-stack">
-                              <span class="issue-id"><%= summary.issue_identifier || "n/a" %></span>
-                              <span class="muted"><%= project_run_summary_title(summary) %></span>
-                            </div>
-                            <div>
-                              <span class={state_badge_class(summary.health || summary.current_phase || summary.linear_state)}>
-                                <%= summary.current_phase || "unknown" %>
-                              </span>
-                              <span class="muted event-meta">
-                                <%= project_run_summary_health_meta(summary) %>
-                              </span>
-                            </div>
-                            <div class="mono"><%= summary.current_action || "n/a" %></div>
-                            <div class="muted event-meta"><%= project_run_summary_ids(summary) %></div>
-                            <div class="muted event-meta"><%= project_run_summary_runtime(summary) %></div>
-                            <p :if={is_binary(summary.last_error) and summary.last_error != ""} class="mono">
-                              <%= summary.last_error %>
-                            </p>
-                          </article>
-                        </div>
                       </details>
                     </td>
                   </tr>
@@ -743,21 +719,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp format_project_action_error(reason), do: to_string(reason)
 
   defp project_runtime_or_validation_error(project) do
-    project.last_error || project_validation_error_summary(project.validation_errors)
+    Presenter.project_runtime_or_validation_error(project)
   end
-
-  defp project_validation_error_summary(errors) when is_list(errors) do
-    errors
-    |> Enum.map(&project_validation_error_label/1)
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.join(", ")
-    |> case do
-      "" -> nil
-      summary -> summary
-    end
-  end
-
-  defp project_validation_error_summary(_errors), do: nil
 
   defp project_action_disabled?(project, action) do
     project.validation_result == "invalid" or
@@ -910,49 +873,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
 
-  defp project_run_summary_title(summary) do
-    case summary.title do
-      value when is_binary(value) and value != "" -> value
-      _ -> "未提供标题"
-    end
-  end
-
-  defp project_run_summary_health_meta(summary) do
-    [summary.linear_state, summary.health]
-    |> Enum.filter(&(is_binary(&1) and &1 != ""))
-    |> Enum.join(" · ")
-    |> blank_to_na()
-  end
-
-  defp project_run_summary_ids(summary) do
-    [
-      summary.thread_id && "thread #{summary.thread_id}",
-      summary.turn_id && "turn #{summary.turn_id}",
-      summary.session_id && "session #{summary.session_id}"
-    ]
-    |> Enum.filter(&is_binary/1)
-    |> Enum.join(" · ")
-    |> blank_to_na()
-  end
-
-  defp project_run_summary_runtime(summary) do
-    parts =
-      [
-        if(is_integer(summary.turn_count), do: "#{summary.turn_count} turns"),
-        if(is_binary(summary.last_event_at), do: "last event #{summary.last_event_at}"),
-        if(is_integer(summary.run_duration_seconds), do: "#{summary.run_duration_seconds}s")
-      ]
-      |> Enum.filter(&is_binary/1)
-
-    case parts do
-      [] -> "n/a"
-      _ -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp project_validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
-  defp project_validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
-  defp project_validation_error_label(_error), do: "invalid"
+  defp project_validation_error_label(error), do: Presenter.project_validation_error_label(error)
 
   defp format_enabled(true), do: "true"
   defp format_enabled(false), do: "false"

@@ -1473,7 +1473,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "/api/v1/projects//summary"
   end
 
-  test "control-plane dashboard renders run summaries in an explicit thread status section" do
+  test "control-plane dashboard keeps run details out of the homepage" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -1510,7 +1510,87 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "线程状态"
+    assert html =~ "View details"
+    assert html =~ "/projects/alpha"
+    refute html =~ "线程状态"
+    refute html =~ "MT-ALPHA-1"
+    refute html =~ "Alpha task"
+    refute html =~ "codex_waiting_next_event"
+    refute html =~ "最近一段时间没有新事件"
+    refute html =~ "possibly_stalled"
+    refute html =~ "thread-alpha"
+    refute html =~ "turn-9"
+    refute html =~ "thread-alpha-turn-9"
+    refute html =~ "960s"
+    refute html =~ "tool_call_failed"
+    refute html =~ "Recent events"
+    refute html =~ "Prompt"
+    refute html =~ "Shell output"
+    refute html =~ "Timeline"
+  end
+
+  test "control-plane dashboard exposes a clear entry to project detail pages" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "/projects/alpha"
+    assert html =~ "View details"
+    refute html =~ "/projects/alpha/runs/"
+  end
+
+  test "project detail page stays lightweight and links each run to a deep view" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  session_id: "thread-alpha-turn-9",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  turn_count: 9,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960,
+                  last_error: "tool_call_failed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    assert html =~ "Alpha"
     assert html =~ "MT-ALPHA-1"
     assert html =~ "Alpha task"
     assert html =~ "codex_waiting_next_event"
@@ -1518,13 +1598,102 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "possibly_stalled"
     assert html =~ "thread-alpha"
     assert html =~ "turn-9"
-    assert html =~ "thread-alpha-turn-9"
     assert html =~ "960s"
-    assert html =~ "tool_call_failed"
-    refute html =~ "Recent events"
+    assert html =~ "/projects/alpha/runs/MT-ALPHA-1"
+    assert html =~ "Open run"
+    refute html =~ "Timeline"
+    refute html =~ "Shell output"
+    refute html =~ "Prompt"
+    refute html =~ "Raw event"
+  end
+
+  test "run deep view renders summary fields and skeleton sections without heavy content by default" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  session_id: "thread-alpha-turn-9",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  turn_count: 9,
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960,
+                  last_error: "tool_call_failed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "Alpha task"
+    assert html =~ "In Progress"
+    assert html =~ "codex_waiting_next_event"
+    assert html =~ "最近一段时间没有新事件"
+    assert html =~ "possibly_stalled"
+    assert html =~ "thread-alpha"
+    assert html =~ "turn-9"
+    assert html =~ "2026-05-14T02:00:00Z"
+    assert html =~ "960s"
+    assert html =~ "Timeline"
+    assert html =~ "Event detail"
+    assert html =~ "Thread"
+    assert html =~ "Turn"
+    assert html =~ "Conversation"
+    assert html =~ "Tools"
+    assert html =~ "Sub-agent context"
+    assert html =~ "Dependencies"
+    assert html =~ "Attention"
+    assert html =~ "Not loaded by default"
+    refute html =~ "Raw event"
     refute html =~ "Prompt"
     refute html =~ "Shell output"
+    refute html =~ "notification"
+    refute html =~ "rendered"
+  end
+
+  test "run deep view stays lightweight when the run summary is unavailable" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-MISSING")
+    assert html =~ "Run unavailable"
+    assert html =~ "MT-MISSING"
     refute html =~ "Timeline"
+    refute html =~ "Shell output"
+    refute html =~ "Prompt"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
