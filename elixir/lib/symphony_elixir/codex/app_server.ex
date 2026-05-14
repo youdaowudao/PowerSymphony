@@ -446,17 +446,21 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
+        turn_context = %{
+          timeout_ms: timeout_ms,
+          tool_executor: tool_executor,
+          auto_approve_requests: auto_approve_requests,
+          thread_id: thread_id,
+          turn_id: turn_id
+        }
+
         handle_turn_method(
           port,
           on_message,
           payload,
           payload_string,
           method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests,
-          thread_id,
-          turn_id
+          turn_context
         )
 
       {:ok, payload} ->
@@ -568,19 +572,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp handle_turn_method(
-         port,
-         on_message,
-         payload,
-         payload_string,
-         method,
-         timeout_ms,
-         tool_executor,
-         auto_approve_requests,
-         thread_id,
-         turn_id
-       ) do
+  defp handle_turn_method(port, on_message, payload, payload_string, method, turn_context) do
     metadata = metadata_from_message(port, payload)
+    %{timeout_ms: timeout_ms, tool_executor: tool_executor, auto_approve_requests: auto_approve_requests} = turn_context
 
     case maybe_handle_approval_request(
            port,
@@ -610,8 +604,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
-          thread_id,
-          turn_id
+          turn_context.thread_id,
+          turn_context.turn_id
         )
 
       :approval_required ->
@@ -654,8 +648,8 @@ defmodule SymphonyElixir.Codex.AppServer do
             "",
             tool_executor,
             auto_approve_requests,
-            thread_id,
-            turn_id
+            turn_context.thread_id,
+            turn_context.turn_id
           )
         end
     end

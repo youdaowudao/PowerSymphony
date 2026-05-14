@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.RunStateStoreTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{LogFile, RawEventStore, RunStateStore, RunTrace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.{LogFile, RawEventStore, RunStateStore, RunTrace}
 
   test "summary_for_running_entry ignores events from older run_instance_id" do
     previous_log_file = Application.get_env(:symphony_elixir, :log_file)

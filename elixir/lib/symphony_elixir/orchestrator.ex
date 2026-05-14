@@ -1110,6 +1110,12 @@ defmodule SymphonyElixir.Orchestrator do
         run_trace = resolve_dispatch_run_trace(retry_trace, issue, worker_host, retry_workspace_path)
         run_instance_id = new_run_instance_id()
 
+        spawn_context =
+          transition_context
+          |> Map.put(:recipient, recipient)
+          |> Map.put(:run_trace, run_trace)
+          |> Map.put(:run_instance_id, run_instance_id)
+
         RunTrace.record(run_trace, :orchestrator, %{
           event: :dispatch_started,
           summary: "orchestrator:dispatch_started",
@@ -1121,14 +1127,9 @@ defmodule SymphonyElixir.Orchestrator do
           state,
           issue,
           attempt,
-          recipient,
           worker_host,
           retry_workspace_path,
-          transition_context
-          |> Map.put(:run_trace, run_trace)
-          |> Map.put(:run_instance_id, run_instance_id),
-          run_trace,
-          run_instance_id
+          spawn_context
         )
     end
   end
@@ -1166,14 +1167,14 @@ defmodule SymphonyElixir.Orchestrator do
          %State{} = state,
          issue,
          attempt,
-         recipient,
          worker_host,
          retry_workspace_path,
-         transition_context,
-         run_trace,
-         run_instance_id
+         spawn_context
        ) do
     run_mode = dispatch_run_mode(state, issue)
+    recipient = Map.fetch!(spawn_context, :recipient)
+    run_trace = Map.get(spawn_context, :run_trace)
+    run_instance_id = Map.get(spawn_context, :run_instance_id)
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient,
@@ -1186,7 +1187,7 @@ defmodule SymphonyElixir.Orchestrator do
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
-        transition_result = maybe_transition_spawned_todo_to_in_progress(issue, transition_context)
+        transition_result = maybe_transition_spawned_todo_to_in_progress(issue, spawn_context)
 
         handle_spawned_issue_transition_result(
           transition_result,
@@ -1199,7 +1200,7 @@ defmodule SymphonyElixir.Orchestrator do
             run_mode: run_mode,
             worker_host: worker_host,
             retry_workspace_path: retry_workspace_path,
-            transition_context: transition_context,
+            transition_context: spawn_context,
             run_trace: run_trace,
             run_instance_id: run_instance_id
           }
@@ -2403,85 +2404,139 @@ defmodule SymphonyElixir.Orchestrator do
     if recovered_stall_stop_with_terminal_evidence?(running_entry) do
       retry_stalled_issue_after_terminal_stop(state, issue_id, running_entry)
     else
-      case Map.get(running_entry, :run_result) do
-        %{status: :continuation_required} = run_result ->
-          Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check")
-
-          state
-          |> complete_issue(issue_id)
-          |> schedule_issue_retry(issue_id, 1, %{
-            identifier: running_entry.identifier,
-            delay_type: :continuation,
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path),
-            run_trace: run_trace,
-            run_instance_id: run_instance_id_from_metadata(running_entry)
-          })
-
-        %{status: :completed} = run_result ->
-          if run_result.reason == :issue_entered_checking do
-            Logger.info("Agent task entered checking for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling checking recheck")
-
-            state
-            |> complete_issue(issue_id)
-            |> schedule_issue_retry(issue_id, 1, %{
-              identifier: running_entry.identifier,
-              delay_type: @checking_recheck_delay_type,
-              worker_host: Map.get(running_entry, :worker_host),
-              workspace_path: Map.get(running_entry, :workspace_path),
-              run_trace: run_trace,
-              run_instance_id: run_instance_id_from_metadata(running_entry)
-            })
-          else
-            Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled")
-
-            complete_issue(state, issue_id, release_claim?: true)
-          end
-
-        %{status: :failed, reason: :premature_turn_end} = run_result ->
-          Logger.warning("Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck")
-
-          state
-          |> complete_issue(issue_id)
-          |> schedule_issue_retry(issue_id, 1, %{
-            identifier: running_entry.identifier,
-            delay_type: :premature_turn_end_hold,
-            error: "premature turn end",
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path),
-            run_trace: run_trace,
-            run_instance_id: run_instance_id_from_metadata(running_entry)
-          })
-
-        %{status: :failed, reason: :turn_timeout} = run_result ->
-          Logger.warning("Agent task timed out for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling ordinary retry")
-
-          next_attempt = next_retry_attempt_from_running(running_entry)
-
-          schedule_issue_retry(state, issue_id, next_attempt, %{
-            identifier: running_entry.identifier,
-            error: "turn_timeout",
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path),
-            run_trace: run_trace,
-            run_instance_id: run_instance_id_from_metadata(running_entry)
-          })
-
-        _ ->
-          Logger.warning("Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry")
-
-          next_attempt = next_retry_attempt_from_running(running_entry)
-
-          schedule_issue_retry(state, issue_id, next_attempt, %{
-            identifier: running_entry.identifier,
-            error: "agent exited normally without run_result",
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path),
-            run_trace: run_trace,
-            run_instance_id: run_instance_id_from_metadata(running_entry)
-          })
-      end
+      handle_normal_worker_run_result(
+        state,
+        issue_id,
+        running_entry,
+        session_id,
+        run_trace,
+        Map.get(running_entry, :run_result)
+      )
     end
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         run_trace,
+         %{status: :continuation_required} = run_result
+       ) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling active-state continuation check")
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      delay_type: :continuation,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      run_trace: run_trace,
+      run_instance_id: run_instance_id_from_metadata(running_entry)
+    })
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         run_trace,
+         %{status: :completed, reason: :issue_entered_checking} = run_result
+       ) do
+    Logger.info("Agent task entered checking for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling checking recheck")
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      delay_type: @checking_recheck_delay_type,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      run_trace: run_trace,
+      run_instance_id: run_instance_id_from_metadata(running_entry)
+    })
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         _running_entry,
+         session_id,
+         _run_trace,
+         %{status: :completed} = run_result
+       ) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; no continuation scheduled")
+
+    complete_issue(state, issue_id, release_claim?: true)
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         run_trace,
+         %{status: :failed, reason: :premature_turn_end} = run_result
+       ) do
+    Logger.warning("Agent task closed with premature turn end for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; holding claim for state recheck")
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      delay_type: :premature_turn_end_hold,
+      error: "premature turn end",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      run_trace: run_trace,
+      run_instance_id: run_instance_id_from_metadata(running_entry)
+    })
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         run_trace,
+         %{status: :failed, reason: :turn_timeout} = run_result
+       ) do
+    Logger.warning("Agent task timed out for issue_id=#{issue_id} session_id=#{session_id} run_result=#{inspect(run_result)}; scheduling ordinary retry")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "turn_timeout",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      run_trace: run_trace,
+      run_instance_id: run_instance_id_from_metadata(running_entry)
+    })
+  end
+
+  defp handle_normal_worker_run_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         run_trace,
+         _run_result
+       ) do
+    Logger.warning("Agent task exited normally for issue_id=#{issue_id} session_id=#{session_id} without run_result; scheduling retry")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "agent exited normally without run_result",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      run_trace: run_trace,
+      run_instance_id: run_instance_id_from_metadata(running_entry)
+    })
   end
 
   defp recovered_stall_stop_with_terminal_evidence?(running_entry) do
