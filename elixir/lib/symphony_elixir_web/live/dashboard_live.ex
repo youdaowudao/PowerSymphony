@@ -15,16 +15,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     socket =
       socket
-      |> assign(:payload, load_payload())
+      |> assign(:payload, initial_payload(runtime_mode))
       |> assign(:projects_payload, load_projects_payload())
       |> assign(:runtime_mode, runtime_mode)
       |> assign(:project_action_feedback, nil)
       |> assign(:m3_precheck_results, %{})
+      |> assign(:workflow_snapshot_status, workflow_snapshot_status(runtime_mode))
+      |> assign(:workflow_snapshot_requested_version, 0)
+      |> assign(:workflow_snapshot_task, nil)
+      |> assign(:workflow_snapshot_refresh_pending, false)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
       if runtime_mode != :control_plane do
         :ok = ObservabilityPubSub.subscribe()
+        send(self(), :refresh_workflow_snapshot)
       end
 
       schedule_runtime_tick()
@@ -41,13 +46,54 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_info(:refresh_workflow_snapshot, %{assigns: %{runtime_mode: :control_plane}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_info(:refresh_workflow_snapshot, socket) do
+    {:noreply, refresh_workflow_snapshot(socket)}
+  end
+
+  @impl true
   def handle_info(:observability_updated, socket) do
-    {:noreply,
-     socket
-     |> assign(:payload, load_payload())
-     |> assign(:projects_payload, load_projects_payload())
-     |> assign(:project_action_feedback, nil)
-     |> assign(:now, DateTime.utc_now())}
+    socket =
+      socket
+      |> assign(:projects_payload, load_projects_payload())
+      |> assign(:project_action_feedback, nil)
+      |> assign(:now, DateTime.utc_now())
+
+    {:noreply, refresh_workflow_snapshot(socket)}
+  end
+
+  @impl true
+  def handle_info({ref, {version, payload}}, %{assigns: %{workflow_snapshot_task: %{ref: ref}}} = socket)
+      when is_reference(ref) do
+    {:noreply, apply_workflow_snapshot(socket, ref, version, payload)}
+  end
+
+  def handle_info({ref, _payload}, %{assigns: %{workflow_snapshot_task: %{ref: ref}}} = socket)
+      when is_reference(ref) do
+    {:noreply, clear_workflow_snapshot_task(socket, ref)}
+  end
+
+  def handle_info({ref, _payload}, socket) when is_reference(ref) do
+    {:noreply, socket}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, :normal}, %{assigns: %{workflow_snapshot_task: %{ref: ref}}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{assigns: %{workflow_snapshot_task: %{ref: ref}}} = socket) do
+    {:noreply, handle_failed_workflow_snapshot_task(socket, ref)}
+  end
+
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, socket), do: {:noreply, socket}
+
+  @impl true
+  def terminate(_reason, socket) do
+    _ = cancel_workflow_snapshot_task(socket)
+    :ok
   end
 
   @impl true
@@ -234,44 +280,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
       <% else %>
-      <%= if @payload[:error] do %>
-        <section class="error-card">
-          <h2 class="error-title">
-            Snapshot unavailable
-          </h2>
-          <p class="error-copy">
-            <strong><%= @payload.error.code %>:</strong> <%= @payload.error.message %>
-          </p>
-        </section>
-      <% else %>
-        <section class="metric-grid">
-          <article class="metric-card">
-            <p class="metric-label">Running</p>
-            <p class="metric-value numeric"><%= @payload.counts.running %></p>
-            <p class="metric-detail">Active issue sessions in the current runtime.</p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Retrying</p>
-            <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
-            <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
-            </p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Runtime</p>
-            <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
-          </article>
-        </section>
-
         <section class="section-card">
           <div class="section-header">
             <div>
@@ -327,7 +335,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Todo 池检验</h2>
-              <p class="section-copy">Run the workflow M3-0 precheck directly from the main runtime dashboard.</p>
+              <p class="section-copy">
+                <%= if workflow_snapshot_loading?(@workflow_snapshot_status) do %>
+                  Run the workflow M3-0 precheck while the runtime snapshot is still loading.
+                <% else %>
+                  Run the workflow M3-0 precheck directly from the main runtime dashboard.
+                <% end %>
+              </p>
             </div>
 
             <button
@@ -350,138 +364,194 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </details>
         </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+        <%= if workflow_snapshot_loading?(@workflow_snapshot_status) do %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Loading workflow snapshot</h2>
+                <p class="section-copy">Runtime metrics, running sessions, retry queue, and rate limits will appear here once the snapshot arrives.</p>
+              </div>
             </div>
-          </div>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+            <div class="detail-stack">
+              <p class="mono">Metrics pending</p>
+              <p class="mono">Running sessions pending</p>
+              <p class="mono">Retry queue pending</p>
+              <p class="mono">Rate limits pending</p>
             </div>
-          </div>
-
-          <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
+          </section>
+        <% else %>
+          <%= if @payload[:error] do %>
+            <section class="error-card">
+              <h2 class="error-title">
+                Snapshot unavailable
+              </h2>
+              <p class="error-copy">
+                <strong><%= @payload.error.code %>:</strong> <%= @payload.error.message %>
+              </p>
+            </section>
           <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.health || entry.current_phase || entry.state)}>
-                        <%= entry.current_phase || entry.state %>
-                      </span>
-                      <div class="muted event-meta"><%= entry.linear_state || entry.state %> · <%= entry.health || "unknown" %></div>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span class="event-text"><%= running_activity_summary(entry) %></span>
-                        <span class="muted event-meta"><%= running_activity_meta(entry) %></span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+            <section class="metric-grid">
+              <article class="metric-card">
+                <p class="metric-label">Running</p>
+                <p class="metric-value numeric"><%= @payload.counts.running %></p>
+                <p class="metric-detail">Active issue sessions in the current runtime.</p>
+              </article>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
-            </div>
-          </div>
+              <article class="metric-card">
+                <p class="metric-label">Retrying</p>
+                <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
+                <p class="metric-detail">Issues waiting for the next retry window.</p>
+              </article>
 
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Attempt</th>
-                    <th>Due at</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td><%= entry.attempt %></td>
-                    <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+              <article class="metric-card">
+                <p class="metric-label">Total tokens</p>
+                <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
+                <p class="metric-detail numeric">
+                  In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
+                </p>
+              </article>
+
+              <article class="metric-card">
+                <p class="metric-label">Runtime</p>
+                <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
+                <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
+              </article>
+            </section>
+
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Rate limits</h2>
+                  <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+                </div>
+              </div>
+
+              <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+            </section>
+
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Running sessions</h2>
+                  <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+                </div>
+              </div>
+
+              <%= if @payload.running == [] do %>
+                <p class="empty-state">No active sessions.</p>
+              <% else %>
+                <div class="table-wrap">
+                  <table class="data-table data-table-running">
+                    <colgroup>
+                      <col style="width: 12rem;" />
+                      <col style="width: 8rem;" />
+                      <col style="width: 7.5rem;" />
+                      <col style="width: 8.5rem;" />
+                      <col />
+                      <col style="width: 10rem;" />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th>Issue</th>
+                        <th>State</th>
+                        <th>Session</th>
+                        <th>Runtime / turns</th>
+                        <th>Codex update</th>
+                        <th>Tokens</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr :for={entry <- @payload.running}>
+                        <td>
+                          <div class="issue-stack">
+                            <span class="issue-id"><%= entry.issue_identifier %></span>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
+                        </td>
+                        <td>
+                          <span class={state_badge_class(entry.health || entry.current_phase || entry.state)}>
+                            <%= entry.current_phase || entry.state %>
+                          </span>
+                          <div class="muted event-meta"><%= entry.linear_state || entry.state %> · <%= entry.health || "unknown" %></div>
+                        </td>
+                        <td>
+                          <div class="session-stack">
+                            <%= if entry.session_id do %>
+                              <button
+                                type="button"
+                                class="subtle-button"
+                                data-label="Copy ID"
+                                data-copy={entry.session_id}
+                                onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                              >
+                                Copy ID
+                              </button>
+                            <% else %>
+                              <span class="muted">n/a</span>
+                            <% end %>
+                          </div>
+                        </td>
+                        <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
+                        <td>
+                          <div class="detail-stack">
+                            <span class="event-text"><%= running_activity_summary(entry) %></span>
+                            <span class="muted event-meta"><%= running_activity_meta(entry) %></span>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="token-stack numeric">
+                            <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                            <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              <% end %>
+            </section>
+
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Retry queue</h2>
+                  <p class="section-copy">Issues waiting for the next retry window.</p>
+                </div>
+              </div>
+
+              <%= if @payload.retrying == [] do %>
+                <p class="empty-state">No issues are currently backing off.</p>
+              <% else %>
+                <div class="table-wrap">
+                  <table class="data-table" style="min-width: 680px;">
+                    <thead>
+                      <tr>
+                        <th>Issue</th>
+                        <th>Attempt</th>
+                        <th>Due at</th>
+                        <th>Error</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr :for={entry <- @payload.retrying}>
+                        <td>
+                          <div class="issue-stack">
+                            <span class="issue-id"><%= entry.issue_identifier %></span>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
+                        </td>
+                        <td><%= entry.attempt %></td>
+                        <td class="mono"><%= entry.due_at || "n/a" %></td>
+                        <td><%= entry.error || "n/a" %></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              <% end %>
+            </section>
           <% end %>
-        </section>
-      <% end %>
+        <% end %>
       <% end %>
     </section>
     """
@@ -557,17 +627,133 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
-  defp load_payload do
-    if runtime_mode() == :control_plane do
-      Presenter.empty_state_payload()
-    else
-      Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
-    end
-  end
-
   defp load_projects_payload do
     Presenter.projects_payload(project_registry())
   end
+
+  defp initial_payload(:control_plane), do: Presenter.empty_state_payload()
+  defp initial_payload(:workflow), do: Presenter.empty_state_payload()
+
+  defp workflow_snapshot_status(:control_plane), do: :ready
+  defp workflow_snapshot_status(:workflow), do: :loading
+
+  defp workflow_snapshot_loading?(:loading), do: true
+  defp workflow_snapshot_loading?(_status), do: false
+
+  defp refresh_workflow_snapshot(%{assigns: %{runtime_mode: :workflow}} = socket) do
+    case socket.assigns.workflow_snapshot_task do
+      %Task{} ->
+        assign(socket, :workflow_snapshot_refresh_pending, true)
+
+      _ ->
+        start_workflow_snapshot_refresh(socket)
+    end
+  end
+
+  defp refresh_workflow_snapshot(socket), do: socket
+
+  defp start_workflow_snapshot_refresh(%{assigns: %{runtime_mode: :control_plane}} = socket), do: socket
+
+  defp start_workflow_snapshot_refresh(socket) do
+    version = socket.assigns.workflow_snapshot_requested_version + 1
+
+    task =
+      Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+        {version, Presenter.state_payload(orchestrator(), snapshot_timeout_ms())}
+      end)
+
+    status =
+      if socket.assigns.workflow_snapshot_requested_version == 0 do
+        :loading
+      else
+        socket.assigns.workflow_snapshot_status
+      end
+
+    socket
+    |> assign(:workflow_snapshot_status, status)
+    |> assign(:workflow_snapshot_requested_version, version)
+    |> assign(:workflow_snapshot_task, task)
+    |> assign(:workflow_snapshot_refresh_pending, false)
+  end
+
+  defp apply_workflow_snapshot(socket, task_ref, version, payload) when is_integer(version) do
+    cond do
+      socket.assigns.workflow_snapshot_refresh_pending ->
+        socket
+        |> clear_workflow_snapshot_task(task_ref)
+        |> maybe_start_pending_workflow_snapshot_refresh()
+
+      version == socket.assigns.workflow_snapshot_requested_version ->
+        socket
+        |> assign(:payload, payload)
+        |> assign(:workflow_snapshot_status, snapshot_status_from_payload(payload))
+        |> clear_workflow_snapshot_task(task_ref)
+        |> maybe_start_pending_workflow_snapshot_refresh()
+
+      true ->
+        socket
+        |> clear_workflow_snapshot_task(task_ref)
+        |> maybe_start_pending_workflow_snapshot_refresh()
+    end
+  end
+
+  defp apply_workflow_snapshot(socket, task_ref, _version, _payload) do
+    socket
+    |> clear_workflow_snapshot_task(task_ref)
+    |> maybe_start_pending_workflow_snapshot_refresh()
+  end
+
+  defp snapshot_status_from_payload(%{error: %{code: "snapshot_timeout"}}), do: :error
+  defp snapshot_status_from_payload(%{error: %{code: "snapshot_unavailable"}}), do: :error
+  defp snapshot_status_from_payload(_payload), do: :ready
+
+  defp handle_failed_workflow_snapshot_task(socket, task_ref) do
+    socket
+    |> clear_workflow_snapshot_task(task_ref)
+    |> maybe_mark_initial_workflow_snapshot_failed()
+    |> maybe_start_pending_workflow_snapshot_refresh()
+  end
+
+  defp maybe_mark_initial_workflow_snapshot_failed(%{assigns: %{workflow_snapshot_status: :loading}} = socket) do
+    socket
+    |> assign(:payload, workflow_snapshot_failure_payload())
+    |> assign(:workflow_snapshot_status, :error)
+  end
+
+  defp maybe_mark_initial_workflow_snapshot_failed(socket), do: socket
+
+  defp workflow_snapshot_failure_payload do
+    Presenter.empty_state_payload()
+    |> Map.put(:error, %{code: "snapshot_unavailable", message: "Snapshot unavailable"})
+  end
+
+  defp cancel_workflow_snapshot_task(%{assigns: %{workflow_snapshot_task: %Task{} = task}} = socket) do
+    _ = Task.shutdown(task, :brutal_kill)
+    clear_workflow_snapshot_task(socket, task.ref)
+  end
+
+  defp cancel_workflow_snapshot_task(socket), do: socket
+
+  defp clear_workflow_snapshot_task(%{assigns: %{workflow_snapshot_task: %Task{} = task}} = socket, task_ref)
+       when task.ref == task_ref do
+    _ = Process.demonitor(task.ref, [:flush])
+    assign(socket, :workflow_snapshot_task, nil)
+  end
+
+  defp clear_workflow_snapshot_task(%{assigns: %{workflow_snapshot_task: %Task{} = task}} = socket, nil) do
+    _ = Process.demonitor(task.ref, [:flush])
+    assign(socket, :workflow_snapshot_task, nil)
+  end
+
+  defp clear_workflow_snapshot_task(socket, _task_ref) do
+    socket
+  end
+
+  defp maybe_start_pending_workflow_snapshot_refresh(%{assigns: %{workflow_snapshot_refresh_pending: true}} = socket) do
+    start_workflow_snapshot_refresh(socket)
+  end
+
+  defp maybe_start_pending_workflow_snapshot_refresh(socket), do: socket
 
   defp refresh_runtime_tick(socket) do
     socket
