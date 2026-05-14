@@ -1518,6 +1518,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   test "workflow dashboard ignores a stale snapshot after a newer refresh wins" do
     orchestrator_name = Module.concat(__MODULE__, :StaleDashboardOrchestrator)
+
     first_snapshot = %{
       running: [
         %{
@@ -1743,6 +1744,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_eventually(fn ->
       rendered = render(view)
+
       rendered =~ "Snapshot unavailable" and rendered =~ "snapshot_unavailable" and
         not String.contains?(rendered, "Loading workflow snapshot")
     end)
@@ -1751,6 +1753,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_eventually(fn ->
       rendered = render(view)
+
       rendered =~ "MT-RECOVERED" and not String.contains?(rendered, "Loading workflow snapshot") and
         not String.contains?(rendered, "Snapshot unavailable")
     end)
