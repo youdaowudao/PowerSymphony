@@ -1722,6 +1722,30 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert_eventually(fn -> not process_alive?(running_state.pid) end)
   end
 
+  test "manager shutdown stops running workers it started" do
+    test_root = temp_root!("manager-shutdown-stops-workers")
+    manager_name = Module.concat(__MODULE__, ShutdownManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "hang"})})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert running_state.status == :running
+    assert is_integer(running_state.pid)
+    assert process_alive?(running_state.pid)
+
+    manager_pid = GenServer.whereis(manager_name)
+    GenServer.stop(manager_pid)
+
+    assert_eventually(fn -> not process_alive?(running_state.pid) end)
+  end
+
   test "reconciles persisted pid after control-plane restart" do
     test_root = temp_root!("reconcile-pid")
     manager_name = Module.concat(__MODULE__, ReconcileManager)
