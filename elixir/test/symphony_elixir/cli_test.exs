@@ -1132,6 +1132,7 @@ printf 'args=%s\n' "$*" >> "$TRACE_FILE"))
     home_dir = Path.join(test_root, "home")
     token_dir = Path.join(home_dir, ".config/linear")
     token_file = Path.join(token_dir, "linear_api_key.token")
+
     listener =
       case :gen_tcp.listen(4000, [:binary, active: false, reuseaddr: true]) do
         {:ok, socket} -> socket
