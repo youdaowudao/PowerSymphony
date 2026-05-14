@@ -78,11 +78,29 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   @spec project_registry(GenServer.name()) :: ProjectRegistry.t()
   def project_registry(server) do
+    project_registry(server, include_run_summaries: false)
+  end
+
+  @spec project_registry_for_display() :: ProjectRegistry.t()
+  def project_registry_for_display do
+    project_registry_for_display(default_name())
+  end
+
+  @spec project_registry_for_display(GenServer.name()) :: ProjectRegistry.t()
+  def project_registry_for_display(server) do
+    project_registry(server, include_run_summaries: true)
+  end
+
+  @spec project_registry(GenServer.name(), keyword()) :: ProjectRegistry.t()
+  def project_registry(server, opts) when is_list(opts) do
+    include_run_summaries = Keyword.get(opts, :include_run_summaries, false)
+    request = {:project_registry, include_run_summaries: include_run_summaries}
+
     if alive?(server) do
-      GenServer.call(server, :project_registry, 15_000)
+      GenServer.call(server, request, 15_000)
     else
       project_static_registry()
-      |> project_registry_with_runtime(%{})
+      |> project_registry_with_runtime(%{}, include_run_summaries: include_run_summaries)
     end
   end
 
@@ -159,10 +177,12 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   @impl true
-  def handle_call(:project_registry, _from, state) do
+  def handle_call({:project_registry, opts}, _from, state) do
+    include_run_summaries = Keyword.get(opts, :include_run_summaries, false)
+
     registry =
       project_static_registry()
-      |> project_registry_with_runtime(state.runtimes)
+      |> project_registry_with_runtime(state.runtimes, include_run_summaries: include_run_summaries)
 
     {:reply, registry, %{state | runtimes: refresh_runtime_truth(state.runtimes, registry)}}
   end
@@ -541,13 +561,15 @@ defmodule SymphonyElixir.ProjectProcessManager do
     ProjectRegistryLoader.load()
   end
 
-  defp project_registry_with_runtime(%ProjectRegistry{} = registry, runtime_map) do
+  defp project_registry_with_runtime(%ProjectRegistry{} = registry, runtime_map, opts \\ []) do
+    include_run_summaries = Keyword.get(opts, :include_run_summaries, false)
+
     entries =
       Enum.map(registry.entries, fn entry ->
         merged_runtime =
           entry
           |> merge_runtime_state(Map.get(runtime_map, entry.project_id))
-          |> refresh_run_summaries()
+          |> maybe_refresh_run_summaries(include_run_summaries)
           |> reconcile_project_runtime(entry)
 
         %{entry | runtime_state: merged_runtime}
@@ -615,6 +637,9 @@ defmodule SymphonyElixir.ProjectProcessManager do
     do: %{runtime_state | status: :unreachable}
 
   defp project_health_status(runtime_state), do: runtime_state
+
+  defp maybe_refresh_run_summaries(runtime_state, true), do: refresh_run_summaries(runtime_state)
+  defp maybe_refresh_run_summaries(runtime_state, false), do: Map.put(runtime_state, :run_summaries, [])
 
   defp refresh_run_summaries(%{status: status, worker_port: worker_port} = runtime_state)
        when status in [:running, :unreachable] and is_integer(worker_port) do

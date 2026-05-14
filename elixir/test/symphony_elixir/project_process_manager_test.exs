@@ -1175,14 +1175,46 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
-    running_entry = fetch_entry!(manager_name, "alpha")
+    running_entry = fetch_display_entry!(manager_name, "alpha")
     assert running_entry.runtime_state.run_summaries != []
 
     assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
 
-    stopped_entry = fetch_entry!(manager_name, "alpha")
+    stopped_entry = fetch_display_entry!(manager_name, "alpha")
     assert stopped_entry.runtime_state.status == :stopped
     assert stopped_entry.runtime_state.run_summaries == []
+  end
+
+  test "default project registry read does not refresh run summaries" do
+    test_root = temp_root!("registry-without-run-summaries")
+    manager_name = Module.concat(__MODULE__, RegistryWithoutRunSummariesManager)
+    port = reserve_tcp_port!()
+    request_log = Path.join(test_root, "default-registry.requests.log")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!(
+      {ProjectProcessManager,
+       name: manager_name,
+       command_builder: fake_worker_builder(%{"alpha" => {"normal", request_log}})}
+    )
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.run_summaries == []
+    refute File.exists?(request_log)
+
+    display_entry = fetch_display_entry!(manager_name, "alpha")
+    assert display_entry.runtime_state.run_summaries != []
+    assert_eventually(fn -> state_request_logged?(request_log) end)
   end
 
   test "worker state 503 clears stale run summaries" do
@@ -1211,7 +1243,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-503"}])
     end)
 
-    entry = fetch_entry!(manager_name, "alpha")
+    entry = fetch_display_entry!(manager_name, "alpha")
     assert entry.runtime_state.status == :running
     assert entry.runtime_state.run_summaries == []
     assert_eventually(fn -> state_request_logged?(request_log) end)
@@ -1243,7 +1275,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-TIMEOUT"}])
     end)
 
-    entry = fetch_entry!(manager_name, "alpha")
+    entry = fetch_display_entry!(manager_name, "alpha")
     assert entry.runtime_state.status == :running
     assert entry.runtime_state.run_summaries == []
     assert_eventually(fn -> state_request_logged?(request_log) end)
@@ -1897,6 +1929,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
   defp fetch_entry!(manager_name, project_id) do
     registry = ProjectProcessManager.project_registry(manager_name)
+    entry = Enum.find(registry.entries, &(&1.project_id == project_id))
+    assert entry != nil
+    entry
+  end
+
+  defp fetch_display_entry!(manager_name, project_id) do
+    registry = ProjectProcessManager.project_registry_for_display(manager_name)
     entry = Enum.find(registry.entries, &(&1.project_id == project_id))
     assert entry != nil
     entry
