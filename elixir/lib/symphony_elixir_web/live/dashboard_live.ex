@@ -78,7 +78,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           _ -> %{text: "m3 precheck request failed"}
         end
       else
-        case SymphonyElixir.Orchestrator.m3_precheck() do
+        case SymphonyElixir.Orchestrator.m3_precheck(orchestrator()) do
           {:ok, payload} -> Presenter.m3_precheck_payload(payload)
           _ -> %{text: "m3 precheck request failed"}
         end
@@ -223,68 +223,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                       <details class="session-stack">
                         <summary>M3-0 预检</summary>
-                        <% result = Map.get(@m3_precheck_results, project.project_id, %{}) %>
-                        <div class="session-stack">
-                          <p class="mono">
-                            <%= "可放行 #{length(m3_issue_entries(result, :eligible_todos))}" %>
-                            ·
-                            <%= "容量排队 #{length(m3_issue_entries(result, :capacity_queued_todos))}" %>
-                            ·
-                            <%= "本轮已派发 #{length(m3_issue_entries(result, :dispatched_todos))}" %>
-                            ·
-                            <%= "阻塞 #{length(m3_blocked_entries(result))}" %>
-                            ·
-                            <%= "执行中 #{length(m3_current_work_entries(result))}" %>
-                            ·
-                            <%= "异常 #{length(m3_anomalies(result))}" %>
-                          </p>
-
-                          <section :if={m3_issue_entries(result, :eligible_todos) != []} class="session-stack">
-                            <p class="issue-id">可放行 Todo</p>
-                            <p :for={entry <- m3_issue_entries(result, :eligible_todos)} class="mono">
-                              <%= m3_issue_label(entry) %>
-                            </p>
-                          </section>
-
-                          <section :if={m3_blocked_entries(result) != []} class="session-stack">
-                            <p class="issue-id">依赖阻塞</p>
-                            <p :for={{issue_identifier, reasons} <- m3_blocked_entries(result)} class="mono">
-                              <%= issue_identifier %>: <%= Enum.join(reasons, "; ") %>
-                            </p>
-                          </section>
-
-                          <section :if={m3_issue_entries(result, :capacity_queued_todos) != []} class="session-stack">
-                            <p class="issue-id">容量排队</p>
-                            <p :for={entry <- m3_issue_entries(result, :capacity_queued_todos)} class="mono">
-                              <%= m3_issue_label(entry) %>
-                            </p>
-                          </section>
-
-                          <section :if={m3_issue_entries(result, :dispatched_todos) != []} class="session-stack">
-                            <p class="issue-id">本轮已派发</p>
-                            <p :for={entry <- m3_issue_entries(result, :dispatched_todos)} class="mono">
-                              <%= m3_issue_label(entry) %>
-                            </p>
-                          </section>
-
-                          <section :if={m3_current_work_entries(result) != []} class="session-stack">
-                            <p class="issue-id">当前执行中</p>
-                            <p :for={entry <- m3_current_work_entries(result)} class="mono">
-                              <%= m3_issue_label(entry) %>
-                              <%= if entry["worker_host"], do: " @#{entry["worker_host"]}" %>
-                            </p>
-                          </section>
-
-                          <section :if={m3_anomalies(result) != []} class="session-stack">
-                            <p class="issue-id">异常执行态</p>
-                            <p :for={anomaly <- m3_anomalies(result)} class="mono">
-                              <%= m3_issue_label(anomaly) %>
-                              <%= if anomaly["blocking_identifiers"] != [], do: " blocked by #{Enum.join(anomaly["blocking_identifiers"], ", ")}" %>
-                            </p>
-                          </section>
-
-                          <p :if={m3_result_empty?(result)} class="mono">(none)</p>
-                        </div>
+                        <.m3_precheck_result result={Map.get(@m3_precheck_results, project.project_id, %{})} />
                       </details>
                     </td>
                   </tr>
@@ -381,6 +320,32 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </table>
             </div>
           <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Todo 池检验</h2>
+              <p class="section-copy">Run the workflow M3-0 precheck directly from the main runtime dashboard.</p>
+            </div>
+
+            <button
+              type="button"
+              class="subtle-button"
+              phx-click="run_m3_precheck"
+              phx-value-project_id={workflow_m3_project_id()}
+            >
+              运行预检
+            </button>
+          </div>
+
+          <details class="session-stack" open>
+            <summary>M3-0 预检</summary>
+            <.m3_precheck_result result={Map.get(@m3_precheck_results, workflow_m3_project_id(), %{})} />
+            <p :if={m3_result_unavailable?(Map.get(@m3_precheck_results, workflow_m3_project_id(), %{}))} class="empty-state">
+              尚未运行。点击“运行预检”查看当前 Todo 池放行、容量排队、阻塞与异常判断。
+            </p>
+          </details>
         </section>
 
         <section class="section-card">
@@ -517,6 +482,72 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <% end %>
       <% end %>
     </section>
+    """
+  end
+
+  attr(:result, :map, default: %{})
+
+  defp m3_precheck_result(assigns) do
+    ~H"""
+    <div class="session-stack">
+      <p class="mono">
+        <%= "可放行 #{length(m3_issue_entries(@result, :eligible_todos))}" %>
+        ·
+        <%= "容量排队 #{length(m3_issue_entries(@result, :capacity_queued_todos))}" %>
+        ·
+        <%= "本轮已派发 #{length(m3_issue_entries(@result, :dispatched_todos))}" %>
+        ·
+        <%= "阻塞 #{length(m3_blocked_entries(@result))}" %>
+        ·
+        <%= "执行中 #{length(m3_current_work_entries(@result))}" %>
+        ·
+        <%= "异常 #{length(m3_anomalies(@result))}" %>
+      </p>
+
+      <section :if={m3_issue_entries(@result, :eligible_todos) != []} class="session-stack">
+        <p class="issue-id">可放行 Todo</p>
+        <p :for={entry <- m3_issue_entries(@result, :eligible_todos)} class="mono">
+          <%= m3_issue_label(entry) %>
+        </p>
+      </section>
+
+      <section :if={m3_blocked_entries(@result) != []} class="session-stack">
+        <p class="issue-id">依赖阻塞</p>
+        <p :for={{issue_identifier, reasons} <- m3_blocked_entries(@result)} class="mono">
+          <%= issue_identifier %>: <%= Enum.join(reasons, "; ") %>
+        </p>
+      </section>
+
+      <section :if={m3_issue_entries(@result, :capacity_queued_todos) != []} class="session-stack">
+        <p class="issue-id">容量排队</p>
+        <p :for={entry <- m3_issue_entries(@result, :capacity_queued_todos)} class="mono">
+          <%= m3_issue_label(entry) %>
+        </p>
+      </section>
+
+      <section :if={m3_issue_entries(@result, :dispatched_todos) != []} class="session-stack">
+        <p class="issue-id">本轮已派发</p>
+        <p :for={entry <- m3_issue_entries(@result, :dispatched_todos)} class="mono">
+          <%= m3_issue_label(entry) %>
+        </p>
+      </section>
+
+      <section :if={m3_current_work_entries(@result) != []} class="session-stack">
+        <p class="issue-id">当前执行中</p>
+        <p :for={entry <- m3_current_work_entries(@result)} class="mono">
+          <%= m3_issue_label(entry) %><%= m3_worker_host_suffix(entry) %>
+        </p>
+      </section>
+
+      <section :if={m3_anomalies(@result) != []} class="session-stack">
+        <p class="issue-id">异常执行态</p>
+        <p :for={anomaly <- m3_anomalies(@result)} class="mono">
+          <%= m3_issue_label(anomaly) %><%= m3_anomaly_blockers_suffix(anomaly) %>
+        </p>
+      </section>
+
+      <p :if={m3_result_empty?(@result)} class="mono">(none)</p>
+    </div>
     """
   end
 
@@ -709,6 +740,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
       (status in ["running", "unreachable"] and action == "start")
   end
 
+  defp workflow_m3_project_id, do: "workflow"
+
   defp m3_issue_entries(nil, _key), do: []
 
   defp m3_issue_entries(result, key) when is_map(result) do
@@ -747,6 +780,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
       m3_anomalies(result) == []
   end
 
+  defp m3_result_unavailable?(result) do
+    m3_result_empty?(result) and
+      not is_binary(Map.get(result, :text, Map.get(result, "text")))
+  end
+
   defp m3_issue_label(%{"issue_identifier" => identifier, "state" => state})
        when is_binary(identifier) and is_binary(state),
        do: "#{identifier} (#{state})"
@@ -758,6 +796,24 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp m3_issue_label(%{"issue_identifier" => identifier}) when is_binary(identifier), do: identifier
   defp m3_issue_label(%{issue_identifier: identifier}) when is_binary(identifier), do: identifier
   defp m3_issue_label(_entry), do: "unknown"
+
+  defp m3_worker_host_suffix(entry) when is_map(entry) do
+    worker_host = Map.get(entry, "worker_host", Map.get(entry, :worker_host))
+    if is_binary(worker_host) and worker_host != "", do: " @#{worker_host}", else: ""
+  end
+
+  defp m3_worker_host_suffix(_entry), do: ""
+
+  defp m3_anomaly_blockers_suffix(anomaly) when is_map(anomaly) do
+    blockers = Map.get(anomaly, "blocking_identifiers", Map.get(anomaly, :blocking_identifiers, []))
+
+    case blockers do
+      [_ | _] = identifiers -> " blocked by #{Enum.join(identifiers, ", ")}"
+      _ -> ""
+    end
+  end
+
+  defp m3_anomaly_blockers_suffix(_anomaly), do: ""
 
   defp running_activity_summary(entry) do
     current_action(entry) || turns_or_session_summary(entry)
