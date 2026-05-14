@@ -5,9 +5,19 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
   setup do
     previous_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
+    {:ok, cleanup_agent} = Agent.start_link(fn -> [] end)
+    Process.put(:fake_worker_cleanup_agent, cleanup_agent)
 
     on_exit(fn ->
       restore_app_env(:project_config_path_override, previous_config_path)
+
+      cleanup_agent
+      |> maybe_agent_values()
+      |> Enum.each(&kill_fake_worker_port/1)
+
+      if Process.alive?(cleanup_agent) do
+        Agent.stop(cleanup_agent)
+      end
     end)
 
     :ok
@@ -2042,6 +2052,59 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     :ok
   end
 
+  defp kill_fake_worker_port(port) when is_integer(port) do
+    fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
+    port_fragment = "--port #{port}"
+
+    case System.cmd("ps", ["-eo", "pid,args"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&(String.contains?(&1, fake_worker_path) and String.contains?(&1, port_fragment)))
+        |> Enum.map(&String.trim_leading/1)
+        |> Enum.map(&Integer.parse/1)
+        |> Enum.flat_map(fn
+          {pid, _rest} -> [pid]
+          :error -> []
+        end)
+        |> Enum.each(fn pid ->
+          _ = System.cmd("kill", ["-TERM", Integer.to_string(pid)])
+        end)
+
+        Process.sleep(100)
+
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&(String.contains?(&1, fake_worker_path) and String.contains?(&1, port_fragment)))
+        |> Enum.map(&String.trim_leading/1)
+        |> Enum.map(&Integer.parse/1)
+        |> Enum.flat_map(fn
+          {pid, _rest} -> [pid]
+          :error -> []
+        end)
+        |> Enum.each(fn pid ->
+          _ = System.cmd("kill", ["-KILL", Integer.to_string(pid)])
+        end)
+
+      _other ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp kill_fake_worker_port(_port), do: :ok
+
+  defp maybe_agent_values(agent) when is_pid(agent) do
+    if Process.alive?(agent) do
+      Agent.get(agent, & &1)
+    else
+      []
+    end
+  end
+
+  defp maybe_agent_values(_agent), do: []
+
   defp assert_eventually(fun, attempts \\ 20)
 
   defp assert_eventually(fun, attempts) when attempts > 0 do
@@ -2056,11 +2119,32 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
 
   defp reserve_tcp_port! do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}])
-    {:ok, port} = :inet.port(socket)
-    :ok = :gen_tcp.close(socket)
+    base = 40_000 + rem(System.unique_integer([:positive]), 20_000)
+    port = reserve_tcp_port!(base, 200)
+
+    case Process.get(:fake_worker_cleanup_agent) do
+      cleanup_agent when is_pid(cleanup_agent) ->
+        Agent.update(cleanup_agent, &[port | &1])
+
+      _other ->
+        :ok
+    end
+
     port
   end
+
+  defp reserve_tcp_port!(port, attempts_left) when attempts_left > 0 do
+    case :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}]) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.close(socket)
+        port
+
+      {:error, :eaddrinuse} ->
+        reserve_tcp_port!(port + 1, attempts_left - 1)
+    end
+  end
+
+  defp reserve_tcp_port!(_port, 0), do: flunk("failed to reserve fake worker tcp port")
 
   defp shell_escape(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

@@ -2025,6 +2025,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Todo 池检验"
     assert html =~ "M3-0 预检"
+    assert html =~ "尚未运行。点击“运行预检”查看当前 Todo 池放行、容量排队、阻塞与异常判断。"
+    refute html =~ "可放行 0"
+    refute html =~ "(none)"
 
     view
     |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='workflow']")
@@ -2308,6 +2311,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       :symphony_elixir
       |> Application.get_env(SymphonyElixirWeb.Endpoint, [])
       |> Keyword.merge(server: false, secret_key_base: String.duplicate("s", 64))
+      |> Keyword.put_new(:runtime_mode, :workflow)
       |> Keyword.merge(overrides)
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
