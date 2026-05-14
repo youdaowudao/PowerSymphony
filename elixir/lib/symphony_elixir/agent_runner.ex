@@ -19,7 +19,8 @@ defmodule SymphonyElixir.AgentRunner do
   @type run_result :: %{
           status: run_result_status(),
           reason: run_result_reason(),
-          turn_count: pos_integer()
+          turn_count: pos_integer(),
+          run_instance_id: String.t() | nil
         }
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -42,6 +43,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
+    run_instance_id = Keyword.get(opts, :run_instance_id)
+
     trace =
       case Keyword.get(opts, :run_trace) do
         %RunTrace{} = existing_trace ->
@@ -62,6 +65,7 @@ defmodule SymphonyElixir.AgentRunner do
       RunTrace.record(trace, :agent_runner, %{
         event: :worker_attempt_started,
         summary: "agent_runner:worker_attempt_started",
+        run_instance_id: run_instance_id,
         payload: %{worker_host: worker_host}
       })
 
@@ -72,14 +76,15 @@ defmodule SymphonyElixir.AgentRunner do
           RunTrace.record(trace, :agent_runner, %{
             event: :workspace_prepared,
             summary: "agent_runner:workspace_prepared",
+            run_instance_id: run_instance_id,
             payload: %{workspace_path: workspace, worker_host: worker_host}
           })
 
-          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+          send_worker_runtime_info(codex_update_recipient, issue, run_instance_id, worker_host, workspace)
 
           try do
             with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, run_instance_id)
             end
           after
             Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -89,6 +94,7 @@ defmodule SymphonyElixir.AgentRunner do
           RunTrace.record(trace, :agent_runner, %{
             event: :workspace_prepare_failed,
             summary: "agent_runner:workspace_prepare_failed",
+            run_instance_id: run_instance_id,
             payload: %{worker_host: worker_host, reason: inspect(reason)}
           })
 
@@ -97,29 +103,32 @@ defmodule SymphonyElixir.AgentRunner do
     end)
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, run_instance_id) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, run_instance_id, message)
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_codex_update(recipient, %Issue{id: issue_id}, run_instance_id, message)
        when is_binary(issue_id) and is_pid(recipient) do
+    message = put_run_instance_id(message, run_instance_id)
     RunTrace.record(:codex, message)
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, message) do
+  defp send_codex_update(_recipient, _issue, run_instance_id, message) do
+    message = put_run_instance_id(message, run_instance_id)
     RunTrace.record(:codex, message)
     :ok
   end
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, run_instance_id, worker_host, workspace)
        when is_binary(issue_id) and is_binary(workspace) do
     RunTrace.record(:agent_runner, %{
       event: :worker_runtime_info,
       summary: "agent_runner:worker_runtime_info",
+      run_instance_id: run_instance_id,
       payload: %{worker_host: worker_host, workspace_path: workspace}
     })
 
@@ -128,6 +137,7 @@ defmodule SymphonyElixir.AgentRunner do
         recipient,
         {:worker_runtime_info, issue_id,
          %{
+           run_instance_id: run_instance_id,
            worker_host: worker_host,
            workspace_path: workspace
          }}
@@ -137,9 +147,9 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _run_instance_id, _worker_host, _workspace), do: :ok
 
-  defp send_run_result(recipient, %Issue{id: issue_id}, %{
+  defp send_run_result(recipient, %Issue{id: issue_id}, run_instance_id, %{
          status: status,
          reason: reason,
          turn_count: turn_count
@@ -148,6 +158,7 @@ defmodule SymphonyElixir.AgentRunner do
     RunTrace.record(:agent_runner, %{
       event: :run_result,
       summary: "agent_runner:run_result",
+      run_instance_id: run_instance_id,
       payload: %{status: status, reason: reason, turn_count: turn_count}
     })
 
@@ -158,7 +169,8 @@ defmodule SymphonyElixir.AgentRunner do
          %{
            status: status,
            reason: reason,
-           turn_count: turn_count
+           turn_count: turn_count,
+           run_instance_id: run_instance_id
          }}
       )
     end
@@ -166,9 +178,9 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_run_result(_recipient, _issue, _run_result), do: :ok
+  defp send_run_result(_recipient, _issue, _run_instance_id, _run_result), do: :ok
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, run_instance_id) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     run_mode = Keyword.get(opts, :run_mode, :normal)
@@ -178,7 +190,8 @@ defmodule SymphonyElixir.AgentRunner do
       opts: opts,
       issue_state_fetcher: issue_state_fetcher,
       run_mode: run_mode,
-      max_turns: max_turns
+      max_turns: max_turns,
+      run_instance_id: run_instance_id
     }
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
@@ -196,7 +209,8 @@ defmodule SymphonyElixir.AgentRunner do
       opts: opts,
       issue_state_fetcher: issue_state_fetcher,
       run_mode: run_mode,
-      max_turns: max_turns
+      max_turns: max_turns,
+      run_instance_id: run_instance_id
     } = turn_context
 
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
@@ -205,14 +219,14 @@ defmodule SymphonyElixir.AgentRunner do
            app_session,
            prompt,
            issue,
-           on_message: codex_message_handler(codex_update_recipient, issue)
+           on_message: codex_message_handler(codex_update_recipient, issue, run_instance_id)
          ) do
       {:ok, turn_session} ->
         Logger.info("Completed agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
         case continue_with_issue?(issue, issue_state_fetcher, run_mode) do
           {:continue, refreshed_issue} when turn_number < max_turns ->
-            send_run_result(codex_update_recipient, issue, %{
+            send_run_result(codex_update_recipient, issue, run_instance_id, %{
               status: :continuation_required,
               reason: :issue_still_active,
               turn_count: turn_number
@@ -229,7 +243,7 @@ defmodule SymphonyElixir.AgentRunner do
             )
 
           {:continue, refreshed_issue} ->
-            send_run_result(codex_update_recipient, issue, %{
+            send_run_result(codex_update_recipient, issue, run_instance_id, %{
               status: :continuation_required,
               reason: :max_turns_reached,
               turn_count: turn_number
@@ -240,7 +254,7 @@ defmodule SymphonyElixir.AgentRunner do
             :ok
 
           {:done, _refreshed_issue, reason} ->
-            send_run_result(codex_update_recipient, issue, %{
+            send_run_result(codex_update_recipient, issue, run_instance_id, %{
               status: :completed,
               reason: reason,
               turn_count: turn_number
@@ -253,13 +267,13 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} ->
-        handle_turn_error(reason, issue, codex_update_recipient, turn_number)
+        handle_turn_error(reason, issue, codex_update_recipient, run_instance_id, turn_number)
     end
   end
 
-  defp handle_turn_error({error_type, _details} = reason, issue, codex_update_recipient, turn_number)
+  defp handle_turn_error({error_type, _details} = reason, issue, codex_update_recipient, run_instance_id, turn_number)
        when error_type in [:turn_failed, :turn_cancelled] do
-    send_run_result(codex_update_recipient, issue, %{
+    send_run_result(codex_update_recipient, issue, run_instance_id, %{
       status: :failed,
       reason: :premature_turn_end,
       turn_count: turn_number
@@ -270,8 +284,8 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp handle_turn_error(:turn_timeout, issue, codex_update_recipient, turn_number) do
-    send_run_result(codex_update_recipient, issue, %{
+  defp handle_turn_error(:turn_timeout, issue, codex_update_recipient, run_instance_id, turn_number) do
+    send_run_result(codex_update_recipient, issue, run_instance_id, %{
       status: :failed,
       reason: :turn_timeout,
       turn_count: turn_number
@@ -282,9 +296,15 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp handle_turn_error(reason, _issue, _codex_update_recipient, _turn_number) do
+  defp handle_turn_error(reason, _issue, _codex_update_recipient, _run_instance_id, _turn_number) do
     {:error, reason}
   end
+
+  defp put_run_instance_id(message, run_instance_id) when is_map(message) and is_binary(run_instance_id) do
+    Map.put(message, :run_instance_id, run_instance_id)
+  end
+
+  defp put_run_instance_id(message, _run_instance_id), do: message
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 

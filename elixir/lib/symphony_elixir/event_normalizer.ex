@@ -19,6 +19,7 @@ defmodule SymphonyElixir.EventNormalizer do
     %{
       "event_id" => event_id,
       "run_id" => trace.run_id,
+      "run_instance_id" => normalize_run_instance_id(attrs),
       "project_id" => trace.project_id,
       "project_slug" => trace.project_slug,
       "issue_id" => trace.issue_id,
@@ -41,6 +42,10 @@ defmodule SymphonyElixir.EventNormalizer do
 
   defp normalize_timestamp(%DateTime{} = timestamp), do: DateTime.truncate(timestamp, :millisecond)
   defp normalize_timestamp(_value), do: DateTime.utc_now() |> DateTime.truncate(:millisecond)
+
+  defp normalize_run_instance_id(attrs) do
+    Map.get(attrs, :run_instance_id) || Map.get(attrs, "run_instance_id")
+  end
 
   defp normalize_event_type(:codex, %{event: event} = attrs)
        when event in [:notification, :other_message] do
