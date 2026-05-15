@@ -176,7 +176,7 @@ defmodule SymphonyElixir.RunTrace do
       true ->
         stream =
           trace_file
-          |> File.stream!([], :line)
+          |> File.stream!(:line, [])
           |> maybe_take_timeline_prefix(cursor_line)
 
         {line_count, recent_lines} =

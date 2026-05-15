@@ -20,7 +20,7 @@ defmodule SymphonyElixir.RawEventStore do
       trace_file when is_binary(trace_file) ->
         if File.exists?(trace_file) do
           trace_file
-          |> File.stream!([], :line)
+          |> File.stream!(:line, [])
           |> Stream.map(&String.trim_trailing(&1, "\n"))
           |> Stream.reject(&(&1 == ""))
           |> Stream.map(&Jason.decode!/1)
