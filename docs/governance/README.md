@@ -8,6 +8,7 @@
 - [reusable-repository-documentation-standard.md](./reusable-repository-documentation-standard.md)
 - [repository-bootstrap-guide.md](./repository-bootstrap-guide.md)
 - [verification-layering.md](./verification-layering.md)
+- [质量门禁红蓝对抗写法.md](./质量门禁红蓝对抗写法.md)
 - [templates/README.md](./templates/README.md)
 
 ## 这个目录负责什么
@@ -39,5 +40,7 @@
   - 改 `repository-bootstrap-guide.md`
 - 想改“质量门禁 / 验证分层”：
   - 改 `verification-layering.md`
+- 想改“质量门禁的红蓝对抗写法”：
+  - 改 `质量门禁红蓝对抗写法.md`
 - 想改“可复制模板”：
   - 改 `templates/`
