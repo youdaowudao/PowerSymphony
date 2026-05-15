@@ -5,7 +5,7 @@ defmodule SymphonyElixir.RunTrace do
 
   require Logger
 
-  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore}
+  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore, RunTimeline}
 
   @context_key {__MODULE__, :current}
 
@@ -156,6 +156,11 @@ defmodule SymphonyElixir.RunTrace do
     |> Path.join("meta.json")
     |> File.read!()
     |> Jason.decode!()
+  end
+
+  @spec timeline(t(), keyword()) :: {:ok, RunTimeline.page()} | {:error, term()}
+  def timeline(%__MODULE__{} = trace, opts \\ []) when is_list(opts) do
+    RunTimeline.page(trace, opts)
   end
 
   defp meta_payload(trace) do
