@@ -44,6 +44,18 @@
 - 编辑目标文件前，先检查该文件是否已有用户操作而造成的本地改动,避免二次打乱用户已经开始操作的原文件和上下文。
 - 对仓库内的设计文档、spec、plan、说明文档等常规文档产物，默认视为用户已授权 agent 直接编写、修改、自检并继续后续开发流程；除非用户明确要求“先给我看文档并等待我回复/批准”，否则不得把“等待用户回应文档”当作继续实现前的硬门禁。
 - 如果外部 skill、模板或流程要求“文档写完后必须等待用户 review / 回复 / 批准再继续”，在本仓库内以上一条为准，直接继续，不得因此停工。
+- 本仓库文档归档以根目录 `SPEC.md` 和 `docs/` 为准；`SPEC.md` 只承载项目级总规范，`docs/` 承载人类文档归档。
+- `docs/governance/` 是可复用规则层；本仓库特有的执行要求、验证要求和文档落点摘要统一写在 `AGENTS.md`；根目录 `SPEC.md` 仅用于描述本仓库系统规格，不作为通用治理模板。
+- 新增 repo 文档前，先阅读 `docs/README.md` 与 `docs/governance/documentation-taxonomy.md`，按文档类型选择落点，不得按工具名新建长期目录。
+- 目录名统一使用英文；文档标题尽量使用简体中文；专有名词、命令、协议名、状态名、工具名可以保留英文。
+- `Superpowers` 是方法，不是归档轴；设计、计划、验证文档默认落到 `docs/changes/<change-id>/`，事故复盘落到 `docs/incidents/`，长期愿景、路线图、未完成功能与技术路线裁决落到 `docs/initiatives/`。
+- `docs/changes/<change-id>/` 的文件数量和拆分深度由作者按任务复杂度自行决定；不要为了套模板强行凑固定件数，但必须有清晰入口和不重复职责。
+- `docs/changes/<change-id>/` 的入口文件必须包含稳定的“目标 / 需求快照”，至少说明要解决什么问题、成功标准、明确不做什么以及当前固定约束；目标快照用于让 reviewer 尽量不依赖 Linear 也能审查实现是否命中需求。
+- 小修小改默认不新建 repo 文档；满足“小修小改”条件且可由 diff + 定向测试直接证明的任务，只在 Linear issue body / `## Codex Workpad` 保留最小执行记录。
+- 下列目录视为历史归档，不再作为新文档默认落点：`docs/superpowers/`、`docs/plan_rerun_fix/`、`docs/symphony_ext_plan/`。只有在用户明确要求修改原文件或执行迁移时，才允许继续写入这些目录。
+- 单次高风险变更文档放 `docs/changes/`；事故分析放 `docs/incidents/`；长期愿景、路线图、未完成功能清单和技术路线 / A-B 裁决都放 `docs/initiatives/`。
+- 不是每个 bug 都升级为 `incident`；只有当问题影响真实流转、跨多个 ticket / PR / session、需要保留时间线与证据链，或根因分析具有长期复用价值时，才建立 `docs/incidents/<incident-id>/`。
+- 若某个事故的代码修复本身也复杂或高风险，可同时建立 `docs/changes/<change-id>/`；`incident` 写事实与根因，`change` 写实现与验证，二者不要重复抄写。
 
 ## 本地验证分层规则
 
