@@ -28,7 +28,7 @@ description:
 ## Steps
 
 1. Identify current branch and confirm remote state.
-2. Run the lightest local validation that matches the diff, following `AGENTS.md`.
+2. If this push will create a PR or update an existing PR, run the closeout gate required by `AGENTS.md` first; otherwise run the lightest local validation that matches the diff.
 3. Push branch to `origin` with upstream tracking if needed, using whatever
    remote URL is already configured.
 4. If push is not clean/rejected:
@@ -67,11 +67,13 @@ description:
 # Identify branch
 branch=$(git branch --show-current)
 
-# Minimal validation gate
-# Choose the lightest validation that matches the change scope per AGENTS.md.
+# Validation gate
+# If this push creates or updates a PR, run the closeout gate first.
+# Otherwise choose the lightest validation that matches the change scope per AGENTS.md.
 # Examples:
-# cd elixir && mise exec -- mix format --check-formatted path/to/file.ex
-# cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test test/path/to_test.exs
+# cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted
+# cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint
+# cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix test test/path/to_test.exs
 
 # Initial push: respect the current origin remote.
 git push -u origin HEAD

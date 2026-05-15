@@ -215,33 +215,51 @@ default on first open.
 
 Choose the validation command based on the current `git diff`.
 
-- Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a test run.
-- Localized code changes should use targeted validation first.
+- Docs-only updates, read-only investigation, or Linear triage/cleanup do not require a development-stage test run.
+- Development should use targeted validation only.
 - Any local development or test run that enables the dashboard or control plane should avoid
   `4000`; use another free port such as `4100`, `4123`, or `4311`.
 - Current repo-level coverage gate is `99%`.
 - Current time-sensitive test baseline is `8000ms`.
+- Before opening a PR or updating an existing PR, run a closeout gate with format check, lint,
+  and targeted tests for the touched area. Every test command must carry an explicit
+  `SYMPHONY_TEST_MAX_CASES` value. For docs-only diffs, still run the closeout gate, but targeted
+  tests may be omitted when there is no executable coverage tied to the change.
 - For ordinary local milestone checks or pre-PR self-checks, prefer:
 
 ```bash
 cd elixir
-SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover
+SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix test test/some_targeted_test.exs
 ```
 
-- Run the full gate locally only for core code changes, test/build config changes, startup/execution-flow changes, external-process orchestration changes, or when reproducing a remote gate failure:
+- `make all` is not a daily development command and is not a reproduction tool. Use it only as
+  final confirmation for major fixes, high-risk changes, or after CI has failed and you have already
+  finished local targeted investigation and repair.
+- If CI fails, read the CI error first, run targeted local checks next, fix the problem, and only
+  after the fix is complete run local `make all` once for final confirmation:
 
 ```bash
 cd elixir
-SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all
+SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all
 ```
 
 - GitHub Actions remains the authoritative remote full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
+
+Heavy tests and `make all` must be monitored for memory growth, swap growth, CPU saturation that
+does not recover, abnormal subprocess/port/worker growth, and signs of system lag or loss of
+responsiveness. If monitoring shows resource pressure, stop immediately, clean up the scene, drop
+concurrency from `4` to `2`, then to `1` if needed, and stop with a report if `1` is still
+unstable.
+
+After every test run, clean up leftover workers, fake workers, background servers, open ports,
+temporary files/directories/logs, and test-injected environment or config overrides.
 
 Run the real external end-to-end test only when you want Symphony to create disposable Linear
 resources and launch a real `codex app-server` session:
 
 ```bash
 cd elixir
+export SYMPHONY_TEST_MAX_CASES=4
 export LINEAR_API_KEY=...
 make e2e
 ```
