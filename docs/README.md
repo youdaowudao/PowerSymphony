@@ -16,7 +16,7 @@
 
 - `docs/governance/`
   - 可复用规则层。
-  - 这里的标准、模板和分类规则，才是以后新仓库可以复制走的内容。
+  - 这里的标准、模板、分类规则和质量门禁写法，才是以后新仓库可以复制走的内容。
 - `AGENTS.md`
   - 本仓库 agent 执行规则层。
   - 本仓库特有的执行要求、文档落点摘要、验证要求和协作规则都写在这里。
@@ -28,7 +28,7 @@
 
 - 目录名统一使用英文。
 - 文档标题尽量使用简体中文。
-- 文档文件名优先使用英文、编号和短横线；需要保留中文标题时，标题写在文档正文里。
+- 文档文件名尽量使用简体中文；专有名词、入口名、协议名、工具名和约定名可保留英文。
 - 专有名词、协议名、工具名、状态名、命令名可以保留英文原文。
 - 不要为了“全中文”去翻译已经具有稳定工程含义的专有名词。
 
@@ -86,6 +86,6 @@
 ## 相关文档
 
 - [governance/README.md](./governance/README.md)
-- [governance/documentation-taxonomy.md](./governance/documentation-taxonomy.md)
-- [governance/repository-bootstrap-guide.md](./governance/repository-bootstrap-guide.md)
-- [governance/reusable-repository-documentation-standard.md](./governance/reusable-repository-documentation-standard.md)
+- [governance/文档分类规则.md](./governance/文档分类规则.md)
+- [governance/新仓库起步指南.md](./governance/新仓库起步指南.md)
+- [governance/可复用仓库文档标准.md](./governance/可复用仓库文档标准.md)

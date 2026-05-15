@@ -4,11 +4,12 @@
 
 如果你要把这套文档规范复制到新仓库，先看这里，再看下面这些文件：
 
-- [documentation-taxonomy.md](./documentation-taxonomy.md)
-- [reusable-repository-documentation-standard.md](./reusable-repository-documentation-standard.md)
-- [repository-bootstrap-guide.md](./repository-bootstrap-guide.md)
-- [verification-layering.md](./verification-layering.md)
-- [templates/README.md](./templates/README.md)
+- [文档分类规则.md](./文档分类规则.md)
+- [可复用仓库文档标准.md](./可复用仓库文档标准.md)
+- [新仓库起步指南.md](./新仓库起步指南.md)
+- [验证分层规则.md](./验证分层规则.md)
+- [质量门禁红蓝对抗写法.md](./质量门禁红蓝对抗写法.md)
+- [模板总览.md](./templates/模板总览.md)
 
 ## 这个目录负责什么
 
@@ -34,10 +35,12 @@
 ## 写作者路由
 
 - 想改“文档分类 / 命名 / 路由”：
-  - 改 `documentation-taxonomy.md`
+  - 改 `文档分类规则.md`
 - 想改“新仓库如何起步”：
-  - 改 `repository-bootstrap-guide.md`
+  - 改 `新仓库起步指南.md`
 - 想改“质量门禁 / 验证分层”：
-  - 改 `verification-layering.md`
+  - 改 `验证分层规则.md`
+- 想改“质量门禁的红蓝对抗写法”：
+  - 改 `质量门禁红蓝对抗写法.md`
 - 想改“可复制模板”：
   - 改 `templates/`
