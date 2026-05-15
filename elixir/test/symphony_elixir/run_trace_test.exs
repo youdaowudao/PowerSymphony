@@ -726,6 +726,8 @@ defmodule SymphonyElixir.RunTraceTest do
       issue = %Issue{id: "issue-timeline-3", identifier: "MT-TL-3", title: "Timeline branches", state: "In Progress"}
       trace = RunTrace.start!(issue, logs_root: logs_root)
 
+      assert {:ok, %{items: [], next_cursor: nil}} = RunTrace.timeline(trace)
+
       File.write!(trace.trace_file, "")
       assert {:ok, %{items: [], next_cursor: nil}} = RunTrace.timeline(trace)
 
@@ -772,14 +774,22 @@ defmodule SymphonyElixir.RunTraceTest do
 
       legacy_cursor = "cursor:3"
       encoded_cursor = Jason.encode!(%{"before" => 3, "v" => 1}) |> Base.url_encode64(padding: false)
+      string_before_cursor = Jason.encode!(%{"before" => "3", "v" => 1}) |> Base.url_encode64(padding: false)
+      invalid_before_cursor = Jason.encode!(%{"before" => %{"bad" => true}, "v" => 1}) |> Base.url_encode64(padding: false)
 
       assert {:ok, legacy_page} = RunTrace.timeline(trace, cursor: legacy_cursor)
       assert {:ok, encoded_page} = RunTrace.timeline(trace, cursor: encoded_cursor)
+      assert {:ok, string_before_page} = RunTrace.timeline(trace, cursor: string_before_cursor)
       assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "not-a-cursor")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: 123)
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:abc")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:-1")
       assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:999")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: invalid_before_cursor)
 
       assert Enum.map(legacy_page.items, & &1.summary) == ["codex:event-1", "codex:event-2", "codex:event-3"]
       assert encoded_page == legacy_page
+      assert string_before_page == legacy_page
       assert legacy_page.next_cursor == nil
     after
       File.rm_rf(test_root)
