@@ -47,20 +47,20 @@
 
 ## 本地验证分层规则
 
-- 先看 `git diff`，再选择能证明改动正确性的最轻验证；禁止把本地 `make all` 当成所有 PR 的默认动作。
-- 重要提醒：未经人类明确确认，禁止在本地直接跑全量 `mix test --cover`、`make all` 或其他会扫完整测试集的命令；本地先从定向测试开始，full gate 留给 CI。
-- 文档更新、只读排查、Linear 分诊或清理：不要求跑测试。
-- 局部代码改动：先跑定向测试；必要时补 `cd elixir && mise exec -- mix format --check-formatted`、`cd elixir && mise exec -- mix lint` 等局部门禁。
-- 普通功能分支在里程碑点或 PR 前的本地自检：优先使用定向测试；如需扩大范围，先获得人类确认，并把 `SYMPHONY_TEST_MAX_CASES` 控制在 `6` 以内。
-- 本地 `cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all` 仅用于高风险改动，或远端 full gate 失败后需要本地复现，且同样需要人类明确确认。高风险改动包括：`Application child_specs`、`Orchestrator`、`AgentRunner`、`AppServer`、`SSH`、`live_e2e`、启动流程、测试/构建配置、外部进程编排。
+- 先看 `git diff`，再选择能证明改动正确性的最轻验证；开发阶段只跑定向测试，不把本地 `make all` 当成日常命令。
+- 文档更新、只读排查、Linear 分诊或清理：开发阶段不要求跑测试；但若准备开 PR 或准备更新 PR，仍需执行 closeout gate，其中定向测试按改动面判断是否存在可执行验证。
+- 局部代码改动：先跑定向测试；必要时补 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint` 等局部门禁。
+- 普通功能分支在准备开 PR 或准备更新 PR 之前，必须先跑一轮 closeout gate，至少包含 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint`，以及改动面对应的定向测试。
+- `make all` 不是日常开发命令，也不是复现工具；它只用于最终确认。适用场景仅限：重大修复、高风险改动、CI 已失败且本地已完成定向排查修复后，准备再次推送前做最终确认。
+- 如果 CI 失败，顺序必须是：先看 CI 报错，再在本地做定向检测，随后修复问题，最后在修复完成后再跑一次本地 `make all` 做最终确认。
 - GitHub / CI 在命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md` 这些路径时继续执行完整 `make all` 作为远端 full gate；不得因为本地分层验证而降低 coverage threshold、删测试或弱化远端门禁。
-- 最高警戒：每次本地测试命令结束后，必须立即检查并关闭该轮测试显式拉起的测试线程、fake worker、端口占用和其他临时子进程；不得把清理动作延后到下一轮测试前，更不得在已知有残留时继续叠加新测试。
+- 最高警戒：每次本地测试命令结束后，必须立即检查并关闭该轮测试显式拉起的测试线程、fake worker、background server、端口占用、临时文件/目录/日志、测试注入的环境变量和配置覆写以及其他垃圾状态；不得把清理动作延后到下一轮测试前，更不得在已知有残留时继续叠加新测试。
 
 ## 本地测试并发约定
 
-- 本地运行 `make all` 或 `mix test --cover` 时，如需主动降低测试并发，使用环境变量 `SYMPHONY_TEST_MAX_CASES` 控制 ExUnit `max_cases`。
-- 本地 ExUnit 并发必须显式受控；`SYMPHONY_TEST_MAX_CASES` 不得超过 `6`，默认先用 `4` 或更低，机器吃紧时优先降到 `2` 或 `1`。
-- 例如：`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- make all`、`cd elixir && SYMPHONY_TEST_MAX_CASES=2 mise exec -- mix test --cover`。
+- 本地所有测试命令都必须显式带 `SYMPHONY_TEST_MAX_CASES`，不得吃默认值；默认统一用 `SYMPHONY_TEST_MAX_CASES=4`。
+- 本地 ExUnit 并发必须显式受控；`SYMPHONY_TEST_MAX_CASES` 不得高于 `4`，资源吃紧时自动降到 `2`，仍不稳再降到 `1`。
+- 例如：`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix test test/some_targeted_test.exs`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all`。
 - 该约定仅用于本地执行，不得修改 CI 默认行为，不得借此降低 coverage threshold，也不得删测试。
 
 ## 测试安全红线
@@ -69,6 +69,8 @@
 - 测试环境禁止默认启动任何会轮询、起外部进程、开端口、走 SSH、连真实 Linear/Codex 的 child。
 - 这类组件只能在具体测试里显式 `start_link`，并且必须用 `on_exit` 或等效机制彻底回收。
 - 凡是测试中启动了 fake worker、测试线程、端口监听或其他临时进程，测试结束后必须立即清理；把“测试结束立刻回收干净”视为最高警戒，严禁残留到下一轮命令。
+- 重型测试和 `make all` 必须带监控，至少覆盖：内存持续升高、swap 持续增长、CPU 长时间打满且不回落、子进程/端口/worker 异常增长、系统明显卡顿或失去响应风险。
+- 一旦监控发现资源不足，处理顺序固定：立即停止当前重型测试，回收现场，把并发从 `4` 降到 `2`，仍不稳则降到 `1`，`1` 还不稳就停止并报告机器承载不了当前 full gate。
 - 测试不得把仓库真实 `WORKFLOW.md` 当成默认运行配置。
 - 凡是涉及 `Port.open`、`ssh`、`codex app-server`、`docker`、fake worker 的测试，必须显式检查并发度、进程清理和资源回收，不能把全局 supervisor 当成免费启动器。
-- 本地 full gate 期间若出现 CPU 长时间不回落、异常子进程数量持续增长、内存持续上涨或 swap 明显放大，按 blocker 处理，不得继续加大并发硬跑。
+- 本地测试结束后必须做现场回收，确认没有残留 worker / fake worker / background server、残留端口占用、临时文件/目录/日志、测试注入的环境变量和配置覆写，确保不会污染下一轮命令。
