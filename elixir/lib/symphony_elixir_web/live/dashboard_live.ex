@@ -677,7 +677,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp apply_workflow_snapshot(socket, task_ref, version, payload) when is_integer(version) do
+    payload_status = snapshot_status_from_payload(payload)
+
     cond do
+      loading_ready_snapshot?(socket, task_ref, version, payload_status) ->
+        socket
+        |> assign(:payload, payload)
+        |> assign(:workflow_snapshot_status, payload_status)
+        |> clear_workflow_snapshot_task(task_ref)
+        |> maybe_start_pending_workflow_snapshot_refresh()
+
       socket.assigns.workflow_snapshot_refresh_pending ->
         socket
         |> clear_workflow_snapshot_task(task_ref)
@@ -686,7 +695,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       version == socket.assigns.workflow_snapshot_requested_version ->
         socket
         |> assign(:payload, payload)
-        |> assign(:workflow_snapshot_status, snapshot_status_from_payload(payload))
+        |> assign(:workflow_snapshot_status, payload_status)
         |> clear_workflow_snapshot_task(task_ref)
         |> maybe_start_pending_workflow_snapshot_refresh()
 
@@ -706,6 +715,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp snapshot_status_from_payload(%{error: %{code: "snapshot_timeout"}}), do: :error
   defp snapshot_status_from_payload(%{error: %{code: "snapshot_unavailable"}}), do: :error
   defp snapshot_status_from_payload(_payload), do: :ready
+
+  defp loading_ready_snapshot?(socket, task_ref, version, :ready) do
+    socket.assigns.workflow_snapshot_status == :loading and
+      socket.assigns.workflow_snapshot_requested_version == version and
+      match?(%Task{ref: ^task_ref}, socket.assigns.workflow_snapshot_task)
+  end
+
+  defp loading_ready_snapshot?(_socket, _task_ref, _version, _payload_status), do: false
 
   defp handle_failed_workflow_snapshot_task(socket, task_ref) do
     socket
