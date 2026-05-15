@@ -33,7 +33,7 @@
 
 ## 新人先看什么
 
-- `docs/governance/documentation-taxonomy.md`
+- `docs/governance/文档分类规则.md`
 - `AGENTS.md`
 - [按仓库真实情况补充]
 

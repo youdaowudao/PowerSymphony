@@ -86,6 +86,6 @@
 ## 相关文档
 
 - [governance/README.md](./governance/README.md)
-- [governance/documentation-taxonomy.md](./governance/documentation-taxonomy.md)
-- [governance/repository-bootstrap-guide.md](./governance/repository-bootstrap-guide.md)
-- [governance/reusable-repository-documentation-standard.md](./governance/reusable-repository-documentation-standard.md)
+- [governance/文档分类规则.md](./governance/文档分类规则.md)
+- [governance/新仓库起步指南.md](./governance/新仓库起步指南.md)
+- [governance/可复用仓库文档标准.md](./governance/可复用仓库文档标准.md)
