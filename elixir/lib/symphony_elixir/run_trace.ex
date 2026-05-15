@@ -163,9 +163,8 @@ defmodule SymphonyElixir.RunTrace do
     limit = normalize_timeline_limit(Keyword.get(opts, :limit, 50))
     cursor = Keyword.get(opts, :cursor)
 
-    with {:ok, cursor_line} <- decode_timeline_cursor(cursor),
-         {:ok, page} <- read_timeline_page(trace.trace_file, cursor_line, limit) do
-      {:ok, page}
+    with {:ok, cursor_line} <- decode_timeline_cursor(cursor) do
+      read_timeline_page(trace.trace_file, cursor_line, limit)
     end
   end
 
