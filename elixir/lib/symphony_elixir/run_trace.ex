@@ -5,7 +5,7 @@ defmodule SymphonyElixir.RunTrace do
 
   require Logger
 
-  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore, RunTimeline}
+  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore}
 
   @context_key {__MODULE__, :current}
 
@@ -158,10 +158,129 @@ defmodule SymphonyElixir.RunTrace do
     |> Jason.decode!()
   end
 
-  @spec timeline(t(), keyword()) :: {:ok, RunTimeline.page()} | {:error, term()}
+  @spec timeline(t(), keyword()) :: {:ok, %{items: [map()], next_cursor: String.t() | nil}} | {:error, term()}
   def timeline(%__MODULE__{} = trace, opts \\ []) when is_list(opts) do
-    RunTimeline.page(trace, opts)
+    limit = normalize_timeline_limit(Keyword.get(opts, :limit, 50))
+    cursor = Keyword.get(opts, :cursor)
+
+    with {:ok, cursor_line} <- decode_timeline_cursor(cursor),
+         {:ok, page} <- read_timeline_page(trace.trace_file, cursor_line, limit) do
+      {:ok, page}
+    end
   end
+
+  defp read_timeline_page(trace_file, cursor_line, limit) when is_binary(trace_file) do
+    case File.exists?(trace_file) do
+      false ->
+        {:ok, %{items: [], next_cursor: nil}}
+
+      true ->
+        stream =
+          trace_file
+          |> File.stream!([], :line)
+          |> maybe_take_timeline_prefix(cursor_line)
+
+        {line_count, recent_lines} =
+          Enum.reduce(stream, {0, []}, fn line, {count, window} ->
+            {count + 1, push_recent_timeline_line(window, line, limit)}
+          end)
+
+        page_end = cursor_line || line_count
+
+        if not is_nil(cursor_line) and line_count < cursor_line do
+          {:error, :invalid_cursor}
+        else
+          {:ok,
+           %{
+             items: recent_lines |> Enum.reverse() |> Enum.map(&project_timeline_event/1),
+             next_cursor: timeline_next_cursor(page_end, limit)
+           }}
+        end
+    end
+  end
+
+  defp maybe_take_timeline_prefix(stream, nil), do: stream
+  defp maybe_take_timeline_prefix(stream, cursor_line) when is_integer(cursor_line), do: Stream.take(stream, cursor_line)
+
+  defp push_recent_timeline_line(window, line, limit) do
+    [line | window]
+    |> Enum.take(limit)
+  end
+
+  defp timeline_next_cursor(page_end, limit) when is_integer(page_end) and page_end > limit do
+    encode_timeline_cursor(page_end - limit)
+  end
+
+  defp timeline_next_cursor(_page_end, _limit), do: nil
+
+  defp encode_timeline_cursor(index) when is_integer(index) and index >= 0 do
+    %{"before" => index, "v" => 1}
+    |> Jason.encode!()
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp project_timeline_event(line) when is_binary(line) do
+    event = Jason.decode!(String.trim_trailing(line, "\n"))
+
+    %{
+      timestamp: Map.get(event, "timestamp"),
+      source: Map.get(event, "source"),
+      event_group: Map.get(event, "event_group"),
+      summary: Map.get(event, "summary") || fallback_timeline_summary(event),
+      event_type: Map.get(event, "event_type"),
+      event_id: Map.get(event, "event_id"),
+      status_markers: timeline_status_markers(event)
+    }
+  end
+
+  defp fallback_timeline_summary(event) do
+    [Map.get(event, "source"), Map.get(event, "event_type")]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(":")
+  end
+
+  defp timeline_status_markers(event) do
+    event_type = Map.get(event, "event_type")
+
+    []
+    |> maybe_add_timeline_marker(event_type in ["turn_completed", "run_result"], "completed")
+    |> maybe_add_timeline_marker(event_type in ["tool_call_failed", "unsupported_tool_call", "turn_input_required"], "attention")
+    |> maybe_add_timeline_marker(event_type == "session_started", "session_started")
+  end
+
+  defp maybe_add_timeline_marker(markers, true, marker), do: [marker | markers]
+  defp maybe_add_timeline_marker(markers, false, _marker), do: markers
+
+  defp normalize_timeline_limit(value) when is_integer(value) and value > 0, do: min(value, 50)
+  defp normalize_timeline_limit(_value), do: 50
+
+  defp decode_timeline_cursor(nil), do: {:ok, nil}
+  defp decode_timeline_cursor(""), do: {:ok, nil}
+
+  defp decode_timeline_cursor("cursor:" <> index), do: decode_legacy_timeline_cursor(index)
+
+  defp decode_timeline_cursor(cursor) when is_binary(cursor) do
+    with {:ok, decoded} <- Base.url_decode64(cursor, padding: false),
+         {:ok, %{"before" => before}} <- Jason.decode(decoded),
+         {:ok, parsed} <- normalize_timeline_cursor_before(before) do
+      {:ok, parsed}
+    else
+      _ -> {:error, :invalid_cursor}
+    end
+  end
+
+  defp decode_timeline_cursor(_), do: {:error, :invalid_cursor}
+
+  defp decode_legacy_timeline_cursor(index) do
+    case Integer.parse(index) do
+      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
+      _ -> {:error, :invalid_cursor}
+    end
+  end
+
+  defp normalize_timeline_cursor_before(before) when is_integer(before) and before >= 0, do: {:ok, before}
+  defp normalize_timeline_cursor_before(before) when is_binary(before), do: decode_legacy_timeline_cursor(before)
+  defp normalize_timeline_cursor_before(_before), do: {:error, :invalid_cursor}
 
   defp meta_payload(trace) do
     %{
