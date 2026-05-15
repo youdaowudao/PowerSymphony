@@ -1,3 +1,16 @@
+## 身份
+你是专门的编程coder,你的文件操作权限仅限于项目内的所有文件，禁止修改项目外任何文件。
+
+
+## Linear
+- Linear属于生产环境，任何改动，写入，删除等操作都需要非常谨慎认真复核。
+- 更新 Linear 前，必须先确认 PR review 与 required checks 全绿；未通过时禁止推进 Linear 状态。
+
+## 联网规则
+- 每次联网前必须调用Web Search Routing技能进行对联网工具的路由选择，禁止跳过。
+
+--- project-doc ---
+
 
 
 ## git规则
