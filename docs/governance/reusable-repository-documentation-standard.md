@@ -1,0 +1,273 @@
+# 可复用仓库文档标准
+
+## 用途
+
+这是一份可复制到新仓库的通用文档标准。
+
+目标不是把所有项目都变成文档工厂，而是先定死：
+
+- 总规范放哪里
+- 变更文档放哪里
+- 事故文档放哪里
+- 哪些情况根本不该写 repo 文档
+
+补充约定：
+
+- 这份 `governance` 标准本身是可复用、可复制到其他仓库的。
+- 除 `docs/governance/` 外，其余文档默认都应视为当前仓库内容，不应直接当成通用模板整包复制。
+
+## 适用前提
+
+建议在下面场景使用这套标准：
+
+- 使用 AI / agent 辅助开发
+- 存在多轮 handoff
+- 需求与执行可能跨会话丢上下文
+- 高风险边界不能只靠口头传递
+
+不建议全量套用到所有小仓库或所有小改动。
+
+## 推荐目录结构
+
+```text
+README.md
+AGENTS.md
+docs/
+  README.md
+  governance/
+  changes/
+  incidents/
+  initiatives/
+SPEC.md
+```
+
+说明：
+
+- `docs/governance/` 是可复用规则层。
+- `docs/governance/README.md` 是这套规则层的入口。
+- `AGENTS.md` 是仓库特有的 agent 执行规则层。
+- `SPEC.md` 是仓库特有的系统规格层，不属于通用治理模板。
+- 若新仓库没有明显的系统级长期合同，可以不建立 `SPEC.md`。
+
+## 命名与标题规则
+
+- 目录名统一使用英文。
+- 文件名优先使用英文、编号和短横线，方便排序和复制。
+- 文档标题尽量使用简体中文。
+- 专有名词、命令、协议名、状态名、工具名可以保留英文。
+- 不要求把所有英文工程术语强行翻译成中文。
+
+## 目录职责
+
+### `SPEC.md`
+
+只放当前仓库自己的系统级总规范：
+
+- 长期边界
+- 全局不变量
+- 核心状态机
+- 明确 non-goals
+
+不要把单次任务计划和事故细节写进这里。
+
+它不是这套治理标准里最需要被复制的文件；真正可复用的是 `docs/governance/` 的规则和模板。
+
+### `docs/README.md`
+
+文档入口。必须回答：
+
+- 总规范在哪
+- 新变更文档放哪
+- 事故文档放哪
+- 新开发者应该先看哪几份文件
+
+### `docs/governance/`
+
+放文档治理规则：
+
+- 文档分类
+- 归档规则
+- 何时必须写 repo 文档
+- 何时禁止过度文档化
+
+这是默认应该复制到新仓库的部分。
+
+补充：
+
+- 如果新仓库不知道如何起步，先看 `docs/governance/repository-bootstrap-guide.md`。
+
+### `docs/changes/`
+
+单次高风险变更文档。
+
+文件数量和拆分深度由作者按复杂度自行决定，不预设上限。
+
+最小要求：
+
+- 至少有一个清晰入口文件。
+- 文档之间职责不重复。
+- 命名便于排序、检索和 handoff。
+
+常见结构示例：
+
+```text
+docs/changes/<change-id>/
+  00_context.md
+  10_design.md
+  20_plan.md
+  90_verification.md
+```
+
+其中：
+
+- `00_context.md` 可选
+- `10_design.md` 和 `20_plan.md` 是主文件
+- `90_verification.md` 用于收口
+
+补充要求：
+
+- change 文档必须包含一个稳定的“目标 / 需求快照”段落。
+- 这不是为了复制 Linear，而是为了让 reviewer 在不打开 Linear 的情况下，也能直接审查“这次改动到底要解决什么”。
+- 只保留稳定目标，不复制完整讨论历史。
+- 入口文件建议至少回答：
+  - 要解决什么问题
+  - 成功标准是什么
+  - 明确不做什么
+  - 当前固定约束或风险是什么
+
+### `docs/incidents/`
+
+事故分析，不与 change 混用。
+
+推荐结构：
+
+```text
+docs/incidents/<incident-id>/
+  00_summary.md
+  10_timeline.md
+  20_evidence.md
+  30_root_cause.md
+  40_actions.md
+  artifacts/
+```
+
+其中：
+
+- `artifacts/` 为可选目录
+- 仅在需要保存截图、日志摘录、快照或其他证据附件时创建
+
+### `docs/initiatives/`
+
+长期愿景、路线图、里程碑、阶段 backlog、技术路线分析、A/B 裁决，以及长期有效的 SPEC。
+
+可选子目录：
+
+- `全局规划/`
+  - 长期目标、路线图、里程碑
+- `阶段规划/`
+  - 当需要长期维护多个阶段的正式规划、门禁和交接要求时使用
+- `SPEC/`
+  - 长期有效、可被 coder 和 reviewer 直接引用的 SPEC
+- `决策记录/`
+  - 当同一长期主题下存在多次技术路线裁决时使用
+- `资料复核/`
+  - 当需要保留资料来源和源码复核记录时使用
+
+## 文档路由规则
+
+### 必须写 repo 文档的情况
+
+- 并发
+- 生命周期
+- 持久化
+- 权限 / 安全
+- retry / reconciliation
+- 启动 / 停止 / 清理
+- 外部副作用
+- 跨模块高风险契约
+
+### 默认不写 repo 文档的情况
+
+- 2 个文件以内的小改动
+- 命名修正
+- 局部重构
+- 能被 diff + 定向测试直接证明的行为修复
+
+此时只保留最小执行记录即可，不必再建 repo 文档。
+
+### bug 修复与事故的分流
+
+- 普通 bug：
+  - 小则不建 repo 文档，只留 Linear / PR / 测试证据
+  - 高风险则写 `docs/changes/<change-id>/`
+- 事故级 bug：
+  - 写 `docs/incidents/<incident-id>/`
+  - 如果同时有代码修复，再补 `docs/changes/<change-id>/`
+
+两者不要混成一份文档。
+
+### Linear 与 repo 文档的边界
+
+- `Linear`
+  - 任务流转主真相源
+  - 当前状态、最新评论、执行面板、日常事件流
+- `docs/changes/`
+  - 单次高风险变更的稳定设计、计划、验证快照
+- `docs/incidents/`
+  - 事故事实、证据、时间线、根因和后续动作
+- `docs/initiatives/`
+  - 长期愿景、路线图、backlog、技术路线和 A/B 裁决
+
+原则：
+
+- 不把 Linear 完整镜像到 repo。
+- 不把 repo 文档变成日常执行台账。
+- 只把稳定、可复用、后续人会反复回看的内容沉淀到 repo。
+
+## 与方法论工具的关系
+
+方法论工具不应成为目录轴。
+
+例如：
+
+- `Superpowers` 是方法，不是归档位置
+- 任何设计、计划、验证产物，都应回填到 `docs/changes/`、`docs/incidents/`、`docs/initiatives/` 等固定类型目录
+
+不要创建：
+
+- `docs/<tool-name>/specs`
+- `docs/<tool-name>/plans`
+- `docs/<tool-name>/tasks`
+
+Review 不默认起目录：
+
+- review 事件以 GitHub / Linear 为主
+- 只有当 review 形成稳定结论时，才回填到 `change`、`incident` 或 `initiative`
+
+## 反腐败规则
+
+1. 一类长期事实只有一个主归档位置。
+2. 小改动不强迫产文档。
+3. 文档必须挂到 review 或门禁上，否则宁可不写。
+4. 过期文档要删除、归档或标明历史状态。
+5. 长期规则和单次 change 不得混在一篇文档里。
+
+## 新仓库接入步骤
+
+1. 复制 `docs/governance/`
+2. 阅读 `docs/governance/repository-bootstrap-guide.md`
+3. 用 `docs/governance/templates/仓库级/AGENTS_模板.md` 实例化新仓库自己的 `AGENTS.md`
+4. 用 `docs/governance/templates/仓库级/docs_README_模板.md` 实例化新仓库自己的 `docs/README.md`
+5. 建立 `docs/changes/`、`docs/incidents/`、`docs/initiatives/`
+6. 用 `docs/governance/templates/initiative/README.md` 创建第一个长期主题入口
+7. 明确哪些改动必须写 repo 文档，哪些默认不写
+8. 只有当该仓库存在需要长期维护的系统级合同，再决定是否创建 `SPEC.md`
+
+## 最终目标
+
+这套标准要实现的是：
+
+- 新人一眼知道文档放哪里
+- agent 不会再按工具名到处散写
+- 高风险设计可以被长期复用
+- 小改动不会被文档负担拖死
