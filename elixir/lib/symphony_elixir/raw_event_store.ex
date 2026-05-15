@@ -3,34 +3,37 @@ defmodule SymphonyElixir.RawEventStore do
   Append-only raw trace writer and reader for normalized run events.
   """
 
-  alias SymphonyElixir.RunTrace
-
-  @spec append(RunTrace.t(), map()) :: :ok
-  def append(%RunTrace{} = trace, %{} = event) do
+  @spec append(map(), map()) :: :ok
+  def append(%{} = trace, %{} = event) do
     event = maybe_write_payload(trace, event)
     persisted = Map.drop(event, ["payload", "raw_payload"])
     File.write!(trace.trace_file, Jason.encode!(persisted) <> "\n", [:append])
     :ok
   end
 
-  @spec list_events(RunTrace.t()) :: [map()]
-  def list_events(%RunTrace{trace_file: trace_file}) do
-    if File.exists?(trace_file) do
-      trace_file
-      |> File.read!()
-      |> String.split("\n", trim: true)
-      |> Enum.map(&Jason.decode!/1)
-    else
-      []
+  @spec list_events(map()) :: [map()]
+  def list_events(%{} = trace), do: stream_events(trace) |> Enum.to_list()
+
+  @spec stream_events(map()) :: Enumerable.t()
+  def stream_events(%{} = trace) do
+    case Map.get(trace, :trace_file) || Map.get(trace, "trace_file") do
+      trace_file when is_binary(trace_file) ->
+        if File.exists?(trace_file) do
+          trace_file
+          |> File.stream!(:line, [])
+          |> Stream.map(&String.trim_trailing(&1, "\n"))
+          |> Stream.reject(&(&1 == ""))
+          |> Stream.map(&Jason.decode!/1)
+        else
+          []
+        end
+
+      _ ->
+        []
     end
   end
 
-  @spec stream_events(RunTrace.t()) :: Enumerable.t()
-  def stream_events(%RunTrace{} = trace) do
-    list_events(trace)
-  end
-
-  defp maybe_write_payload(%RunTrace{} = trace, event) do
+  defp maybe_write_payload(%{} = trace, event) do
     payload = payload_body(event)
 
     if is_nil(payload) do

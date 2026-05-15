@@ -55,6 +55,10 @@ defmodule SymphonyElixir.RunTraceTest do
     |> Enum.map(&Jason.decode!/1)
   end
 
+  defp write_trace_lines!(trace, lines) when is_list(lines) do
+    File.write!(trace.trace_file, Enum.map_join(lines, "\n", &Jason.encode!/1) <> "\n")
+  end
+
   test "agent runner creates run trace and records codex plus agent_runner events" do
     test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-#{System.unique_integer([:positive])}")
     logs_root = set_logs_root!(Path.join(test_root, "logs"))
@@ -247,6 +251,103 @@ defmodule SymphonyElixir.RunTraceTest do
       assert event["run_id"] == trace.run_id
       assert event["source"] == "agent_runner"
       assert event["event_type"] == "worker_attempt_started"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline keeps summary_for_trace behavior intact" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-summary-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-trace-14", identifier: "MT-TRACE-14", title: "Timeline summary", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.with_context(trace, fn ->
+        RunTrace.record(:agent_runner, %{
+          event: :workspace_prepared,
+          summary: "agent_runner:workspace_prepared"
+        })
+      end)
+
+      summary = RunStateStore.summary_for_trace(trace)
+      assert summary.current_phase == "preparing_workspace"
+      assert summary.current_action == "agent_runner:workspace_prepared"
+      assert summary.health == "normal"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline defaults to the recent window and returns cursor metadata" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-timeline-1", identifier: "MT-TL-1", title: "Timeline window", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      Enum.each(1..60, fn index ->
+        RunTrace.record(trace, :agent_runner, %{
+          event: :worker_runtime_info,
+          summary: "agent_runner:event-#{index}",
+          timestamp: DateTime.add(DateTime.utc_now() |> DateTime.truncate(:millisecond), index, :second),
+          payload: %{index: index}
+        })
+      end)
+
+      {:ok, timeline} = RunTrace.timeline(trace)
+
+      assert length(timeline.items) == 50
+      assert List.first(timeline.items).summary == "agent_runner:event-11"
+      assert List.last(timeline.items).summary == "agent_runner:event-60"
+      assert is_binary(timeline.next_cursor)
+      refute timeline.next_cursor == ""
+
+      assert Enum.all?(timeline.items, fn item ->
+               is_binary(item.summary) and
+                 is_binary(item.event_id) and
+                 is_binary(item.timestamp) and
+                 is_binary(item.source) and
+                 is_list(item.status_markers)
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline cursor loads the previous window and preserves stable item shape" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-cursor-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-timeline-2", identifier: "MT-TL-2", title: "Timeline cursor", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      Enum.each(1..60, fn index ->
+        RunTrace.record(trace, :codex, %{
+          event: :turn_completed,
+          summary: "codex:event-#{index}",
+          timestamp: DateTime.add(DateTime.utc_now() |> DateTime.truncate(:millisecond), index, :second),
+          payload: %{index: index}
+        })
+      end)
+
+      {:ok, first_page} = RunTrace.timeline(trace)
+      {:ok, previous_page} = RunTrace.timeline(trace, cursor: first_page.next_cursor)
+
+      assert length(previous_page.items) == 10
+      assert List.first(previous_page.items).summary == "codex:event-1"
+      assert List.last(previous_page.items).summary == "codex:event-10"
+      assert previous_page.next_cursor == nil
+
+      assert Enum.all?(previous_page.items, fn item ->
+               is_binary(item.summary) and
+                 is_binary(item.event_id) and
+                 is_binary(item.timestamp) and
+                 is_list(item.status_markers)
+             end)
     after
       File.rm_rf(test_root)
     end
@@ -595,7 +696,7 @@ defmodule SymphonyElixir.RunTraceTest do
         })
       end)
 
-      [event] = RawEventStore.stream_events(trace)
+      event = RawEventStore.stream_events(trace) |> Enum.at(0)
       payload_path = Path.join(trace.run_dir, event["payload_ref"])
       payload = payload_path |> File.read!() |> Jason.decode!()
 
@@ -612,6 +713,122 @@ defmodule SymphonyElixir.RunTraceTest do
       assert Enum.any?(persisted_events, fn persisted_event ->
                persisted_event["event_id"] == event["event_id"]
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline covers empty trace cursor and limit normalization branches" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-timeline-3", identifier: "MT-TL-3", title: "Timeline branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      assert {:ok, %{items: [], next_cursor: nil}} = RunTrace.timeline(trace)
+
+      File.write!(trace.trace_file, "")
+      assert {:ok, %{items: [], next_cursor: nil}} = RunTrace.timeline(trace)
+
+      for index <- 1..60 do
+        RunTrace.record(trace, :agent_runner, %{
+          event: :worker_runtime_info,
+          summary: "agent_runner:event-#{index}",
+          timestamp: DateTime.add(DateTime.utc_now() |> DateTime.truncate(:millisecond), index, :second),
+          payload: %{index: index}
+        })
+      end
+
+      assert {:ok, zero_limit_page} = RunTrace.timeline(trace, limit: 0)
+      assert {:ok, negative_limit_page} = RunTrace.timeline(trace, limit: -1)
+      assert {:ok, capped_limit_page} = RunTrace.timeline(trace, limit: 100)
+      assert {:ok, empty_cursor_page} = RunTrace.timeline(trace, cursor: "")
+
+      assert length(zero_limit_page.items) == 50
+      assert length(negative_limit_page.items) == 50
+      assert length(capped_limit_page.items) == 50
+      assert empty_cursor_page == capped_limit_page
+      assert List.first(capped_limit_page.items).summary == "agent_runner:event-11"
+      assert List.last(capped_limit_page.items).summary == "agent_runner:event-60"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline covers legacy cursor base64 cursor invalid cursor and overflow branches" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-cursor-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-timeline-4", identifier: "MT-TL-4", title: "Timeline cursor branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      for index <- 1..6 do
+        RunTrace.record(trace, :codex, %{
+          event: :turn_completed,
+          summary: "codex:event-#{index}",
+          timestamp: DateTime.add(DateTime.utc_now() |> DateTime.truncate(:millisecond), index, :second)
+        })
+      end
+
+      legacy_cursor = "cursor:3"
+      encoded_cursor = Jason.encode!(%{"before" => 3, "v" => 1}) |> Base.url_encode64(padding: false)
+      string_before_cursor = Jason.encode!(%{"before" => "3", "v" => 1}) |> Base.url_encode64(padding: false)
+      invalid_before_cursor = Jason.encode!(%{"before" => %{"bad" => true}, "v" => 1}) |> Base.url_encode64(padding: false)
+
+      assert {:ok, legacy_page} = RunTrace.timeline(trace, cursor: legacy_cursor)
+      assert {:ok, encoded_page} = RunTrace.timeline(trace, cursor: encoded_cursor)
+      assert {:ok, string_before_page} = RunTrace.timeline(trace, cursor: string_before_cursor)
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "not-a-cursor")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: 123)
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:abc")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:-1")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: "cursor:999")
+      assert {:error, :invalid_cursor} = RunTrace.timeline(trace, cursor: invalid_before_cursor)
+
+      assert Enum.map(legacy_page.items, & &1.summary) == ["codex:event-1", "codex:event-2", "codex:event-3"]
+      assert encoded_page == legacy_page
+      assert string_before_page == legacy_page
+      assert legacy_page.next_cursor == nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace timeline projects missing summary and status marker branches" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-project-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-timeline-5", identifier: "MT-TL-5", title: "Timeline projection", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "source" => "codex",
+          "event_type" => "turn_completed",
+          "timestamp" => DateTime.to_iso8601(trace.started_at)
+        },
+        %{
+          "source" => "codex",
+          "event_type" => "tool_call_failed",
+          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 1, :second))
+        },
+        %{
+          "source" => "codex",
+          "event_type" => "session_started",
+          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 2, :second))
+        }
+      ])
+
+      assert {:ok, page} = RunTrace.timeline(trace)
+      assert Enum.map(page.items, & &1.summary) == ["codex:turn_completed", "codex:tool_call_failed", "codex:session_started"]
+
+      [completed, attention, session_started] = page.items
+      assert completed.status_markers == ["completed"]
+      assert attention.status_markers == ["attention"]
+      assert session_started.status_markers == ["session_started"]
     after
       File.rm_rf(test_root)
     end
