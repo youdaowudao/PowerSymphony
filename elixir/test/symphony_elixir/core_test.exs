@@ -1324,9 +1324,49 @@ defmodule SymphonyElixir.CoreTest do
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationRetryCallbackOrchestrator)
 
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-continuation-retry-callback-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    codex_binary = Path.join(test_root, "fake-codex")
+
+    File.mkdir_p!(workspace_root)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r _line; do
+      count=$((count + 1))
+      case "$count" in
+        1)
+          printf '%s\\n' '{"id":1,"result":{}}'
+          ;;
+        2)
+          ;;
+        3)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-continuation-retry"}}}'
+          ;;
+        4)
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-continuation-retry-1"}}}'
+          sleep 30
+          exit 0
+          ;;
+        *)
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: ["Todo", "In Progress", "In Review"],
-      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
     )
 
     Application.put_env(
@@ -1341,8 +1381,26 @@ defmodule SymphonyElixir.CoreTest do
       restore_app_env(:tracker_adapter_override, previous_tracker_adapter)
 
       if Process.alive?(pid) do
+        running =
+          case :sys.get_state(pid) do
+            %{running: running} when is_map(running) -> running
+            _ -> %{}
+          end
+
+        Enum.each(running, fn
+          {_running_issue_id, %{pid: running_pid}} when is_pid(running_pid) ->
+            if Process.alive?(running_pid) do
+              Process.exit(running_pid, :kill)
+            end
+
+          _ ->
+            :ok
+        end)
+
         Process.exit(pid, :normal)
       end
+
+      File.rm_rf(test_root)
     end)
 
     initial_state = :sys.get_state(pid)
@@ -1421,20 +1479,21 @@ defmodule SymphonyElixir.CoreTest do
       fn ->
         state = :sys.get_state(pid)
 
-        case state.retry_attempts[issue_id] do
+        case state.running[issue_id] do
           %{
-            attempt: 2,
-            error: "agent exited normally without run_result",
+            pid: spawned_pid,
+            retry_attempt: 1,
             worker_host: nil,
-            workspace_path: nil,
+            workspace_path: workspace_path,
             run_instance_id: run_instance_id,
-            retry_token: new_retry_token
+            issue: %Issue{identifier: "MT-570"}
           }
-          when is_binary(run_instance_id) and is_reference(new_retry_token) ->
-            not Map.has_key?(state.running, issue_id) and
+          when is_pid(spawned_pid) and is_binary(workspace_path) and is_binary(run_instance_id) ->
+            spawned_pid != worker_pid and
+              workspace_path == Path.join(workspace_root, "MT-570") and
+              not Map.has_key?(state.retry_attempts, issue_id) and
               MapSet.member?(state.claimed, issue_id) and
-              MapSet.member?(state.completed, issue_id) and
-              new_retry_token != retry_token
+              MapSet.member?(state.completed, issue_id)
 
           _ ->
             false
@@ -1448,18 +1507,19 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
 
     assert %{
-             attempt: 2,
-             error: "agent exited normally without run_result",
+             pid: spawned_pid,
+             retry_attempt: 1,
              worker_host: nil,
-             workspace_path: nil,
+             workspace_path: workspace_path,
              run_instance_id: run_instance_id,
-             retry_token: new_retry_token
-           } = state.retry_attempts[issue_id]
+             issue: %Issue{identifier: "MT-570"}
+           } = state.running[issue_id]
 
+    assert is_pid(spawned_pid)
+    refute spawned_pid == worker_pid
+    assert workspace_path == Path.join(workspace_root, "MT-570")
     assert is_binary(run_instance_id)
-    assert is_reference(new_retry_token)
-    refute new_retry_token == retry_token
-    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -4129,13 +4189,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> String.trim_leading("JSON:")
                  |> Jason.decode!()
                  |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
+                   expected_approval_policy = "on-request"
 
                    payload["method"] == "thread/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
@@ -4162,13 +4216,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> String.trim_leading("JSON:")
                  |> Jason.decode!()
                  |> then(fn payload ->
-                   expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
-                     }
-                   }
+                   expected_approval_policy = "on-request"
 
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "cwd"]) == canonical_workspace &&
