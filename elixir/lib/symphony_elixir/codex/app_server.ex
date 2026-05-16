@@ -1156,8 +1156,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     is_binary(message) and (code in ["ENOENT", "NOT_FOUND"] or String.contains?(String.downcase(message), "cwd missing"))
   end
 
-  defp workspace_path_failure_payload?(_payload), do: false
-
   defp protocol_message_candidate?(data) do
     data
     |> to_string()

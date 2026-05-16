@@ -313,8 +313,6 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp validate_workspace_turn_ownership(_workspace, _run_instance_id, _worker_host, _on_message), do: :ok
-
   defp emit_workspace_lifecycle_invalid(on_message, run_instance_id, details) when is_function(on_message, 1) do
     on_message.(%{
       event: :workspace_lifecycle_invalid,

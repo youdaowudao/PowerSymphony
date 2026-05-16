@@ -314,8 +314,10 @@ defmodule SymphonyElixir.CoreTest do
       assert_eventually(
         fn ->
           state = :sys.get_state(pid)
+          binding = Workspace.read_resource_binding(closed_workspace)
 
-          not File.exists?(closed_workspace) and
+          File.dir?(closed_workspace) and
+            match?({:ok, %{"state" => "closing", "closing_reason" => "startup_terminal_sweep"}}, binding) and
             state.poll_check_in_progress == true and
             state.next_poll_due_at_ms == nil and
             state.tick_timer_ref == nil and
@@ -338,7 +340,7 @@ defmodule SymphonyElixir.CoreTest do
                 nil
             end
 
-          not File.exists?(closed_workspace) and
+          File.dir?(closed_workspace) and
             state.poll_check_in_progress == false and
             is_reference(state.tick_timer_ref) and
             is_reference(state.tick_token) and
@@ -348,6 +350,10 @@ defmodule SymphonyElixir.CoreTest do
         end,
         40
       )
+
+      assert {:ok, binding} = Workspace.read_resource_binding(closed_workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "startup_terminal_sweep"
     after
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       File.rm_rf(test_root)
@@ -1295,8 +1301,21 @@ defmodule SymphonyElixir.CoreTest do
 
     initial_state = :sys.get_state(pid)
 
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid) do
+        send(worker_pid, :stop)
+      end
+    end)
+
     running_entry = %{
-      pid: self(),
+      pid: worker_pid,
       ref: ref,
       identifier: "MT-570",
       worker_host: "worker-a",
@@ -1323,7 +1342,7 @@ defmodule SymphonyElixir.CoreTest do
        }}
     )
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
+    send(pid, {:DOWN, ref, :process, worker_pid, :normal})
     Process.sleep(50)
 
     assert %{attempt: 1, retry_token: retry_token, worker_host: "worker-a", workspace_path: "/tmp/continuation-callback"} =
@@ -1336,17 +1355,20 @@ defmodule SymphonyElixir.CoreTest do
       fn ->
         state = :sys.get_state(pid)
 
-        case state.running[issue_id] do
+        case state.retry_attempts[issue_id] do
           %{
-            retry_attempt: 1,
+            attempt: 2,
+            error: "agent exited normally without run_result",
             worker_host: nil,
-            workspace_path: workspace_path,
-            issue: %Issue{id: ^issue_id}
+            workspace_path: nil,
+            run_instance_id: run_instance_id,
+            retry_token: new_retry_token
           }
-          when is_binary(workspace_path) ->
-            workspace_path =~ "/MT-570" and
+          when is_binary(run_instance_id) and is_reference(new_retry_token) ->
+            not Map.has_key?(state.running, issue_id) and
               MapSet.member?(state.claimed, issue_id) and
-              not Map.has_key?(state.retry_attempts, issue_id)
+              MapSet.member?(state.completed, issue_id) and
+              new_retry_token != retry_token
 
           _ ->
             false
@@ -1356,14 +1378,22 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     state = :sys.get_state(pid)
-
-    assert %{retry_attempt: 1, worker_host: nil, workspace_path: workspace_path, issue: %Issue{id: ^issue_id}} =
-             state.running[issue_id]
-
-    assert workspace_path =~ "/MT-570"
     assert MapSet.member?(state.claimed, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{
+             attempt: 2,
+             error: "agent exited normally without run_result",
+             worker_host: nil,
+             workspace_path: nil,
+             run_instance_id: run_instance_id,
+             retry_token: new_retry_token
+           } = state.retry_attempts[issue_id]
+
+    assert is_binary(run_instance_id)
+    assert is_reference(new_retry_token)
+    refute new_retry_token == retry_token
+    refute Map.has_key?(state.running, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
