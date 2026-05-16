@@ -74,6 +74,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.fetch!(state, :snapshot), state}
     end
 
+    def handle_call({:run_timeline, issue_identifier, cursor}, _from, state) do
+      results = Keyword.get(state, :run_timeline_results, %{})
+      {:reply, Map.get(results, {issue_identifier, cursor}, {:error, :run_not_found}), state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
@@ -218,6 +223,32 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defmodule StaticProjectRegistry do
     defstruct entries: []
+  end
+
+  defmodule WorkerPortManagerStub do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts) do
+      {:ok,
+       %{
+         worker_ports: Keyword.get(opts, :worker_ports, %{})
+       }}
+    end
+
+    def handle_call({:worker_port_for_project, project_id}, _from, state) do
+      reply =
+        case Map.fetch(state.worker_ports, project_id) do
+          {:ok, port} -> {:ok, port}
+          :error -> {:error, :not_found}
+        end
+
+      {:reply, reply, state}
+    end
   end
 
   defmodule FailingTrackerAdapter do
@@ -1376,6 +1407,303 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "workflow timeline api maps orchestrator timeline payload and errors" do
+    orchestrator_name = Module.concat(__MODULE__, :TimelineWorkflowOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-HTTP", nil} => {:ok, %{items: [%{event_id: "evt-1", summary: "recent"}], next_cursor: "cur-1"}},
+          {"MT-HTTP", "bad-cursor"} => {:error, :invalid_cursor},
+          {"MT-MISSING-RUN", nil} => {:error, :run_not_found},
+          {"MT-DUP", nil} => {:error, :duplicate_run},
+          {"MT-BROKEN", nil} => {:error, :timeline_unavailable}
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    payload = json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/timeline"), 200)
+
+    assert payload == %{
+             "items" => [
+               %{
+                 "event_group" => nil,
+                 "event_id" => "evt-1",
+                 "event_type" => nil,
+                 "source" => nil,
+                 "status_markers" => [],
+                 "summary" => "recent",
+                 "timestamp" => nil
+               }
+             ],
+             "next_cursor" => "cur-1"
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/timeline?cursor=bad-cursor"), 400) == %{
+             "error" => %{"code" => "invalid_cursor", "message" => "Timeline cursor is invalid"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-MISSING-RUN/timeline"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run timeline not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-DUP/timeline"), 409) == %{
+             "error" => %{"code" => "duplicate_run", "message" => "Multiple running entries matched this run"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-BROKEN/timeline"), 503) == %{
+             "error" => %{"code" => "timeline_unavailable", "message" => "Run timeline is unavailable"}
+           }
+  end
+
+  test "control-plane timeline api proxies worker responses and preserves timeline-specific errors" do
+    manager_name = Module.concat(__MODULE__, TimelineProxyManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline?cursor=older" ->
+          {200,
+           %{
+             items: [%{event_id: "evt-old", summary: "older event", source: "codex"}],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline" ->
+          {200,
+           %{
+             items: [%{event_id: "evt-new", summary: "recent event", source: "orchestrator"}],
+             next_cursor: "older"
+           }}
+
+        "GET", "/api/v1/runs/MT-BAD/timeline" ->
+          {400, %{error: %{code: "invalid_cursor", message: "worker said bad cursor"}}}
+
+        "GET", "/api/v1/runs/MT-MISSING/timeline" ->
+          {404, %{error: %{code: "run_not_found", message: "worker missing"}}}
+
+        "GET", "/api/v1/runs/MT-DUP/timeline" ->
+          {409, %{error: %{code: "duplicate_run", message: "worker duplicate"}}}
+
+        "GET", "/api/v1/runs/MT-DOWN/timeline" ->
+          {503, %{error: %{code: "timeline_unavailable", message: "worker down"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-ALPHA-1", title: "Alpha run"},
+                %{issue_identifier: "MT-BAD", title: "Bad cursor run"},
+                %{issue_identifier: "MT-MISSING", title: "Missing run"},
+                %{issue_identifier: "MT-DUP", title: "Duplicate run"},
+                %{issue_identifier: "MT-DOWN", title: "Down run"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/timeline"), 200) == %{
+             "items" => [
+               %{
+                 "event_group" => nil,
+                 "event_id" => "evt-new",
+                 "event_type" => nil,
+                 "source" => "orchestrator",
+                 "status_markers" => [],
+                 "summary" => "recent event",
+                 "timestamp" => nil
+               }
+             ],
+             "next_cursor" => "older"
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/timeline?cursor=older"), 200) == %{
+             "items" => [
+               %{
+                 "event_group" => nil,
+                 "event_id" => "evt-old",
+                 "event_type" => nil,
+                 "source" => "codex",
+                 "status_markers" => [],
+                 "summary" => "older event",
+                 "timestamp" => nil
+               }
+             ],
+             "next_cursor" => nil
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-BAD/timeline"), 400) == %{
+             "error" => %{"code" => "invalid_cursor", "message" => "Timeline cursor is invalid"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-MISSING/timeline"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run timeline not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-DUP/timeline"), 409) == %{
+             "error" => %{"code" => "duplicate_run", "message" => "Multiple running entries matched this run"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-DOWN/timeline"), 503) == %{
+             "error" => %{"code" => "timeline_unavailable", "message" => "Run timeline is unavailable"}
+           }
+  end
+
+  test "control-plane timeline api encodes issue identifier path segments" do
+    manager_name = Module.concat(__MODULE__, TimelinePathEncodingManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT%2FALPHA/timeline" ->
+          {200,
+           %{
+             items: [%{event_id: "evt-encoded", summary: "encoded path"}],
+             next_cursor: nil
+           }}
+
+        other_method, other_path ->
+          {503, %{error: %{code: "timeline_unavailable", message: "#{other_method} #{other_path}"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT/ALPHA", title: "Encoded path run", linear_state: "In Progress"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    assert {:ok,
+            %{
+              items: [
+                %{
+                  event_group: nil,
+                  event_id: "evt-encoded",
+                  event_type: nil,
+                  source: nil,
+                  status_markers: [],
+                  summary: "encoded path",
+                  timestamp: nil
+                }
+              ],
+              next_cursor: nil
+            }} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_timeline_payload(
+               "alpha",
+               "MT/ALPHA"
+             )
+  end
+
+  test "control-plane timeline api proxies when project exists even if run summary is absent" do
+    manager_name = Module.concat(__MODULE__, TimelineProjectOnlyManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-MISSING-SUMMARY/timeline" ->
+          {200, %{items: [%{event_id: "evt-project-only", summary: "project only"}], next_cursor: nil}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-MISSING-SUMMARY/timeline"), 200) == %{
+             "items" => [
+               %{
+                 "event_group" => nil,
+                 "event_id" => "evt-project-only",
+                 "event_type" => nil,
+                 "source" => nil,
+                 "status_markers" => [],
+                 "summary" => "project only",
+                 "timestamp" => nil
+               }
+             ],
+             "next_cursor" => nil
+           }
+  end
+
+  test "control-plane timeline api maps manager exit to timeline unavailable" do
+    manager_name = Module.concat(__MODULE__, TimelineExitManager)
+
+    {:ok, pid} =
+      GenServer.start(WorkerPortManagerStub, [name: manager_name, worker_ports: %{"alpha" => 9_999}], name: manager_name)
+
+    Process.exit(pid, :kill)
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/timeline"), 503) == %{
+             "error" => %{"code" => "timeline_unavailable", "message" => "Run timeline is unavailable"}
+           }
+  end
+
   test "dashboard bootstraps liveview from embedded static assets" do
     orchestrator_name = Module.concat(__MODULE__, :AssetOrchestrator)
 
@@ -2213,6 +2541,41 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Raw event"
   end
 
+  test "project detail page encodes run detail path segments" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT/ALPHA",
+                  title: "Encoded alpha task",
+                  linear_state: "In Progress"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    {:ok, document} = Floki.parse_document(html)
+
+    assert ["/projects/alpha/runs/MT%2FALPHA"] =
+             document
+             |> Floki.find("a.issue-link")
+             |> Floki.attribute("href")
+  end
+
   test "project detail page shows unavailable state when project summary is missing" do
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -2298,7 +2661,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert article_mono_texts(article) |> Enum.member?("n/a")
   end
 
-  test "run deep view renders summary fields and skeleton sections without heavy content by default" do
+  test "run deep view renders summary fields and timeline shell without heavy content by default" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -2354,7 +2717,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Sub-agent context"
     assert html =~ "Dependencies"
     assert html =~ "Attention"
-    assert html =~ "Not loaded by default"
+    assert html =~ "Timeline unavailable"
     refute html =~ "Raw event"
     refute html =~ "Prompt"
     refute html =~ "Shell output"
@@ -2426,6 +2789,40 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert summary_row_text(document, "run_duration_seconds") == "run_duration_seconds: 960s"
   end
 
+  test "control-plane timeline proxy degrades when project manager is unavailable" do
+    Application.delete_env(:symphony_elixir, :project_process_manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-ALPHA-1", title: "Alpha task", linear_state: "In Progress"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/timeline"), 503) == %{
+             "error" => %{"code" => "timeline_unavailable", "message" => "Run timeline is unavailable"}
+           }
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    assert html =~ "Alpha task"
+    assert html =~ "Timeline unavailable"
+    refute html =~ "Run unavailable"
+  end
+
   test "run deep view stays lightweight when the run summary is unavailable" do
     start_test_endpoint(
       runtime_mode: :control_plane,
@@ -2449,6 +2846,265 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Timeline"
     refute html =~ "Shell output"
     refute html =~ "Prompt"
+  end
+
+  test "run deep view renders recent timeline, quiet notice, load more, and detail placeholder independently from summary" do
+    manager_name = Module.concat(__MODULE__, RunLiveTimelineManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-2",
+                 timestamp: "2026-05-14T01:59:00Z",
+                 source: "codex",
+                 event_group: "session",
+                 summary: "session opened",
+                 event_type: "session_started",
+                 status_markers: ["session_started"]
+               },
+               %{
+                 event_id: "evt-3",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "orchestrator",
+                 event_group: "retry",
+                 summary: "retry queued",
+                 event_type: "retry_scheduled",
+                 status_markers: []
+               },
+               %{
+                 event_id: "evt-4",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "turn finished",
+                 event_type: "turn_completed",
+                 status_markers: ["completed", "attention"]
+               },
+               %{
+                 event_id: "evt-5",
+                 timestamp: "2026-05-14T02:02:00Z",
+                 source: "orchestrator",
+                 event_group: "result",
+                 summary: "run finished",
+                 event_type: "run_result",
+                 status_markers: []
+               }
+             ],
+             next_cursor: "older"
+           }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline?cursor=older" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-1",
+                 timestamp: "2026-05-14T01:58:00Z",
+                 source: "agent_runner",
+                 event_group: "workspace",
+                 summary: "workspace ready",
+                 event_type: "worker_runtime_info",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "最近一段时间没有新事件",
+                  health: "possibly_stalled",
+                  thread_id: "thread-alpha",
+                  turn_id: "turn-9",
+                  last_event_at: ~U[2026-05-14 02:00:00Z],
+                  run_duration_seconds: 960
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    assert html =~ "Alpha task"
+    assert html =~ "Timeline"
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "session opened" and
+        rendered =~ "retry queued" and
+        rendered =~ "turn finished" and
+        rendered =~ "run finished" and
+        rendered =~ "quiet attention" and
+        rendered =~ "session started" and
+        rendered =~ "turn completed" and
+        rendered =~ "run result" and
+        rendered =~ "retry" and
+        rendered =~ "completed" and
+        rendered =~ "attention" and
+        rendered =~ "Load more"
+    end)
+
+    render_click(view, "load_more_timeline")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "workspace ready" and not String.contains?(rendered, "Load more")
+    end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-4']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "Detail placeholder" and rendered =~ "evt-4"
+    end)
+  end
+
+  test "run deep view keeps summary visible when timeline load and load-more fail" do
+    manager_name = Module.concat(__MODULE__, RunLiveTimelineErrorManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-2",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "turn finished",
+                 event_type: "turn_completed",
+                 status_markers: ["completed"]
+               }
+             ],
+             next_cursor: "broken"
+           }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/timeline?cursor=broken" ->
+          {400, %{error: %{code: "invalid_cursor", message: "cursor expired"}}}
+
+        "GET", "/api/v1/runs/MT-BROKEN/timeline" ->
+          {409, %{error: %{code: "duplicate_run", message: "duplicate"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-ALPHA-1", title: "Alpha task", linear_state: "In Progress"},
+                %{issue_identifier: "MT-BROKEN", title: "Broken task", linear_state: "In Progress"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "Alpha task" and rendered =~ "turn finished"
+    end)
+
+    render_click(view, "load_more_timeline")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Alpha task" and rendered =~ "turn finished" and
+        rendered =~ "Timeline load more failed" and not String.contains?(rendered, "Load more")
+    end)
+
+    {:ok, broken_view, _html} = live(build_conn(), "/projects/alpha/runs/MT-BROKEN")
+
+    assert_eventually(fn ->
+      rendered = render(broken_view)
+      rendered =~ "Broken task" and rendered =~ "Timeline unavailable" and not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "run deep view keeps summary visible when worker returns timeline run_not_found" do
+    manager_name = Module.concat(__MODULE__, RunLiveTimelineMissingManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-MISSING-TIMELINE/timeline" ->
+          {404, %{error: %{code: "run_not_found", message: "worker missing run trace"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-MISSING-TIMELINE", title: "Missing timeline", linear_state: "In Progress"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-MISSING-TIMELINE")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Missing timeline" and rendered =~ "Timeline unavailable" and
+        not String.contains?(rendered, "Run unavailable")
+    end)
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -3675,6 +4331,63 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp kill_fake_worker_port(_port), do: :ok
 
+  defp start_stub_http_server(handler) when is_function(handler, 2) do
+    port = reserve_tcp_port!()
+    parent = self()
+
+    pid =
+      spawn_link(fn ->
+        {:ok, listener} = open_stub_http_listener(port)
+
+        send(parent, {:stub_http_server_ready, self()})
+        accept_stub_http_requests(listener, handler)
+      end)
+
+    assert_receive {:stub_http_server_ready, ^pid}
+
+    on_exit(fn ->
+      Process.exit(pid, :kill)
+      wait_for_tcp_port_closed(port)
+    end)
+
+    {:ok, port}
+  end
+
+  defp open_stub_http_listener(port) do
+    :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+  end
+
+  defp accept_stub_http_requests(listener, handler) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+
+    spawn(fn ->
+      serve_stub_http_request(socket, handler)
+    end)
+
+    accept_stub_http_requests(listener, handler)
+  end
+
+  defp serve_stub_http_request(socket, handler) do
+    request = read_stub_http_request(socket)
+    {method, path} = parse_http_request(request)
+    {status, body} = handler.(method, path)
+    json = Jason.encode!(body)
+
+    :gen_tcp.send(
+      socket,
+      "HTTP/1.1 #{status} #{http_status_text(status)}\r\ncontent-length: #{byte_size(json)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{json}"
+    )
+
+    :gen_tcp.close(socket)
+  end
+
+  defp read_stub_http_request(socket) do
+    case :gen_tcp.recv(socket, 0, 5_000) do
+      {:ok, data} -> data
+      _other -> ""
+    end
+  end
+
   defp kill_fake_worker_port(port, attempts_left) when is_integer(port) and attempts_left > 0 do
     case fake_worker_pids_for_port(port) do
       [] ->
@@ -3713,6 +4426,22 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp wait_for_fake_worker_port_exit(_port, _attempts_left), do: :ok
 
+  defp wait_for_tcp_port_closed(port, attempts \\ 10)
+
+  defp wait_for_tcp_port_closed(port, attempts) when attempts > 0 do
+    case :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}], 50) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        Process.sleep(50)
+        wait_for_tcp_port_closed(port, attempts - 1)
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp wait_for_tcp_port_closed(_port, _attempts), do: :ok
+
   defp fake_worker_pids_for_port(port) do
     fake_worker_path = Path.expand("../support/project_process_manager_fake_worker.exs", __DIR__)
     port_fragment = "--port #{port}"
@@ -3744,6 +4473,26 @@ defmodule SymphonyElixir.ExtensionsTest do
     File.mkdir_p!(root)
     root
   end
+
+  defp parse_http_request(request) when is_binary(request) do
+    case String.split(request, "\r\n", parts: 2) do
+      [request_line | _rest] ->
+        case String.split(request_line, " ", parts: 3) do
+          [method, path | _rest] -> {method, path}
+          _other -> {"GET", "/"}
+        end
+
+      _other ->
+        {"GET", "/"}
+    end
+  end
+
+  defp http_status_text(200), do: "OK"
+  defp http_status_text(400), do: "Bad Request"
+  defp http_status_text(404), do: "Not Found"
+  defp http_status_text(409), do: "Conflict"
+  defp http_status_text(503), do: "Service Unavailable"
+  defp http_status_text(_status), do: "OK"
 
   defp project_fixture(test_root, project_id, worker_port, opts \\ []) do
     project_root = Path.join(test_root, project_id)

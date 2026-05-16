@@ -142,6 +142,18 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec run_timeline_payload(map()) :: map()
+  def run_timeline_payload(%{} = payload) do
+    %{
+      items:
+        payload
+        |> map_value(:items)
+        |> List.wrap()
+        |> Enum.map(&timeline_item_payload/1),
+      next_cursor: map_value(payload, :next_cursor)
+    }
+  end
+
   @spec find_project_run_summary(map(), String.t()) :: map() | nil
   def find_project_run_summary(project, issue_identifier)
       when is_map(project) and is_binary(issue_identifier) do
@@ -357,6 +369,20 @@ defmodule SymphonyElixirWeb.Presenter do
       _ -> nil
     end
   end
+
+  defp timeline_item_payload(item) when is_map(item) do
+    %{
+      event_id: map_value(item, :event_id),
+      timestamp: map_value(item, :timestamp),
+      source: map_value(item, :source),
+      event_group: map_value(item, :event_group),
+      summary: map_value(item, :summary),
+      event_type: map_value(item, :event_type),
+      status_markers: map_value(item, :status_markers) |> List.wrap()
+    }
+  end
+
+  defp timeline_item_payload(_item), do: %{}
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
 

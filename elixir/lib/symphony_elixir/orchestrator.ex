@@ -2176,6 +2176,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec run_timeline(GenServer.server(), String.t(), keyword()) ::
+          {:ok, %{items: [map()], next_cursor: String.t() | nil}}
+          | {:error, :run_not_found | :duplicate_run | :invalid_cursor | :timeline_unavailable}
+          | :timeout
+          | :unavailable
+  def run_timeline(server, issue_identifier, opts \\ [])
+      when is_binary(issue_identifier) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+    cursor = Keyword.get(opts, :cursor)
+
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:run_timeline, issue_identifier, cursor}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2258,6 +2280,22 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:run_timeline, issue_identifier, cursor}, _from, state)
+      when is_binary(issue_identifier) do
+    running_entries =
+      state.running
+      |> Map.values()
+
+    reply =
+      RunStateStore.timeline_for_running_entries(
+        running_entries,
+        issue_identifier,
+        cursor: cursor
+      )
+
+    {:reply, reply, state}
   end
 
   def handle_call(:request_refresh, _from, state) do

@@ -17,6 +17,51 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec project_run_timeline_payload(String.t(), String.t(), String.t() | nil) ::
+          {:ok, map()}
+          | {:error,
+             :project_not_found
+             | :run_not_found
+             | :invalid_cursor
+             | :duplicate_run
+             | :timeline_unavailable}
+  def project_run_timeline_payload(project_id, issue_identifier, cursor \\ nil)
+      when is_binary(project_id) and is_binary(issue_identifier) do
+    with {:ok, _project_payload} <-
+           Presenter.project_summary_payload(project_id, project_registry()),
+         {:ok, body} <-
+           project_worker_request(
+             project_id,
+             timeline_path(issue_identifier, cursor)
+           ) do
+      {:ok, Presenter.run_timeline_payload(body)}
+    else
+      {:error, :project_not_found} ->
+        {:error, :project_not_found}
+
+      {:error, :run_not_found} ->
+        {:error, :timeline_unavailable}
+
+      {:error, {:worker_status, 400, %{"error" => %{"code" => "invalid_cursor"}}}} ->
+        {:error, :invalid_cursor}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "run_not_found"}}}} ->
+        {:error, :run_not_found}
+
+      {:error, {:worker_status, 409, %{"error" => %{"code" => "duplicate_run"}}}} ->
+        {:error, :duplicate_run}
+
+      {:error, {:worker_status, 503, %{"error" => %{"code" => "timeline_unavailable"}}}} ->
+        {:error, :timeline_unavailable}
+
+      {:error, {:worker_status, _status, _body}} ->
+        {:error, :timeline_unavailable}
+
+      {:error, _reason} ->
+        {:error, :timeline_unavailable}
+    end
+  end
+
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
     if control_plane_mode?() do
@@ -37,6 +82,43 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
         {:error, :issue_not_found} ->
           error_response(conn, 404, "issue_not_found", "Issue not found")
+      end
+    end
+  end
+
+  @spec run_timeline(Conn.t(), map()) :: Conn.t()
+  def run_timeline(conn, %{"issue_identifier" => issue_identifier} = params) do
+    cursor = Map.get(params, "cursor")
+
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case SymphonyElixir.Orchestrator.run_timeline(
+             orchestrator(),
+             issue_identifier,
+             cursor: cursor,
+             timeout: snapshot_timeout_ms()
+           ) do
+        {:ok, payload} ->
+          json(conn, Presenter.run_timeline_payload(payload))
+
+        {:error, :invalid_cursor} ->
+          error_response(conn, 400, "invalid_cursor", "Timeline cursor is invalid")
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run timeline not found")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :timeline_unavailable} ->
+          error_response(conn, 503, "timeline_unavailable", "Run timeline is unavailable")
+
+        :timeout ->
+          error_response(conn, 503, "timeline_unavailable", "Run timeline is unavailable")
+
+        :unavailable ->
+          error_response(conn, 503, "timeline_unavailable", "Run timeline is unavailable")
       end
     end
   end
@@ -63,6 +145,35 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, :project_not_found} ->
         error_response(conn, 404, "project_not_found", "Project not found")
+    end
+  end
+
+  @spec project_run_timeline(Conn.t(), map()) :: Conn.t()
+  def project_run_timeline(conn, %{"project_id" => project_id, "issue_identifier" => issue_identifier} = params) do
+    if control_plane_mode?() do
+      cursor = Map.get(params, "cursor")
+
+      case project_run_timeline_payload(project_id, issue_identifier, cursor) do
+        {:ok, payload} ->
+          json(conn, payload)
+
+        {:error, :project_not_found} ->
+          error_response(conn, 404, "project_not_found", "Project not found")
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run timeline not found")
+
+        {:error, :invalid_cursor} ->
+          error_response(conn, 400, "invalid_cursor", "Timeline cursor is invalid")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :timeline_unavailable} ->
+          error_response(conn, 503, "timeline_unavailable", "Run timeline is unavailable")
+      end
+    else
+      control_plane_not_available(conn)
     end
   end
 
@@ -206,14 +317,40 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         SymphonyElixir.ProjectProcessManager
       )
 
-    with {:ok, worker_port} <- ProjectProcessManager.worker_port_for_project(manager_name, project_id),
-         {:ok, %Req.Response{status: status, body: body}} when status in 200..299 <-
-           Req.post("http://127.0.0.1:#{worker_port}#{path}", json: %{}, retry: false) do
-      {:ok, body}
+    with {:ok, worker_port} <- safe_worker_port_for_project(manager_name, project_id),
+         {:ok, %Req.Response{} = response} <- worker_req(worker_port, path) do
+      case response do
+        %Req.Response{status: status, body: body} when status in 200..299 ->
+          {:ok, body}
+
+        %Req.Response{status: status, body: body} ->
+          {:error, {:worker_status, status, body}}
+      end
     else
       {:error, :not_found} -> {:error, :project_not_found}
-      {:ok, %Req.Response{status: status}} -> {:error, {:worker_status, status}}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp worker_req(worker_port, path) when is_integer(worker_port) and is_binary(path) do
+    if String.contains?(path, "/m3_precheck") do
+      Req.post("http://127.0.0.1:#{worker_port}#{path}", json: %{}, retry: false)
+    else
+      Req.get("http://127.0.0.1:#{worker_port}#{path}", retry: false)
+    end
+  end
+
+  defp safe_worker_port_for_project(manager_name, project_id) do
+    ProjectProcessManager.worker_port_for_project(manager_name, project_id)
+  catch
+    :exit, _reason -> {:error, :project_manager_unavailable}
+  end
+
+  defp timeline_query_string(nil), do: ""
+  defp timeline_query_string(""), do: ""
+  defp timeline_query_string(cursor), do: "?cursor=#{URI.encode_www_form(cursor)}"
+
+  defp timeline_path(issue_identifier, cursor) do
+    "/api/v1/runs/#{URI.encode(issue_identifier, &URI.char_unreserved?/1)}/timeline#{timeline_query_string(cursor)}"
   end
 end
