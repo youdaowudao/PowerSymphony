@@ -2830,6 +2830,42 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert plain =~ "turn completed (completed)"
   end
 
+  test "status dashboard test helper uses stable default width when terminal width is omitted" do
+    previous_columns = System.get_env("COLUMNS")
+    System.put_env("COLUMNS", "80")
+
+    on_exit(fn ->
+      if previous_columns do
+        System.put_env("COLUMNS", previous_columns)
+      else
+        System.delete_env("COLUMNS")
+      end
+    end)
+
+    row =
+      StatusDashboard.format_running_summary_for_test(%{
+        identifier: "MT-233",
+        state: "running",
+        session_id: "thread-1234567890",
+        codex_app_server_pid: "4242",
+        codex_total_tokens: 12,
+        runtime_seconds: 15,
+        last_codex_event: :notification,
+        last_codex_message: %{
+          event: :notification,
+          message: %{
+            "method" => "turn/completed",
+            "params" => %{"turn" => %{"status" => "completed"}}
+          }
+        }
+      })
+
+    plain = Regex.replace(~r/\e\[[\d;]*m/, row, "")
+
+    assert String.length(plain) > 80
+    assert plain =~ "turn completed (completed)"
+  end
+
   test "status dashboard humanizes full codex app-server event set" do
     event_cases = [
       {"turn/started", %{"params" => %{"turn" => %{"id" => "turn-1"}}}, "turn started"},
