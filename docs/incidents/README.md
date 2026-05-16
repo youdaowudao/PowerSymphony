@@ -25,6 +25,7 @@ docs/incidents/<incident-id>/
 当前事故目录：
 
 - [c-50-ownership-split-brain/README.md](./c-50-ownership-split-brain/README.md)
+- [c-52-workspace-invalidation-race/README.md](./c-52-workspace-invalidation-race/README.md)
 
 补充规则：
 

@@ -15,6 +15,7 @@ defmodule SymphonyElixir.AgentRunner do
           | :issue_entered_checking
           | :max_turns_reached
           | :premature_turn_end
+          | :workspace_lifecycle_invalid
           | :turn_timeout
   @type run_result :: %{
           status: run_result_status(),
@@ -62,6 +63,8 @@ defmodule SymphonyElixir.AgentRunner do
       end
 
     RunTrace.with_context(trace, fn ->
+      workspace_issue = Map.put(issue, :run_instance_id, run_instance_id)
+
       RunTrace.record(trace, :agent_runner, %{
         event: :worker_attempt_started,
         summary: "agent_runner:worker_attempt_started",
@@ -69,7 +72,7 @@ defmodule SymphonyElixir.AgentRunner do
         payload: %{worker_host: worker_host}
       })
 
-      case Workspace.create_for_issue(issue, worker_host) do
+      case Workspace.create_for_issue(workspace_issue, worker_host) do
         {:ok, workspace} ->
           trace = RunTrace.update(trace, %{workspace_path: workspace})
 
@@ -89,6 +92,29 @@ defmodule SymphonyElixir.AgentRunner do
           after
             Workspace.run_after_run_hook(workspace, issue, worker_host)
           end
+
+        {:error, {:workspace_resource_owned_by_other_run, binding}} ->
+          details = %{
+            reason: :resource_owned_by_other_run,
+            run_instance_id: Map.get(binding, "run_instance_id"),
+            closing_reason: Map.get(binding, "closing_reason"),
+            binding_state: Map.get(binding, "state"),
+            workspace_path: Map.get(binding, "workspace_path")
+          }
+
+          emit_workspace_lifecycle_invalid(
+            codex_message_handler(codex_update_recipient, issue, run_instance_id),
+            run_instance_id,
+            details
+          )
+
+          send_run_result(codex_update_recipient, issue, run_instance_id, %{
+            status: :failed,
+            reason: :workspace_lifecycle_invalid,
+            turn_count: 1
+          })
+
+          :ok
 
         {:error, reason} ->
           RunTrace.record(trace, :agent_runner, %{
@@ -191,7 +217,8 @@ defmodule SymphonyElixir.AgentRunner do
       issue_state_fetcher: issue_state_fetcher,
       run_mode: run_mode,
       max_turns: max_turns,
-      run_instance_id: run_instance_id
+      run_instance_id: run_instance_id,
+      worker_host: worker_host
     }
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
@@ -210,66 +237,91 @@ defmodule SymphonyElixir.AgentRunner do
       issue_state_fetcher: issue_state_fetcher,
       run_mode: run_mode,
       max_turns: max_turns,
-      run_instance_id: run_instance_id
+      run_instance_id: run_instance_id,
+      worker_host: worker_host
     } = turn_context
 
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    on_message = codex_message_handler(codex_update_recipient, issue, run_instance_id)
 
-    case AppServer.run_turn(
-           app_session,
-           prompt,
-           issue,
-           on_message: codex_message_handler(codex_update_recipient, issue, run_instance_id)
-         ) do
-      {:ok, turn_session} ->
-        Logger.info("Completed agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    with :ok <- validate_workspace_turn_ownership(workspace, run_instance_id, worker_host, on_message),
+         {:ok, turn_session} <-
+           AppServer.run_turn(
+             app_session,
+             prompt,
+             issue,
+             on_message: on_message
+           ) do
+      Logger.info("Completed agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-        case continue_with_issue?(issue, issue_state_fetcher, run_mode) do
-          {:continue, refreshed_issue} when turn_number < max_turns ->
-            send_run_result(codex_update_recipient, issue, run_instance_id, %{
-              status: :continuation_required,
-              reason: :issue_still_active,
-              turn_count: turn_number
-            })
+      case continue_with_issue?(issue, issue_state_fetcher, run_mode) do
+        {:continue, refreshed_issue} when turn_number < max_turns ->
+          send_run_result(codex_update_recipient, issue, run_instance_id, %{
+            status: :continuation_required,
+            reason: :issue_still_active,
+            turn_count: turn_number
+          })
 
-            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-            do_run_codex_turns(
-              app_session,
-              workspace,
-              refreshed_issue,
-              turn_context,
-              turn_number + 1
-            )
+          do_run_codex_turns(
+            app_session,
+            workspace,
+            refreshed_issue,
+            turn_context,
+            turn_number + 1
+          )
 
-          {:continue, refreshed_issue} ->
-            send_run_result(codex_update_recipient, issue, run_instance_id, %{
-              status: :continuation_required,
-              reason: :max_turns_reached,
-              turn_count: turn_number
-            })
+        {:continue, refreshed_issue} ->
+          send_run_result(codex_update_recipient, issue, run_instance_id, %{
+            status: :continuation_required,
+            reason: :max_turns_reached,
+            turn_count: turn_number
+          })
 
-            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-            :ok
+          :ok
 
-          {:done, _refreshed_issue, reason} ->
-            send_run_result(codex_update_recipient, issue, run_instance_id, %{
-              status: :completed,
-              reason: reason,
-              turn_count: turn_number
-            })
+        {:done, _refreshed_issue, reason} ->
+          send_run_result(codex_update_recipient, issue, run_instance_id, %{
+            status: :completed,
+            reason: reason,
+            turn_count: turn_number
+          })
 
-            :ok
+          :ok
 
-          {:error, reason} ->
-            {:error, reason}
-        end
-
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
       {:error, reason} ->
         handle_turn_error(reason, issue, codex_update_recipient, run_instance_id, turn_number)
     end
   end
+
+  defp validate_workspace_turn_ownership(workspace, run_instance_id, worker_host, on_message)
+       when is_binary(workspace) do
+    case Workspace.validate_workspace_owner(workspace, run_instance_id, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, {:workspace_lifecycle_invalid, details}} ->
+        emit_workspace_lifecycle_invalid(on_message, run_instance_id, details)
+        {:error, {:workspace_lifecycle_invalid, details}}
+    end
+  end
+
+  defp emit_workspace_lifecycle_invalid(on_message, run_instance_id, details) when is_function(on_message, 1) do
+    on_message.(%{
+      event: :workspace_lifecycle_invalid,
+      details: details,
+      run_instance_id: run_instance_id
+    })
+  end
+
+  defp emit_workspace_lifecycle_invalid(_on_message, _run_instance_id, _details), do: :ok
 
   defp handle_turn_error({error_type, _details} = reason, issue, codex_update_recipient, run_instance_id, turn_number)
        when error_type in [:turn_failed, :turn_cancelled] do
@@ -292,6 +344,18 @@ defmodule SymphonyElixir.AgentRunner do
     })
 
     Logger.warning("Agent turn timed out for #{issue_context(issue)} turn=#{turn_number}")
+
+    :ok
+  end
+
+  defp handle_turn_error({:workspace_lifecycle_invalid, _details}, issue, codex_update_recipient, run_instance_id, turn_number) do
+    send_run_result(codex_update_recipient, issue, run_instance_id, %{
+      status: :failed,
+      reason: :workspace_lifecycle_invalid,
+      turn_count: turn_number
+    })
+
+    Logger.warning("Agent turn rejected by workspace lifecycle gate for #{issue_context(issue)} turn=#{turn_number}")
 
     :ok
   end

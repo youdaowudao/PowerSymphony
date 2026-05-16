@@ -5,6 +5,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  @resource_binding_file ".symphony-resource.json"
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -92,6 +94,85 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace create writes active resource binding for the current run" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-binding-active-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %{id: "issue-binding-1", identifier: "MT-BINDING", run_instance_id: "run-binding-1"}
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["issue_id"] == issue.id
+      assert binding["issue_identifier"] == issue.identifier
+      assert binding["run_instance_id"] == issue.run_instance_id
+      assert binding["workspace_path"] == workspace
+      assert binding["state"] == "active"
+      assert is_binary(binding["worker_host"]) or is_nil(binding["worker_host"])
+      assert is_binary(binding["updated_at"])
+      assert File.exists?(Path.join(workspace, @resource_binding_file))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace create takes over stale closing binding and clears stale invalidation record" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-binding-takeover-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %{id: "issue-binding-2", identifier: "MT-TAKEOVER", run_instance_id: "run-binding-2"}
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      File.mkdir_p!(workspace)
+
+      File.write!(
+        Path.join(workspace, @resource_binding_file),
+        Jason.encode!(%{
+          "issue_id" => issue.id,
+          "issue_identifier" => issue.identifier,
+          "run_instance_id" => "run-old",
+          "worker_host" => nil,
+          "workspace_path" => workspace,
+          "state" => "closing",
+          "closing_reason" => "terminal_cleanup_pending",
+          "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
+      File.write!(
+        Path.join(workspace, ".symphony-invalidation.json"),
+        Jason.encode!(%{
+          "issue_identifier" => issue.identifier,
+          "run_instance_id" => "run-old",
+          "reason" => "workspace_removed",
+          "workspace_path" => workspace
+        })
+      )
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["run_instance_id"] == issue.run_instance_id
+      assert binding["state"] == "active"
+      assert binding["closing_reason"] in [nil, ""]
+      refute File.exists?(Path.join(workspace, ".symphony-invalidation.json"))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace replaces stale non-directory paths" do
     workspace_root =
       Path.join(
@@ -110,6 +191,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("MT-STALE")
       assert workspace == canonical_workspace
       assert File.dir?(workspace)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace create rejects existing non-empty directory without resource binding" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-unbound-non-empty-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      workspace = Path.join(workspace_root, "MT-UNBOUND")
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "stale.txt"), "stale contents\n")
+
+      assert {:error, {:workspace_resource_owned_by_other_run, binding}} =
+               Workspace.create_for_issue("MT-UNBOUND")
+
+      assert binding["state"] == "preparing"
+      assert binding["workspace_path"] == workspace
+      assert binding["run_instance_id"] == nil
+      assert File.read!(Path.join(workspace, "stale.txt")) == "stale contents\n"
     after
       File.rm_rf(workspace_root)
     end
@@ -247,7 +354,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, ^canonical_workspace} = Workspace.create_for_issue("MT-608")
       assert File.dir?(workspace)
-      assert {:ok, []} = File.ls(workspace)
+      assert {:ok, [".symphony-resource.json"]} = File.ls(workspace)
     after
       File.rm_rf(workspace_root)
     end
@@ -809,6 +916,89 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace cleanup does not run before_remove hook when delete evidence is insufficient" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-cleanup-closing-only-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      before_remove_marker = Path.join(test_root, "before_remove_skipped.log")
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+      )
+
+      issue = %{id: "issue-closing-only", identifier: "MT-CLOSING-ONLY", run_instance_id: "run-closing-only"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace(issue.identifier,
+                 mode: :terminal_cleanup,
+                 run_instance_id: issue.run_instance_id,
+                 closing_reason: "terminal_cleanup_pending"
+               )
+
+      assert File.dir?(workspace)
+      refute File.exists?(before_remove_marker)
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "terminal_cleanup_pending"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "startup sweep delete evidence does not remove closing workspace without explicit removal proof" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-startup-sweep-closing-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      before_remove_marker = Path.join(test_root, "before_remove_startup_closing.log")
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+      )
+
+      issue = %{id: "issue-startup-closing", identifier: "MT-STARTUP-CLOSING", run_instance_id: "run-startup-closing"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace(issue.identifier,
+                 mode: :terminal_cleanup,
+                 run_instance_id: issue.run_instance_id,
+                 closing_reason: "terminal_cleanup_pending"
+               )
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace(issue.identifier,
+                 mode: :startup_sweep,
+                 delete_evidence: :startup_no_live_owner,
+                 closing_reason: "startup_terminal_sweep"
+               )
+
+      assert File.dir?(workspace)
+      refute File.exists?(before_remove_marker)
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "terminal_cleanup_pending"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "config reads defaults for optional settings" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
@@ -1365,32 +1555,90 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_remote_root = System.get_env("SYMP_TEST_REMOTE_ROOT")
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_REMOTE_ROOT", previous_remote_root)
     end)
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
+      remote_root = Path.join(test_root, "remote-root")
       workspace_root = "~/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
+      before_remove_marker = Path.join(test_root, "before_remove_remote.log")
 
       File.mkdir_p!(test_root)
+      File.mkdir_p!(remote_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env("SYMP_TEST_REMOTE_ROOT", remote_root)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      remote_root="${SYMP_TEST_REMOTE_ROOT:?missing remote root}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
-      case "$*" in
-        *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
-          ;;
-      esac
+      command="$*"
+
+      if printf '%s' "$command" | grep -q "__SYMPHONY_WORKSPACE__"; then
+        target="$remote_root/workspaces/MT-SSH-WS"
+        mkdir -p "$target"
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
+      elif printf '%s' "$command" | grep -q "__SYMPHONY_JSON__"; then
+        binding="$remote_root/workspaces/MT-SSH-WS/.symphony-resource.json"
+        invalidation="$remote_root/workspaces/MT-SSH-WS/.symphony-invalidation.json"
+        if printf '%s' "$command" | grep -q "cat"; then
+          if printf '%s' "$command" | grep -q ".symphony-resource.json"; then
+            if [ -f "$binding" ]; then
+              printf '%s\\t1\\t' '__SYMPHONY_JSON__'
+              cat "$binding"
+              printf '\\n'
+            else
+              printf '%s\\t0\\n' '__SYMPHONY_JSON__'
+            fi
+          else
+            if [ -f "$invalidation" ]; then
+              printf '%s\\t1\\t' '__SYMPHONY_JSON__'
+              cat "$invalidation"
+              printf '\\n'
+            else
+              printf '%s\\t0\\n' '__SYMPHONY_JSON__'
+            fi
+          fi
+        else
+          mkdir -p "$remote_root/workspaces/MT-SSH-WS"
+          if printf '%s' "$command" | grep -q ".symphony-resource.json"; then
+            printf '%s' '{"issue_id":null,"issue_identifier":"MT-SSH-WS","run_instance_id":null,"worker_host":"worker-01:2200","workspace_path":"#{workspace_path}","state":"active","closing_reason":null,"inserted_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}' > "$binding"
+          else
+            printf '%s' '{"issue_id":null,"issue_identifier":"MT-SSH-WS","run_instance_id":null,"worker_host":"worker-01:2200","workspace_path":"#{workspace_path}","state":"closing","reason":"terminal_running_cleanup","updated_at":"2026-01-01T00:00:00Z"}' > "$invalidation"
+          fi
+        fi
+      elif printf '%s' "$command" | grep -q "rm -rf"; then
+        rm -rf "$remote_root/workspaces/MT-SSH-WS"
+      elif printf '%s' "$command" | grep -q "rm -f"; then
+        rm -f "$remote_root/workspaces/MT-SSH-WS/.symphony-invalidation.json"
+      elif printf '%s' "$command" | grep -q "echo before-remove"; then
+        printf 'before-remove\\n' > "#{before_remove_marker}"
+      elif printf '%s' "$command" | grep -q ".symphony-resource.json"; then
+        binding="$remote_root/workspaces/MT-SSH-WS/.symphony-resource.json"
+        mkdir -p "$remote_root/workspaces/MT-SSH-WS"
+        printf '%s' '{"issue_id":null,"issue_identifier":"MT-SSH-WS","run_instance_id":null,"worker_host":"worker-01:2200","workspace_path":"#{workspace_path}","state":"active","closing_reason":null,"inserted_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}' > "$binding"
+      elif printf '%s' "$command" | grep -q ".symphony-invalidation.json"; then
+        invalidation="$remote_root/workspaces/MT-SSH-WS/.symphony-invalidation.json"
+        mkdir -p "$remote_root/workspaces/MT-SSH-WS"
+        printf '%s' '{"issue_id":null,"issue_identifier":"MT-SSH-WS","run_instance_id":null,"worker_host":"worker-01:2200","workspace_path":"#{workspace_path}","state":"closing","reason":"terminal_running_cleanup","updated_at":"2026-01-01T00:00:00Z"}' > "$invalidation"
+      elif printf '%s' "$command" | grep -q "__SYMPHONY_PATH__"; then
+        if [ -e "$remote_root/workspaces/MT-SSH-WS" ]; then
+          printf '%s\\t1\\n' '__SYMPHONY_PATH__'
+        else
+          printf '%s\\t0\\n' '__SYMPHONY_PATH__'
+        fi
+      fi
 
       exit 0
       """)
@@ -1408,9 +1656,23 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
       assert Config.settings!().workspace.root == workspace_root
       assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace_path, "worker-01:2200")
+      assert binding["state"] == "active"
+      assert binding["worker_host"] == "worker-01:2200"
       assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace("MT-SSH-WS",
+                 worker_host: "worker-01:2200",
+                 mode: :terminal_cleanup,
+                 run_instance_id: nil,
+                 delete_evidence: :no_live_owner,
+                 closing_reason: "terminal_running_cleanup"
+               )
+
+      refute File.exists?(Path.join(remote_root, "workspaces/MT-SSH-WS"))
+      assert File.read!(before_remove_marker) == "before-remove\n"
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
