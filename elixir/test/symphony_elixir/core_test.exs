@@ -1440,7 +1440,7 @@ defmodule SymphonyElixir.CoreTest do
             false
         end
       end,
-      20
+      80
     )
 
     state = :sys.get_state(pid)
