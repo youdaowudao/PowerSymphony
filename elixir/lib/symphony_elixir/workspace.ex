@@ -7,6 +7,10 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, RunTrace, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_json_marker "__SYMPHONY_JSON__"
+  @remote_path_marker "__SYMPHONY_PATH__"
+  @resource_binding_file ".symphony-resource.json"
+  @invalidation_record_file ".symphony-invalidation.json"
 
   @type worker_host :: String.t() | nil
 
@@ -21,7 +25,9 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           :ok <- validate_workspace_binding_takeover(workspace, issue_context, worker_host, created?),
+           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host),
+           :ok <- bind_workspace_resource(workspace, issue_context, worker_host) do
         {:ok, workspace}
       end
     rescue
@@ -82,6 +88,96 @@ defmodule SymphonyElixir.Workspace do
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
+  end
+
+  defp validate_workspace_binding_takeover(workspace, issue_context, nil, created?)
+       when is_binary(workspace) and is_map(issue_context) do
+    case read_resource_binding(workspace) do
+      {:ok, binding} ->
+        invalidation = read_optional_json(invalidation_record_path(workspace), nil)
+
+        if resource_binding_takeover_allowed?(binding, invalidation, issue_context.run_instance_id) do
+          :ok
+        else
+          {:error, {:workspace_resource_owned_by_other_run, binding}}
+        end
+
+      {:error, :enoent} ->
+        allow_unbound_workspace?(workspace, nil, created?)
+
+      {:error, :enotdir} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_workspace_binding_takeover(workspace, issue_context, worker_host, created?)
+       when is_binary(workspace) and is_map(issue_context) and is_binary(worker_host) do
+    case read_resource_binding(workspace, worker_host) do
+      {:ok, binding} ->
+        invalidation = read_optional_json(invalidation_record_path(workspace), worker_host)
+
+        if resource_binding_takeover_allowed?(binding, invalidation, issue_context.run_instance_id) do
+          :ok
+        else
+          {:error, {:workspace_resource_owned_by_other_run, binding}}
+        end
+
+      {:error, :enoent} ->
+        allow_unbound_workspace?(workspace, worker_host, created?)
+
+      {:error, :enotdir} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp bind_workspace_resource(workspace, issue_context, nil) when is_binary(workspace) and is_map(issue_context) do
+    binding =
+      case read_resource_binding(workspace) do
+        {:ok, existing_binding} -> existing_binding
+        _ -> nil
+      end
+
+    binding
+    |> merge_active_resource_binding(workspace, issue_context, nil)
+    |> write_resource_binding(workspace)
+
+    clear_invalidation_record(workspace)
+    :ok
+  end
+
+  defp bind_workspace_resource(workspace, issue_context, worker_host)
+       when is_binary(workspace) and is_map(issue_context) and is_binary(worker_host) do
+    binding =
+      case read_resource_binding(workspace, worker_host) do
+        {:ok, existing_binding} -> existing_binding
+        _ -> nil
+      end
+
+    binding
+    |> merge_active_resource_binding(workspace, issue_context, worker_host)
+    |> write_resource_binding(workspace, worker_host)
+
+    clear_invalidation_record(workspace, worker_host)
+    :ok
+  end
+
+  defp allow_unbound_workspace?(_workspace, _worker_host, true), do: :ok
+
+  defp allow_unbound_workspace?(workspace, worker_host, false) do
+    {:error,
+     {:workspace_resource_owned_by_other_run,
+      %{
+        "workspace_path" => workspace,
+        "worker_host" => worker_host,
+        "state" => "preparing",
+        "run_instance_id" => nil
+      }}}
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -161,6 +257,66 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
+  end
+
+  @spec cleanup_issue_workspace(String.t(), keyword()) :: :ok
+  def cleanup_issue_workspace(identifier, opts \\ []) when is_binary(identifier) do
+    worker_host = Keyword.get(opts, :worker_host)
+    mode = Keyword.get(opts, :mode, :terminal_cleanup)
+    run_instance_id = Keyword.get(opts, :run_instance_id)
+    closing_reason = Keyword.get(opts, :closing_reason, to_string(mode))
+    delete_evidence = Keyword.get(opts, :delete_evidence, :none)
+    safe_id = safe_identifier(identifier)
+
+    case workspace_path_for_issue(safe_id, worker_host) do
+      {:ok, workspace} ->
+        fenced_cleanup_workspace(
+          workspace,
+          identifier,
+          worker_host,
+          mode,
+          run_instance_id,
+          closing_reason,
+          delete_evidence
+        )
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  @spec read_resource_binding(Path.t()) :: {:ok, map()} | {:error, term()}
+  def read_resource_binding(workspace) when is_binary(workspace) do
+    workspace
+    |> resource_binding_path()
+    |> read_json_file()
+  end
+
+  @spec read_resource_binding(Path.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def read_resource_binding(workspace, worker_host)
+      when is_binary(workspace) and is_binary(worker_host) do
+    workspace
+    |> resource_binding_path()
+    |> read_remote_json_file(worker_host)
+  end
+
+  @spec workspace_lifecycle_info(Path.t(), worker_host()) :: map()
+  def workspace_lifecycle_info(workspace, worker_host \\ nil) when is_binary(workspace) do
+    %{
+      binding: read_optional_json(resource_binding_path(workspace), worker_host),
+      invalidation: read_optional_json(invalidation_record_path(workspace), worker_host)
+    }
+  end
+
+  @spec validate_workspace_owner(Path.t(), String.t() | nil, worker_host()) ::
+          :ok | {:error, {:workspace_lifecycle_invalid, map()}}
+  def validate_workspace_owner(workspace, run_instance_id, worker_host \\ nil) when is_binary(workspace) do
+    %{binding: binding, invalidation: invalidation} = workspace_lifecycle_info(workspace, worker_host)
+
+    case workspace_lifecycle_error(binding, invalidation, run_instance_id, workspace) do
+      nil -> :ok
+      error -> error
+    end
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
@@ -492,24 +648,528 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
+  defp fenced_cleanup_workspace(
+         workspace,
+         identifier,
+         worker_host,
+         mode,
+         run_instance_id,
+         closing_reason,
+         delete_evidence
+       ) do
+    binding = read_optional_json(resource_binding_path(workspace), worker_host)
+    workspace_exists? = workspace_present?(workspace, worker_host)
+
+    cond do
+      active_binding_owned_by_other_run?(binding, run_instance_id) ->
+        :ok
+
+      workspace_exists? and mode == :startup_sweep ->
+        maybe_delete_workspace(
+          workspace,
+          identifier,
+          worker_host,
+          mode,
+          run_instance_id,
+          binding,
+          delete_evidence
+        )
+
+        :ok
+
+      workspace_exists? ->
+        closing_binding =
+          merge_closing_resource_binding(binding, workspace, identifier, worker_host, run_instance_id, closing_reason)
+
+        write_resource_binding(closing_binding, workspace, worker_host)
+
+        write_invalidation_record(
+          workspace,
+          worker_host,
+          build_invalidation_record(
+            closing_binding,
+            identifier,
+            run_instance_id,
+            workspace,
+            worker_host,
+            closing_reason
+          )
+        )
+
+        maybe_delete_workspace(
+          workspace,
+          identifier,
+          worker_host,
+          mode,
+          run_instance_id,
+          closing_binding,
+          delete_evidence
+        )
+
+        :ok
+
+      delete_allowed?(mode, binding, delete_evidence) ->
+        maybe_delete_workspace(
+          workspace,
+          identifier,
+          worker_host,
+          mode,
+          run_instance_id,
+          binding,
+          delete_evidence
+        )
+
+        :ok
+
+      true ->
+        :ok
+    end
+  end
+
+  defp maybe_delete_workspace(workspace, identifier, worker_host, mode, run_instance_id, binding, delete_evidence) do
+    if delete_allowed?(mode, binding, delete_evidence) do
+      write_resource_binding(
+        merge_removed_pending_resource_binding(binding, workspace, identifier, worker_host, run_instance_id),
+        workspace,
+        worker_host
+      )
+
+      write_invalidation_record(
+        workspace,
+        worker_host,
+        build_invalidation_record(binding, identifier, run_instance_id, workspace, worker_host, "workspace_removed")
+      )
+
+      remove(workspace, worker_host)
+      clear_invalidation_record(workspace, worker_host)
+    else
+      :ok
+    end
+  end
+
+  defp delete_allowed?(:startup_sweep, binding, delete_evidence),
+    do: removed_pending_binding?(binding) and delete_evidence == :startup_no_live_owner
+
+  defp delete_allowed?(:terminal_cleanup, binding, delete_evidence),
+    do: removable_binding_state?(binding) and delete_evidence in [:no_live_owner, :task_down_confirmed]
+
+  defp delete_allowed?(_mode, _binding, _delete_evidence), do: false
+
+  defp removable_binding_state?(%{"state" => state}) when state in ["closing", "removed-pending"],
+    do: true
+
+  defp removable_binding_state?(_binding), do: false
+
+  defp removed_pending_binding?(%{"state" => "removed-pending"}), do: true
+  defp removed_pending_binding?(_binding), do: false
+
+  defp active_binding_owned_by_other_run?(%{"state" => "active"} = binding, run_instance_id) do
+    binding_run_instance_id = Map.get(binding, "run_instance_id")
+    not same_run_instance_id?(binding_run_instance_id, run_instance_id)
+  end
+
+  defp active_binding_owned_by_other_run?(_binding, _run_instance_id), do: false
+
+  defp resource_binding_takeover_allowed?(%{"state" => "active"} = binding, _invalidation, run_instance_id) do
+    same_run_instance_id?(Map.get(binding, "run_instance_id"), run_instance_id)
+  end
+
+  defp resource_binding_takeover_allowed?(%{"state" => "closing"} = binding, invalidation, run_instance_id) do
+    same_run_instance_id?(Map.get(binding, "run_instance_id"), run_instance_id) or
+      stale_closing_binding?(binding, invalidation)
+  end
+
+  defp resource_binding_takeover_allowed?(%{"state" => "removed-pending"} = binding, invalidation, run_instance_id) do
+    same_run_instance_id?(Map.get(binding, "run_instance_id"), run_instance_id) or
+      stale_removed_binding?(binding, invalidation)
+  end
+
+  defp resource_binding_takeover_allowed?(_binding, _invalidation, _run_instance_id), do: false
+
+  defp stale_removed_binding?(binding, invalidation) when is_map(binding) and is_map(invalidation) do
+    Map.get(invalidation, "reason") == "workspace_removed" and
+      Map.get(invalidation, "issue_identifier") == Map.get(binding, "issue_identifier") and
+      Map.get(invalidation, "workspace_path") == Map.get(binding, "workspace_path")
+  end
+
+  defp stale_removed_binding?(_binding, _invalidation), do: false
+
+  defp stale_closing_binding?(binding, invalidation) when is_map(binding) and is_map(invalidation) do
+    Map.get(binding, "state") == "closing" and
+      Map.get(invalidation, "reason") == "workspace_removed" and
+      Map.get(invalidation, "issue_identifier") == Map.get(binding, "issue_identifier") and
+      Map.get(invalidation, "run_instance_id") == Map.get(binding, "run_instance_id") and
+      Map.get(invalidation, "workspace_path") == Map.get(binding, "workspace_path")
+  end
+
+  defp stale_closing_binding?(_binding, _invalidation), do: false
+
+  defp same_run_instance_id?(binding_run_instance_id, run_instance_id)
+       when is_binary(binding_run_instance_id) and is_binary(run_instance_id) do
+    binding_run_instance_id == run_instance_id
+  end
+
+  defp same_run_instance_id?(nil, nil), do: true
+  defp same_run_instance_id?(binding_run_instance_id, run_instance_id), do: binding_run_instance_id == run_instance_id
+
+  defp binding_lifecycle_error(%{"state" => "active"} = binding, run_instance_id, workspace) do
+    if same_run_instance_id?(Map.get(binding, "run_instance_id"), run_instance_id) do
+      nil
+    else
+      {:error, {:workspace_lifecycle_invalid, lifecycle_details(:resource_owned_by_other_run, binding, workspace)}}
+    end
+  end
+
+  defp binding_lifecycle_error(%{"state" => state} = binding, _run_instance_id, workspace)
+       when state in ["closing", "removed-pending"] do
+    {:error, {:workspace_lifecycle_invalid, lifecycle_details(:resource_closing, binding, workspace)}}
+  end
+
+  defp binding_lifecycle_error(_binding, _run_instance_id, _workspace), do: nil
+
+  defp invalidation_lifecycle_error(invalidation, workspace) when is_map(invalidation) do
+    {:error,
+     {:workspace_lifecycle_invalid,
+      %{
+        reason: :resource_invalidated,
+        run_instance_id: Map.get(invalidation, "run_instance_id"),
+        closing_reason: Map.get(invalidation, "reason"),
+        binding_state: Map.get(invalidation, "state"),
+        workspace_path: Map.get(invalidation, "workspace_path") || workspace
+      }}}
+  end
+
+  defp invalidation_lifecycle_error(_invalidation, _workspace), do: nil
+
+  defp lifecycle_details(reason, binding, workspace) do
+    %{
+      reason: reason,
+      run_instance_id: Map.get(binding, "run_instance_id"),
+      closing_reason: Map.get(binding, "closing_reason"),
+      binding_state: Map.get(binding, "state"),
+      workspace_path: Map.get(binding, "workspace_path") || workspace
+    }
+  end
+
+  defp workspace_lifecycle_error(binding, invalidation, run_instance_id, workspace) do
+    binding_lifecycle_error(binding, run_instance_id, workspace) ||
+      invalidation_lifecycle_error(invalidation, workspace)
+  end
+
+  defp merge_active_resource_binding(binding, workspace, issue_context, worker_host) do
+    binding = binding || %{}
+
+    %{
+      "issue_id" => issue_context.issue_id,
+      "issue_identifier" => issue_context.issue_identifier,
+      "run_instance_id" => issue_context.run_instance_id,
+      "worker_host" => worker_host,
+      "workspace_path" => workspace,
+      "state" => "active",
+      "closing_reason" => nil,
+      "inserted_at" => Map.get(binding, "inserted_at") || timestamp_now(),
+      "updated_at" => timestamp_now()
+    }
+  end
+
+  defp merge_closing_resource_binding(binding, workspace, identifier, worker_host, run_instance_id, closing_reason) do
+    binding = binding || %{}
+
+    %{
+      "issue_id" => Map.get(binding, "issue_id"),
+      "issue_identifier" => Map.get(binding, "issue_identifier") || identifier,
+      "run_instance_id" => run_instance_id || Map.get(binding, "run_instance_id"),
+      "worker_host" => worker_host || Map.get(binding, "worker_host"),
+      "workspace_path" => workspace,
+      "state" => "closing",
+      "closing_reason" => closing_reason,
+      "inserted_at" => Map.get(binding, "inserted_at") || timestamp_now(),
+      "updated_at" => timestamp_now()
+    }
+  end
+
+  defp merge_removed_pending_resource_binding(binding, workspace, identifier, worker_host, run_instance_id) do
+    binding = binding || %{}
+
+    %{
+      "issue_id" => Map.get(binding, "issue_id"),
+      "issue_identifier" => Map.get(binding, "issue_identifier") || identifier,
+      "run_instance_id" => run_instance_id || Map.get(binding, "run_instance_id"),
+      "worker_host" => worker_host || Map.get(binding, "worker_host"),
+      "workspace_path" => workspace,
+      "state" => "removed-pending",
+      "closing_reason" => "workspace_removed",
+      "inserted_at" => Map.get(binding, "inserted_at") || timestamp_now(),
+      "updated_at" => timestamp_now()
+    }
+  end
+
+  defp write_resource_binding(binding, workspace, worker_host \\ nil)
+
+  defp write_resource_binding(binding, workspace, nil) when is_map(binding) and is_binary(workspace) do
+    write_json_file(resource_binding_path(workspace), binding)
+  end
+
+  defp write_resource_binding(binding, workspace, worker_host)
+       when is_map(binding) and is_binary(workspace) and is_binary(worker_host) do
+    write_remote_json_file(resource_binding_path(workspace), binding, worker_host)
+  end
+
+  defp clear_invalidation_record(workspace, worker_host \\ nil)
+
+  defp clear_invalidation_record(workspace, nil) when is_binary(workspace) do
+    case File.rm(invalidation_record_path(workspace)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp clear_invalidation_record(workspace, worker_host)
+       when is_binary(workspace) and is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("file", invalidation_record_path(workspace)),
+        "rm -f \"$file\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {_output, _status}} -> :ok
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp resource_binding_path(workspace) when is_binary(workspace),
+    do: Path.join(workspace, @resource_binding_file)
+
+  defp invalidation_record_path(workspace) when is_binary(workspace),
+    do: Path.join(workspace, @invalidation_record_file)
+
+  defp read_optional_json(path, nil) when is_binary(path) do
+    case read_json_file(path) do
+      {:ok, payload} -> payload
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp read_optional_json(path, worker_host) when is_binary(path) and is_binary(worker_host) do
+    case read_remote_json_file(path, worker_host) do
+      {:ok, payload} -> payload
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp read_json_file(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, contents} ->
+        case Jason.decode(contents) do
+          {:ok, %{} = payload} -> {:ok, payload}
+          {:ok, other} -> {:error, {:invalid_resource_json, path, other}}
+          {:error, reason} -> {:error, {:invalid_resource_json, path, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp write_json_file(path, payload) when is_binary(path) and is_map(payload) do
+    temp_path = path <> ".tmp"
+    encoded = Jason.encode_to_iodata!(payload)
+    File.write!(temp_path, encoded)
+    File.rename!(temp_path, path)
+    :ok
+  end
+
+  defp workspace_present?(workspace, nil) when is_binary(workspace), do: File.exists?(workspace)
+
+  defp workspace_present?(workspace, worker_host)
+       when is_binary(workspace) and is_binary(worker_host) do
+    case remote_path_exists?(workspace, worker_host) do
+      {:ok, exists?} -> exists?
+      {:error, _reason} -> false
+    end
+  end
+
+  defp build_invalidation_record(binding, identifier, run_instance_id, workspace, worker_host, reason) do
+    %{
+      "issue_id" => Map.get(binding || %{}, "issue_id"),
+      "issue_identifier" => Map.get(binding || %{}, "issue_identifier") || identifier,
+      "run_instance_id" => run_instance_id || Map.get(binding || %{}, "run_instance_id"),
+      "worker_host" => worker_host || Map.get(binding || %{}, "worker_host"),
+      "workspace_path" => workspace,
+      "state" => Map.get(binding || %{}, "state"),
+      "reason" => reason,
+      "updated_at" => timestamp_now()
+    }
+  end
+
+  defp write_invalidation_record(workspace, nil, payload) when is_binary(workspace) and is_map(payload) do
+    write_json_file(invalidation_record_path(workspace), payload)
+  end
+
+  defp write_invalidation_record(workspace, worker_host, payload)
+       when is_binary(workspace) and is_binary(worker_host) and is_map(payload) do
+    write_remote_json_file(invalidation_record_path(workspace), payload, worker_host)
+  end
+
+  defp read_remote_json_file(path, worker_host) when is_binary(path) and is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("file", path),
+        "if [ -f \"$file\" ]; then",
+        "  printf '%s\\t1\\t' '#{@remote_json_marker}'",
+        "  cat \"$file\"",
+        "  printf '\\n'",
+        "else",
+        "  printf '%s\\t0\\n' '#{@remote_json_marker}'",
+        "fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} ->
+        parse_remote_json_output(output, path)
+
+      {:ok, {output, status}} ->
+        {:error, {:remote_json_read_failed, worker_host, path, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp write_remote_json_file(path, payload, worker_host)
+       when is_binary(path) and is_map(payload) and is_binary(worker_host) do
+    encoded = Jason.encode!(payload)
+
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("file", path),
+        "dir=$(dirname \"$file\")",
+        "mkdir -p \"$dir\"",
+        "tmp=\"$file.tmp.$$\"",
+        "printf '%s' #{shell_escape(encoded)} > \"$tmp\"",
+        "mv \"$tmp\" \"$file\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:remote_json_write_failed, worker_host, path, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remote_path_exists?(path, worker_host) when is_binary(path) and is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("target", path),
+        "if [ -e \"$target\" ]; then",
+        "  printf '%s\\t1\\n' '#{@remote_path_marker}'",
+        "else",
+        "  printf '%s\\t0\\n' '#{@remote_path_marker}'",
+        "fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} -> parse_remote_exists_output(output)
+      {:ok, {output, status}} -> {:error, {:remote_path_exists_failed, worker_host, path, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_remote_json_output(output, path) do
+    lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
+
+    case Enum.find_value(lines, &parse_remote_json_line/1) do
+      {:payload, payload} -> decode_remote_json_payload(payload, path)
+      :missing -> {:error, :enoent}
+      marker -> remote_json_marker_result(marker, path, output)
+    end
+  end
+
+  defp parse_remote_exists_output(output) do
+    lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
+
+    case Enum.find_value(lines, &parse_remote_exists_line/1) do
+      {:ok, exists?} -> {:ok, exists?}
+      marker -> remote_exists_marker_result(marker, output)
+    end
+  end
+
+  defp parse_remote_json_line(line) do
+    case String.split(line, "\t", parts: 3) do
+      [@remote_json_marker, "1", payload] -> {:payload, payload}
+      [@remote_json_marker, "0"] -> :missing
+      _ -> nil
+    end
+  end
+
+  defp parse_remote_exists_line(line) do
+    case String.split(line, "\t", parts: 2) do
+      [@remote_path_marker, "1"] -> {:ok, true}
+      [@remote_path_marker, "0"] -> {:ok, false}
+      _ -> nil
+    end
+  end
+
+  defp decode_remote_json_payload(payload, path) do
+    case Jason.decode(payload) do
+      {:ok, %{} = decoded} -> {:ok, decoded}
+      {:ok, other} -> {:error, {:invalid_resource_json, path, other}}
+      {:error, reason} -> {:error, {:invalid_resource_json, path, reason}}
+    end
+  end
+
+  defp remote_json_marker_result(_marker, path, output) do
+    {:error, {:remote_json_read_failed, :invalid_output, path, output}}
+  end
+
+  defp remote_exists_marker_result(_marker, output) do
+    {:error, {:remote_path_exists_failed, :invalid_output, output}}
+  end
+
+  defp timestamp_now do
+    DateTime.utc_now() |> DateTime.to_iso8601()
+  end
+
+  defp issue_context(%{id: issue_id, identifier: identifier, run_instance_id: run_instance_id}) do
+    %{
+      issue_id: issue_id,
+      issue_identifier: identifier || "issue",
+      run_instance_id: run_instance_id
+    }
+  end
+
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      run_instance_id: nil
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      run_instance_id: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      run_instance_id: nil
     }
   end
 

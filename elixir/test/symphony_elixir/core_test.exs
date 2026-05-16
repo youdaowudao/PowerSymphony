@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  @resource_binding_file ".symphony-resource.json"
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -291,6 +293,22 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       File.mkdir_p!(closed_workspace)
+
+      File.write!(
+        Path.join(closed_workspace, @resource_binding_file),
+        Jason.encode!(%{
+          "issue_id" => "issue-active-startup",
+          "issue_identifier" => closed_identifier,
+          "run_instance_id" => "run-startup-old",
+          "worker_host" => nil,
+          "workspace_path" => closed_workspace,
+          "state" => "closing",
+          "closing_reason" => "startup_terminal_sweep",
+          "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
       {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
       assert_eventually(
@@ -479,6 +497,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-2"
     issue_identifier = "MT-556"
     workspace = Path.join(test_root, issue_identifier)
+    orchestrator_name = Module.concat(__MODULE__, :TerminalReconcileOrchestrator)
 
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
@@ -490,27 +509,57 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(test_root)
       File.mkdir_p!(workspace)
 
+      File.write!(
+        Path.join(workspace, @resource_binding_file),
+        Jason.encode!(%{
+          "issue_id" => issue_id,
+          "issue_identifier" => issue_identifier,
+          "run_instance_id" => "run-terminal-cleanup",
+          "worker_host" => nil,
+          "workspace_path" => workspace,
+          "state" => "active",
+          "closing_reason" => nil,
+          "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
+      {:ok, pid} = start_inert_orchestrator(orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
       agent_pid =
         spawn(fn ->
+          Process.flag(:trap_exit, true)
+
           receive do
-            :stop -> :ok
+            {:EXIT, _from, :shutdown} -> :ok
           end
         end)
 
-      state = %Orchestrator.State{
-        running: %{
+      initial_state = :sys.get_state(pid)
+      ref = Process.monitor(agent_pid)
+
+      state =
+        initial_state
+        |> Map.put(:running, %{
           issue_id => %{
             pid: agent_pid,
-            ref: nil,
+            ref: ref,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            run_instance_id: "run-terminal-cleanup",
+            workspace_path: workspace,
             started_at: DateTime.utc_now()
           }
-        },
-        claimed: MapSet.new([issue_id]),
-        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-        retry_attempts: %{}
-      }
+        })
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+        |> Map.put(:codex_totals, %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0})
 
       issue = %Issue{
         id: issue_id,
@@ -523,10 +572,35 @@ defmodule SymphonyElixir.CoreTest do
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
 
-      refute Map.has_key?(updated_state.running, issue_id)
-      refute MapSet.member?(updated_state.claimed, issue_id)
+      assert %{cleanup_workspace: true} = updated_state.running[issue_id]
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert File.exists?(workspace)
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "terminal_running_cleanup"
+
+      :sys.replace_state(pid, fn _ -> updated_state end)
+      send(pid, {:DOWN, ref, :process, agent_pid, :shutdown})
+
+      assert_eventually(
+        fn ->
+          state = :sys.get_state(pid)
+
+          not Map.has_key?(state.running, issue_id) and
+            not MapSet.member?(state.claimed, issue_id) and
+            not Map.has_key?(state.retry_attempts, issue_id) and
+            MapSet.member?(state.completed, issue_id) and
+            not File.exists?(workspace)
+        end,
+        20
+      )
+
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+      assert MapSet.member?(state.completed, issue_id)
       refute Process.alive?(agent_pid)
-      refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -2339,6 +2413,195 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner stops before a stale continuation turn when workspace binding is closing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-stale-continuation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale-turn"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stale-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+      issue_id = "issue-stale-continuation"
+      issue_identifier = "MT-STALE-CONT"
+
+      state_fetcher = fn [_issue_id] ->
+        workspace = Path.join(workspace_root, issue_identifier)
+
+        File.write!(
+          Path.join(workspace, @resource_binding_file),
+          Jason.encode!(%{
+            "issue_id" => issue_id,
+            "issue_identifier" => issue_identifier,
+            "run_instance_id" => "run-stale-continuation",
+            "worker_host" => nil,
+            "workspace_path" => workspace,
+            "state" => "closing",
+            "closing_reason" => "terminal_cleanup_pending",
+            "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+            "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+          })
+        )
+
+        {:ok,
+         [
+           %Issue{
+             id: issue_id,
+             identifier: issue_identifier,
+             title: "Stale continuation guard",
+             description: "Second turn should be fenced",
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Stale continuation guard",
+        description: "Second turn should be fenced",
+        state: "In Progress",
+        url: "https://example.org/issues/#{issue_identifier}",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, parent,
+                 issue_state_fetcher: state_fetcher,
+                 run_instance_id: "run-stale-continuation"
+               )
+
+      assert_receive(
+        {:agent_run_result, ^issue_id, %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}},
+        500
+      )
+
+      assert_receive(
+        {:agent_run_result, ^issue_id,
+         %{
+           status: :failed,
+           reason: :workspace_lifecycle_invalid,
+           turn_count: 2,
+           run_instance_id: "run-stale-continuation"
+         }},
+        500
+      )
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner reports lifecycle failure when workspace is already owned by another active run" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-owned-by-other-run-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      parent = self()
+      issue_id = "issue-owned-by-other-run"
+      issue_identifier = "MT-OWNED-OTHER"
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      workspace = Path.join(workspace_root, issue_identifier)
+      File.mkdir_p!(workspace)
+
+      File.write!(
+        Path.join(workspace, @resource_binding_file),
+        Jason.encode!(%{
+          "issue_id" => issue_id,
+          "issue_identifier" => issue_identifier,
+          "run_instance_id" => "run-existing-owner",
+          "worker_host" => nil,
+          "workspace_path" => workspace,
+          "state" => "active",
+          "closing_reason" => nil,
+          "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Owned by another run",
+        description: "Acquisition should fail with lifecycle semantics",
+        state: "In Progress",
+        url: "https://example.org/issues/#{issue_identifier}",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, parent, run_instance_id: "run-new-owner")
+
+      assert_receive {:agent_run_result, ^issue_id,
+                      %{
+                        status: :failed,
+                        reason: :workspace_lifecycle_invalid,
+                        turn_count: 1,
+                        run_instance_id: "run-new-owner"
+                      }},
+                     500
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner stops continuation when refreshed active issue gains a non-terminal blocker" do
     test_root =
       Path.join(
@@ -3614,7 +3877,24 @@ defmodule SymphonyElixir.CoreTest do
       }
     ])
 
-    File.mkdir_p!(Path.join(test_root, issue_identifier))
+    workspace = Path.join(test_root, issue_identifier)
+    File.mkdir_p!(workspace)
+
+    File.write!(
+      Path.join(workspace, @resource_binding_file),
+      Jason.encode!(%{
+        "issue_id" => issue_id,
+        "issue_identifier" => issue_identifier,
+        "run_instance_id" => "run-blocked-terminal-release",
+        "worker_host" => nil,
+        "workspace_path" => workspace,
+        "state" => "active",
+        "closing_reason" => nil,
+        "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+        "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+      })
+    )
+
     {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
@@ -3636,6 +3916,7 @@ defmodule SymphonyElixir.CoreTest do
           attempt: 3,
           identifier: issue_identifier,
           worker_host: nil,
+          run_instance_id: "run-blocked-terminal-release",
           reason: :premature_turn_end,
           issue: %Issue{
             id: issue_id,
@@ -3655,7 +3936,10 @@ defmodule SymphonyElixir.CoreTest do
 
     refute MapSet.member?(state.claimed, issue_id)
     refute Map.has_key?(state.blocked_claims, issue_id)
-    refute File.exists?(Path.join(test_root, issue_identifier))
+    assert File.exists?(workspace)
+    assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+    assert binding["state"] == "closing"
+    assert binding["closing_reason"] == "terminal_blocked_claim_cleanup"
   end
 
   test "app server starts with workspace cwd and expected startup command" do

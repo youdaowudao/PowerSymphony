@@ -614,32 +614,53 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
-        worker_host = Map.get(running_entry, :worker_host)
-
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
-
         if is_pid(pid) do
           terminate_task(pid)
         end
 
-        if is_reference(ref) do
-          Process.demonitor(ref, [:flush])
+        if cleanup_workspace do
+          retain_running_cleanup_state(state, issue_id, running_entry, identifier)
+        else
+          release_running_issue_immediately(state, issue_id, running_entry, ref)
         end
-
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked_claims: Map.delete(state.blocked_claims, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
 
       _ ->
         release_issue_claim(state, issue_id)
     end
+  end
+
+  defp retain_running_cleanup_state(state, issue_id, running_entry, identifier) do
+    running_entry = Map.put(running_entry, :cleanup_workspace, true)
+
+    cleanup_issue_workspace(identifier,
+      worker_host: Map.get(running_entry, :worker_host),
+      mode: :terminal_cleanup,
+      run_instance_id: run_instance_id_from_metadata(running_entry),
+      closing_reason: "terminal_running_cleanup"
+    )
+
+    %{
+      state
+      | running: Map.put(state.running, issue_id, running_entry),
+        blocked_claims: Map.delete(state.blocked_claims, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp release_running_issue_immediately(state, issue_id, running_entry, ref) do
+    if is_reference(ref) do
+      Process.demonitor(ref, [:flush])
+    end
+
+    state = record_session_completion_totals(state, running_entry)
+
+    %{
+      state
+      | running: Map.delete(state.running, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        blocked_claims: Map.delete(state.blocked_claims, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
@@ -1184,6 +1205,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> Map.put(:recipient, recipient)
           |> Map.put(:run_trace, run_trace)
           |> Map.put(:run_instance_id, run_instance_id)
+          |> Map.put(:delay_type, Map.get(retry_metadata, :delay_type))
 
         RunTrace.record(run_trace, :orchestrator, %{
           event: :dispatch_started,
@@ -1240,7 +1262,7 @@ defmodule SymphonyElixir.Orchestrator do
          retry_workspace_path,
          spawn_context
        ) do
-    run_mode = dispatch_run_mode(state, issue)
+    run_mode = dispatch_run_mode(state, issue, spawn_context)
     recipient = Map.fetch!(spawn_context, :recipient)
     run_trace = Map.get(spawn_context, :run_trace)
     run_instance_id = Map.get(spawn_context, :run_instance_id)
@@ -1339,6 +1361,7 @@ defmodule SymphonyElixir.Orchestrator do
         run_mode: run_mode,
         run_trace: run_trace,
         retry_attempt: normalize_retry_attempt(attempt),
+        cleanup_workspace: false,
         started_at: DateTime.utc_now()
       })
 
@@ -1609,28 +1632,39 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier), do: cleanup_issue_workspace(identifier, nil)
-
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp cleanup_issue_workspace(identifier, opts) when is_binary(identifier) and is_list(opts) do
+    Workspace.cleanup_issue_workspace(identifier, opts)
   end
 
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+  defp cleanup_issue_workspace(_identifier, _opts), do: :ok
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
-
-          _ ->
-            :ok
-        end)
+        Enum.each(issues, &cleanup_terminal_issue_workspaces/1)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+    end
+  end
+
+  defp cleanup_terminal_issue_workspaces(%Issue{identifier: identifier}) when is_binary(identifier) do
+    Enum.each(startup_sweep_worker_hosts(), fn worker_host ->
+      cleanup_issue_workspace(identifier,
+        worker_host: worker_host,
+        mode: :startup_sweep,
+        delete_evidence: :startup_no_live_owner,
+        closing_reason: "startup_terminal_sweep"
+      )
+    end)
+  end
+
+  defp cleanup_terminal_issue_workspaces(_issue), do: :ok
+
+  defp startup_sweep_worker_hosts do
+    case Config.settings!().worker.ssh_hosts do
+      [] -> [nil]
+      hosts when is_list(hosts) -> hosts
     end
   end
 
@@ -1773,10 +1807,13 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(metadata, :run_instance_id)
   end
 
-  defp dispatch_run_mode(%State{} = state, %Issue{id: issue_id, state: state_name})
+  defp dispatch_run_mode(%State{} = state, %Issue{id: issue_id, state: state_name}, spawn_context)
        when is_binary(issue_id) and is_binary(state_name) do
     cond do
       normalize_issue_state(state_name) == "checking" ->
+        :checking_recheck
+
+      Map.get(spawn_context, :delay_type) == @checking_recheck_delay_type ->
         :checking_recheck
 
       match?(%{delay_type: @checking_recheck_delay_type}, Map.get(state.retry_attempts, issue_id)) ->
@@ -1787,7 +1824,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp dispatch_run_mode(_state, _issue), do: :normal
+  defp dispatch_run_mode(_state, _issue, _spawn_context), do: :normal
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
@@ -1973,7 +2010,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_terminal_retry_issue(state, issue, issue_id, metadata) do
     Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-    cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+    cleanup_issue_workspace(issue.identifier,
+      worker_host: metadata[:worker_host],
+      mode: :terminal_cleanup,
+      run_instance_id: metadata[:run_instance_id],
+      closing_reason: "terminal_retry_cleanup"
+    )
+
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
@@ -2057,7 +2100,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp release_terminal_blocked_claim_issue(state, issue) do
     Logger.info("Blocked claim issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing claim")
 
-    cleanup_issue_workspace(issue.identifier, blocked_claim_worker_host(state, issue.id))
+    blocked_claim = Map.get(state.blocked_claims, issue.id, %{})
+
+    cleanup_issue_workspace(issue.identifier,
+      worker_host: Map.get(blocked_claim, :worker_host),
+      mode: :terminal_cleanup,
+      run_instance_id: Map.get(blocked_claim, :run_instance_id),
+      closing_reason: "terminal_blocked_claim_cleanup"
+    )
+
     release_issue_claim(state, issue.id)
   end
 
@@ -2084,12 +2135,6 @@ defmodule SymphonyElixir.Orchestrator do
       nil -> nil
       blocked_claim -> Map.put(blocked_claim, :issue, issue)
     end)
-  end
-
-  defp blocked_claim_worker_host(%State{} = state, issue_id) do
-    state.blocked_claims
-    |> Map.get(issue_id, %{})
-    |> Map.get(:worker_host)
   end
 
   defp available_slots(%State{} = state) do
@@ -2370,9 +2415,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_worker_exit_after_pop(state, issue_id, running_entry, session_id, reason) do
+    state = maybe_finalize_terminal_workspace_cleanup(state, running_entry)
+
     cond do
       pending_stall_stop_without_terminal_evidence?(running_entry) ->
         block_unconfirmed_stall_stop(state, issue_id, running_entry)
+
+      terminal_workspace_cleanup_exit?(running_entry) ->
+        handle_terminal_workspace_cleanup_exit(state, issue_id, running_entry, session_id, reason)
 
       reason == :normal ->
         handle_normal_worker_exit(state, issue_id, running_entry, session_id)
@@ -2433,6 +2483,49 @@ defmodule SymphonyElixir.Orchestrator do
       run_trace: retry_metadata[:run_trace] || Map.get(running_entry, :run_trace),
       run_instance_id: retry_metadata[:run_instance_id] || run_instance_id_from_metadata(running_entry)
     })
+  end
+
+  defp maybe_finalize_terminal_workspace_cleanup(state, running_entry) do
+    case {Map.get(running_entry, :identifier), Map.get(running_entry, :cleanup_workspace)} do
+      {identifier, true} when is_binary(identifier) ->
+        cleanup_issue_workspace(identifier,
+          worker_host: Map.get(running_entry, :worker_host),
+          mode: :terminal_cleanup,
+          run_instance_id: run_instance_id_from_metadata(running_entry),
+          delete_evidence: :task_down_confirmed,
+          closing_reason: "terminal_running_cleanup"
+        )
+
+        state
+
+      _ ->
+        state
+    end
+  end
+
+  defp terminal_workspace_cleanup_exit?(running_entry) do
+    Map.get(running_entry, :cleanup_workspace) == true
+  end
+
+  defp handle_terminal_workspace_cleanup_exit(state, issue_id, running_entry, session_id, reason) do
+    run_trace = Map.get(running_entry, :run_trace)
+
+    RunTrace.record(run_trace, :orchestrator, %{
+      event: :worker_exit_normal,
+      summary: "orchestrator:worker_exit_normal",
+      run_instance_id: run_instance_id_from_metadata(running_entry),
+      payload: %{
+        issue_id: issue_id,
+        session_id: session_id,
+        reason: inspect(reason),
+        cleanup_workspace: true,
+        run_result: inspect(Map.get(running_entry, :run_result))
+      }
+    })
+
+    Logger.info("Agent task finished terminal workspace cleanup for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; releasing claim")
+
+    complete_issue(state, issue_id, release_claim?: true)
   end
 
   defp terminate_running_process(running_entry) do

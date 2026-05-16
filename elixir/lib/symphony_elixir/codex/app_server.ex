@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH, Workspace}
 
   @initialize_id 1
   @thread_start_id 2
@@ -120,6 +120,7 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
+            reason = maybe_translate_workspace_lifecycle_error(reason, workspace, metadata)
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
             emit_message(
@@ -1110,6 +1111,52 @@ defmodule SymphonyElixir.Codex.AppServer do
       end
     end
   end
+
+  defp maybe_translate_workspace_lifecycle_error({:turn_failed, %{} = payload}, workspace, metadata)
+       when is_binary(workspace) and is_map(metadata) do
+    if workspace_path_failure_payload?(payload) do
+      lifecycle = Workspace.workspace_lifecycle_info(workspace, Map.get(metadata, :worker_host))
+      binding = lifecycle.binding
+      invalidation = lifecycle.invalidation
+
+      cond do
+        is_map(binding) and Map.get(binding, "state") == "closing" ->
+          {:workspace_lifecycle_invalid,
+           %{
+             reason: :resource_closing,
+             run_instance_id: Map.get(binding, "run_instance_id"),
+             closing_reason: Map.get(binding, "closing_reason"),
+             binding_state: Map.get(binding, "state"),
+             workspace_path: Map.get(binding, "workspace_path") || workspace
+           }}
+
+        is_map(invalidation) ->
+          {:workspace_lifecycle_invalid,
+           %{
+             reason: :resource_invalidated,
+             run_instance_id: Map.get(invalidation, "run_instance_id"),
+             closing_reason: Map.get(invalidation, "reason"),
+             binding_state: nil,
+             workspace_path: workspace
+           }}
+
+        true ->
+          {:turn_failed, payload}
+      end
+    else
+      {:turn_failed, payload}
+    end
+  end
+
+  defp maybe_translate_workspace_lifecycle_error(reason, _workspace, _metadata), do: reason
+
+  defp workspace_path_failure_payload?(payload) when is_map(payload) do
+    code = Map.get(payload, "code")
+    message = Map.get(payload, "message", "")
+    is_binary(message) and (code in ["ENOENT", "NOT_FOUND"] or String.contains?(String.downcase(message), "cwd missing"))
+  end
+
+  defp workspace_path_failure_payload?(_payload), do: false
 
   defp protocol_message_candidate?(data) do
     data

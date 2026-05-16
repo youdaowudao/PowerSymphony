@@ -3,6 +3,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   alias SymphonyElixir.{LogFile, RawEventStore, RunTrace}
 
+  @resource_binding_file ".symphony-resource.json"
+
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
@@ -524,6 +526,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
       Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      issue_id = issue.id
 
       orchestrator_name = Module.concat(__MODULE__, :CheckingRecheckOrchestrator)
       {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -559,10 +562,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       send(pid, {:retry_issue, issue.id, retry_token})
 
       assert_eventually(fn ->
-        case File.read(trace_file) do
-          {:ok, contents} ->
-            contents =~ "Checking recheck only:" and
-              not String.contains?(contents, "You are an agent for this repository.")
+        state = :sys.get_state(pid)
+        match?(%{^issue_id => %{run_mode: :checking_recheck}}, state.running)
+      end)
+
+      assert_eventually(fn ->
+        state = :sys.get_state(pid)
+
+        case state.running[issue_id] do
+          %{run_mode: :checking_recheck, workspace_path: workspace_path}
+          when is_binary(workspace_path) ->
+            File.dir?(workspace_path)
 
           _ ->
             false
@@ -1823,6 +1833,101 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute Orchestrator.should_dispatch_issue_for_test(running_entry.issue, state)
   end
 
+  test "terminal running cleanup does not delete workspace before stopping worker" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-terminal-running-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{id: "issue-terminal-running", identifier: "MT-TERM-RUN", state: "Cancelled"}
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+        hook_before_remove: "echo before_remove > before_remove.log"
+      )
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "before_remove.log"), "")
+      write_binding!(workspace, issue, "run-terminal-running-1", "active")
+
+      parent = self()
+
+      worker_pid =
+        spawn(fn ->
+          Process.flag(:trap_exit, true)
+
+          receive do
+            {:EXIT, _from, :shutdown} ->
+              send(parent, {:worker_shutdown_workspace_exists, File.dir?(workspace)})
+          end
+        end)
+
+      orchestrator_name = Module.concat(__MODULE__, :TerminalRunningCleanupOrchestrator)
+      {:ok, pid} = Orchestrator.start_inert_for_test(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+      ref = Process.monitor(worker_pid)
+
+      state_with_running = %{
+        initial_state
+        | running: %{
+            issue.id => %{
+              pid: worker_pid,
+              ref: ref,
+              identifier: issue.identifier,
+              issue: issue,
+              run_instance_id: "run-terminal-running-1",
+              workspace_path: workspace,
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([issue.id]),
+          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      state_after_terminal =
+        Orchestrator.reconcile_issue_states_for_test([issue], state_with_running)
+
+      :sys.replace_state(pid, fn _ ->
+        state_after_terminal
+      end)
+
+      assert_receive {:worker_shutdown_workspace_exists, true}, 1_000
+      send(pid, {:DOWN, ref, :process, worker_pid, :shutdown})
+      assert File.exists?(Path.join(workspace, "before_remove.log"))
+      assert File.dir?(workspace)
+
+      assert_eventually(fn ->
+        state = :sys.get_state(pid)
+
+        not Map.has_key?(state.running, issue.id) and
+          not MapSet.member?(state.claimed, issue.id) and
+          not Map.has_key?(state.retry_attempts, issue.id) and
+          MapSet.member?(state.completed, issue.id) and
+          not File.exists?(workspace)
+      end)
+
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.running, issue.id)
+      refute MapSet.member?(state.claimed, issue.id)
+      refute Map.has_key?(state.retry_attempts, issue.id)
+      assert MapSet.member?(state.completed, issue.id)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "stall grace timeout without terminal evidence blocks claim instead of retrying" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -2040,6 +2145,285 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Map.has_key?(state.blocked_claims, issue.id)
     assert %{attempt: 2, retry_token: new_retry_token} = state.retry_attempts[issue.id]
     refute new_retry_token == retry_token
+  end
+
+  test "startup terminal cleanup skips workspace already rebound to a newer active run" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-startup-terminal-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-startup-terminal",
+      identifier: "MT-STARTUP-TERM",
+      title: "Startup cleanup guard",
+      state: "Closed"
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "keep.txt"), "still owned by a newer run\n")
+      write_binding!(workspace, issue, "run-startup-new", "active")
+
+      orchestrator_name = Module.concat(__MODULE__, :StartupTerminalCleanupGuard)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      Process.sleep(50)
+
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "keep.txt")) == "still owned by a newer run\n"
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "startup terminal cleanup keeps closing workspace and sweeps matching remote removed-pending workspace" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-startup-remote-sweep-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_remote_root = System.get_env("SYMP_TEST_REMOTE_ROOT")
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_REMOTE_ROOT", previous_remote_root)
+    end)
+
+    try do
+      trace_file = Path.join(test_root, "ssh.trace")
+      fake_ssh = Path.join(test_root, "ssh")
+      remote_root = Path.join(test_root, "remote-root")
+      workspace_root = Path.join(test_root, "workspaces")
+      local_issue = %Issue{id: "issue-startup-local-closing", identifier: "MT-STARTUP-LOCAL-CLOSING", state: "Closed"}
+      remote_issue = %Issue{id: "issue-startup-remote-removed", identifier: "MT-STARTUP-REMOTE-REMOVED", state: "Closed"}
+      remote_workspace_path = "/remote/home/.symphony-remote-workspaces/MT-STARTUP-REMOTE-REMOVED"
+
+      File.mkdir_p!(test_root)
+      File.mkdir_p!(remote_root)
+      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env("SYMP_TEST_REMOTE_ROOT", remote_root)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      remote_root="${SYMP_TEST_REMOTE_ROOT:?missing remote root}"
+      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+      command="$*"
+      target="$remote_root/workspaces/MT-STARTUP-REMOTE-REMOVED"
+      binding="$target/.symphony-resource.json"
+      invalidation="$target/.symphony-invalidation.json"
+
+      if printf '%s' "$command" | grep -q "__SYMPHONY_JSON__"; then
+        if printf '%s' "$command" | grep -q "cat"; then
+          if printf '%s' "$command" | grep -q ".symphony-resource.json"; then
+            if [ -f "$binding" ]; then
+              printf '%s\\t1\\t' '__SYMPHONY_JSON__'
+              cat "$binding"
+              printf '\\n'
+            else
+              printf '%s\\t0\\n' '__SYMPHONY_JSON__'
+            fi
+          else
+            if [ -f "$invalidation" ]; then
+              printf '%s\\t1\\t' '__SYMPHONY_JSON__'
+              cat "$invalidation"
+              printf '\\n'
+            else
+              printf '%s\\t0\\n' '__SYMPHONY_JSON__'
+            fi
+          fi
+        else
+          mkdir -p "$target"
+          if printf '%s' "$command" | grep -q ".symphony-resource.json"; then
+            cat <<'EOF' > "$binding"
+      {"issue_id":"issue-startup-remote-removed","issue_identifier":"MT-STARTUP-REMOTE-REMOVED","run_instance_id":"run-remote-removed","worker_host":"worker-01:2200","workspace_path":"#{remote_workspace_path}","state":"removed-pending","closing_reason":"workspace_removed","inserted_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+      EOF
+          else
+            cat <<'EOF' > "$invalidation"
+      {"issue_identifier":"MT-STARTUP-REMOTE-REMOVED","run_instance_id":"run-remote-removed","worker_host":"worker-01:2200","workspace_path":"#{remote_workspace_path}","state":"removed-pending","reason":"workspace_removed","updated_at":"2026-01-01T00:00:00Z"}
+      EOF
+          fi
+        fi
+      elif printf '%s' "$command" | grep -q "__SYMPHONY_PATH__"; then
+        if [ -e "$target" ]; then
+          printf '%s\\t1\\n' '__SYMPHONY_PATH__'
+        else
+          printf '%s\\t0\\n' '__SYMPHONY_PATH__'
+        fi
+      elif printf '%s' "$command" | grep -q "rm -f"; then
+        rm -f "$invalidation"
+      elif printf '%s' "$command" | grep -q "rm -rf"; then
+        rm -rf "$target"
+      fi
+
+      exit 0
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        worker_ssh_hosts: ["worker-01:2200"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [local_issue, remote_issue])
+
+      local_workspace = Path.join(workspace_root, local_issue.identifier)
+      File.mkdir_p!(local_workspace)
+      File.write!(Path.join(local_workspace, "keep.txt"), "closing should remain\n")
+      write_binding!(local_workspace, local_issue, "run-local-closing", "closing")
+
+      remote_workspace = Path.join(remote_root, "workspaces/MT-STARTUP-REMOTE-REMOVED")
+      File.mkdir_p!(remote_workspace)
+      File.write!(Path.join(remote_workspace, "keep.txt"), "removed pending can be swept\n")
+
+      File.write!(
+        Path.join(remote_workspace, @resource_binding_file),
+        Jason.encode!(%{
+          "issue_id" => remote_issue.id,
+          "issue_identifier" => remote_issue.identifier,
+          "run_instance_id" => "run-remote-removed",
+          "worker_host" => "worker-01:2200",
+          "workspace_path" => remote_workspace_path,
+          "state" => "removed-pending",
+          "closing_reason" => "workspace_removed",
+          "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
+      File.write!(
+        Path.join(remote_workspace, ".symphony-invalidation.json"),
+        Jason.encode!(%{
+          "issue_identifier" => remote_issue.identifier,
+          "run_instance_id" => "run-remote-removed",
+          "worker_host" => "worker-01:2200",
+          "workspace_path" => remote_workspace_path,
+          "state" => "removed-pending",
+          "reason" => "workspace_removed",
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :StartupRemoteSweepOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      Process.sleep(75)
+
+      assert File.dir?(local_workspace)
+      assert File.read!(Path.join(local_workspace, "keep.txt")) == "closing should remain\n"
+      refute File.exists?(remote_workspace)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "worker-01 bash -lc"
+      assert trace =~ ".symphony-resource.json"
+      assert trace =~ "rm -rf"
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMP_TEST_REMOTE_ROOT", previous_remote_root)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal blocked claim cleanup respects workspace binding fencing" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-terminal-blocked-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-blocked-terminal",
+      identifier: "MT-BLOCKED-TERM",
+      title: "Blocked cleanup guard",
+      state: "Closed"
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "keep.txt"), "blocked claim cleanup must fence\n")
+      write_binding!(workspace, issue, "run-blocked-new", "active")
+
+      orchestrator_name = Module.concat(__MODULE__, :TerminalBlockedCleanupGuard)
+      {:ok, pid} = Orchestrator.start_inert_for_test(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | claimed: MapSet.new([issue.id]), blocked_claims: %{issue.id => %{identifier: issue.identifier, issue: issue}}}
+      end)
+
+      send(pid, :tick)
+      Process.sleep(50)
+
+      state = :sys.get_state(pid)
+      refute MapSet.member?(state.claimed, issue.id)
+      refute Map.has_key?(state.blocked_claims, issue.id)
+      assert File.dir?(workspace)
+      assert File.read!(Path.join(workspace, "keep.txt")) == "blocked claim cleanup must fence\n"
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(workspace_root)
+    end
   end
 
   test "status dashboard renders offline marker to terminal" do
@@ -2689,5 +3073,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp write_binding!(workspace, issue, run_instance_id, state) do
+    File.write!(
+      Path.join(workspace, @resource_binding_file),
+      Jason.encode!(%{
+        "issue_id" => issue.id,
+        "issue_identifier" => issue.identifier,
+        "run_instance_id" => run_instance_id,
+        "worker_host" => nil,
+        "workspace_path" => workspace,
+        "state" => state,
+        "closing_reason" => nil,
+        "inserted_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+        "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+      })
+    )
   end
 end
