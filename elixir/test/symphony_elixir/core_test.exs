@@ -2,6 +2,58 @@ defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
   @resource_binding_file ".symphony-resource.json"
+  @continuation_retry_callback_issue %Issue{
+    id: "issue-continuation-retry-callback",
+    identifier: "MT-570",
+    title: "Continuation callback",
+    description: "Should keep claim and retry through the real callback path",
+    state: "In Progress",
+    labels: []
+  }
+
+  defmodule ContinuationRetryCallbackTrackerAdapter do
+    alias SymphonyElixir.CoreTest
+
+    def fetch_candidate_issues, do: {:ok, [CoreTest.continuation_retry_callback_issue()]}
+
+    def fetch_issues_by_states(states) when is_list(states) do
+      issue = CoreTest.continuation_retry_callback_issue()
+
+      normalized_states =
+        states
+        |> Enum.map(&normalize_state/1)
+        |> MapSet.new()
+
+      if MapSet.member?(normalized_states, normalize_state(issue.state)) do
+        {:ok, [issue]}
+      else
+        {:ok, []}
+      end
+    end
+
+    def fetch_issue_states_by_ids(issue_ids) when is_list(issue_ids) do
+      issue = CoreTest.continuation_retry_callback_issue()
+
+      if issue.id in issue_ids do
+        {:ok, [issue]}
+      else
+        {:ok, []}
+      end
+    end
+
+    def create_comment(_issue_id, _body), do: :ok
+    def update_issue_state(_issue_id, _state_name), do: :ok
+
+    defp normalize_state(state) when is_binary(state) do
+      state
+      |> String.trim()
+      |> String.downcase()
+    end
+
+    defp normalize_state(_state), do: ""
+  end
+
+  def continuation_retry_callback_issue, do: @continuation_retry_callback_issue
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1267,32 +1319,26 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "continuation retry callback redispatches through the real retry_issue path while keeping claim until handoff" do
-    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_tracker_adapter = Application.get_env(:symphony_elixir, :tracker_adapter_override)
     issue_id = "issue-continuation-retry-callback"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationRetryCallbackOrchestrator)
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "memory",
       tracker_active_states: ["Todo", "In Progress", "In Review"],
       tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
     )
 
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
-      %Issue{
-        id: issue_id,
-        identifier: "MT-570",
-        title: "Continuation callback",
-        description: "Should keep claim and retry through the real callback path",
-        state: "In Progress",
-        labels: []
-      }
-    ])
+    Application.put_env(
+      :symphony_elixir,
+      :tracker_adapter_override,
+      ContinuationRetryCallbackTrackerAdapter
+    )
 
     {:ok, pid} = start_inert_orchestrator(orchestrator_name)
 
     on_exit(fn ->
-      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:tracker_adapter_override, previous_tracker_adapter)
 
       if Process.alive?(pid) do
         Process.exit(pid, :normal)
@@ -1343,10 +1389,30 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     send(pid, {:DOWN, ref, :process, worker_pid, :normal})
-    Process.sleep(50)
 
-    assert %{attempt: 1, retry_token: retry_token, worker_host: "worker-a", workspace_path: "/tmp/continuation-callback"} =
-             :sys.get_state(pid).retry_attempts[issue_id]
+    assert_eventually(
+      fn ->
+        match?(
+          %{
+            attempt: 1,
+            worker_host: "worker-a",
+            workspace_path: "/tmp/continuation-callback"
+          },
+          :sys.get_state(pid).retry_attempts[issue_id]
+        )
+      end,
+      20
+    )
+
+    %{
+      attempt: 1,
+      retry_token: retry_token,
+      timer_ref: timer_ref,
+      worker_host: "worker-a",
+      workspace_path: "/tmp/continuation-callback"
+    } = :sys.get_state(pid).retry_attempts[issue_id]
+
+    Process.cancel_timer(timer_ref, async: false, info: false)
 
     assert MapSet.member?(:sys.get_state(pid).claimed, issue_id)
     send(pid, {:retry_issue, issue_id, retry_token})
