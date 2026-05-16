@@ -55,6 +55,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, %{}, state}
     end
 
+    def handle_call({:run_timeline, _issue_identifier, _cursor}, _from, state) do
+      Process.sleep(25)
+      {:reply, {:ok, %{items: [], next_cursor: nil}}, state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, :unavailable, state}
     end
@@ -2848,6 +2853,175 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Prompt"
   end
 
+  test "run deep view ignores timeline load messages when summary is unavailable" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-MISSING")
+    send(view.pid, :load_timeline)
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Run unavailable" and rendered =~ "MT-MISSING" and
+        not String.contains?(rendered, "Timeline")
+    end)
+  end
+
+  test "workflow run deep view renders timeline items from orchestrator" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowTimelineOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-WORKFLOW", nil} =>
+            {:ok,
+             %{
+               items: [
+                 %{
+                   event_id: "evt-workflow",
+                   timestamp: "2026-05-16T01:00:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "workflow timeline loaded",
+                   status_markers: ["completed"]
+                 }
+               ],
+               next_cursor: nil
+             }}
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW", "Workflow run")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow run" and rendered =~ "workflow timeline loaded" and
+        rendered =~ "turn completed" and not String.contains?(rendered, "Timeline unavailable")
+    end)
+  end
+
+  test "workflow run deep view degrades timeline errors without hiding summary" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowTimelineErrorOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{{"MT-WORKFLOW-ERR", nil} => {:error, :duplicate_run}}
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW-ERR", "Workflow duplicate")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-ERR")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow duplicate" and rendered =~ "Timeline unavailable" and
+        not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "workflow run deep view degrades when orchestrator is unavailable" do
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, MissingRunLiveTimelineOrchestrator),
+      project_registry: run_live_project_registry("MT-WORKFLOW-DOWN", "Workflow down")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-DOWN")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow down" and rendered =~ "Timeline unavailable" and
+        not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "workflow run deep view degrades when timeline call times out" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveTimelineTimeoutOrchestrator)
+    {:ok, _pid} = SlowOrchestrator.start_link(name: orchestrator_name)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 1,
+      project_registry: run_live_project_registry("MT-WORKFLOW-TIMEOUT", "Workflow timeout")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-TIMEOUT")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow timeout" and rendered =~ "Timeline unavailable" and
+        not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "run deep view ignores load more clicks when no cursor is available" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveNoCursorOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-NO-CURSOR", nil} =>
+            {:ok,
+             %{
+               items: [%{event_id: "evt-no-cursor", summary: "single timeline page"}],
+               next_cursor: nil
+             }}
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-NO-CURSOR", "No cursor run")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-NO-CURSOR")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "No cursor run" and rendered =~ "single timeline page" and
+        not String.contains?(rendered, "Load more")
+    end)
+
+    render_click(view, "load_more_timeline")
+
+    rendered = render(view)
+    assert rendered =~ "single timeline page"
+    refute rendered =~ "Timeline load more failed"
+    refute rendered =~ "Load more"
+  end
+
   test "run deep view renders recent timeline, quiet notice, load more, and detail placeholder independently from summary" do
     manager_name = Module.concat(__MODULE__, RunLiveTimelineManager)
 
@@ -3061,6 +3235,48 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_eventually(fn ->
       rendered = render(broken_view)
       rendered =~ "Broken task" and rendered =~ "Timeline unavailable" and not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "run deep view disables load more after generic timeline page failure" do
+    manager_name = Module.concat(__MODULE__, RunLiveTimelineLoadMoreUnavailableManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-LOAD-MORE-DOWN/timeline" ->
+          {200,
+           %{
+             items: [%{event_id: "evt-first", summary: "first page"}],
+             next_cursor: "down"
+           }}
+
+        "GET", "/api/v1/runs/MT-LOAD-MORE-DOWN/timeline?cursor=down" ->
+          {503, %{error: %{code: "timeline_unavailable", message: "worker unavailable"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-LOAD-MORE-DOWN", "History down")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-LOAD-MORE-DOWN")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "History down" and rendered =~ "first page" and rendered =~ "Load more"
+    end)
+
+    render_click(view, "load_more_timeline")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "History down" and rendered =~ "first page" and
+        rendered =~ "Timeline load more failed" and not String.contains?(rendered, "Load more")
     end)
   end
 
@@ -4213,6 +4429,31 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
     |> Floki.text()
     |> String.trim()
+  end
+
+  defp run_live_project_registry(issue_identifier, title) do
+    %StaticProjectRegistry{
+      entries: [
+        %{
+          project_id: "alpha",
+          project_name: "Alpha",
+          validation_result: :valid,
+          validation_errors: [],
+          runtime_state: %{
+            status: :running,
+            run_summaries: [
+              %{
+                issue_identifier: issue_identifier,
+                title: title,
+                linear_state: "In Progress",
+                current_phase: "codex_waiting_next_event",
+                health: "normal"
+              }
+            ]
+          }
+        }
+      ]
+    }
   end
 
   defp find_section_by_title(document, title) do
