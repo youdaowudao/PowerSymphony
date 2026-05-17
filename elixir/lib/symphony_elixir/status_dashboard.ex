@@ -1257,7 +1257,7 @@ defmodule SymphonyElixir.StatusDashboard do
         usage_text -> " (#{usage_text})"
       end
 
-    "turn completed (#{status})#{usage_suffix}"
+    "turn completed (#{status}, pending finalization)#{usage_suffix}"
   end
 
   defp humanize_codex_method("turn/failed", payload) do

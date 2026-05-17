@@ -317,10 +317,12 @@ defmodule SymphonyElixir.RunTrace do
   end
 
   defp timeline_status_markers(event) do
+    source = Map.get(event, "source")
     event_type = Map.get(event, "event_type")
 
     []
-    |> maybe_add_timeline_marker(event_type in ["turn_completed", "run_result"], "completed")
+    |> maybe_add_timeline_marker(source == "codex" and event_type == "turn_completed", "pending_finalization")
+    |> maybe_add_timeline_marker(event_type == "run_result", "completed")
     |> maybe_add_timeline_marker(event_type in ["tool_call_failed", "unsupported_tool_call", "turn_input_required"], "attention")
     |> maybe_add_timeline_marker(event_type == "session_started", "session_started")
   end
