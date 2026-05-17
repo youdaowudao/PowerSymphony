@@ -231,22 +231,20 @@ defmodule SymphonyElixir.Workspace do
     safe_id = safe_identifier(identifier)
 
     case workspace_path_for_issue(safe_id, worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
+      {:ok, workspace} ->
+        remove_legacy_issue_workspace(identifier, workspace, worker_host)
+
+      {:error, _reason} ->
+        :ok
     end
 
     :ok
   end
 
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
-    safe_id = safe_identifier(identifier)
-
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        case workspace_path_for_issue(safe_id, nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
+        remove_local_issue_workspace(identifier)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
@@ -257,6 +255,30 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
+  end
+
+  defp remove_local_issue_workspace(identifier) when is_binary(identifier) do
+    safe_id = safe_identifier(identifier)
+
+    case workspace_path_for_issue(safe_id, nil) do
+      {:ok, workspace} -> remove_legacy_issue_workspace(identifier, workspace, nil)
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp remove_legacy_issue_workspace(identifier, workspace, worker_host)
+       when is_binary(identifier) and is_binary(workspace) do
+    if lifecycle_metadata_present?(workspace, worker_host) do
+      cleanup_issue_workspace(identifier,
+        worker_host: worker_host,
+        mode: :terminal_cleanup,
+        delete_evidence: :no_live_owner,
+        closing_reason: "legacy_remove_issue_workspaces"
+      )
+    else
+      remove(workspace, worker_host)
+      :ok
+    end
   end
 
   @spec cleanup_issue_workspace(String.t(), keyword()) :: :ok
@@ -658,20 +680,33 @@ defmodule SymphonyElixir.Workspace do
          delete_evidence
        ) do
     binding = read_optional_json(resource_binding_path(workspace), worker_host)
+    invalidation = read_optional_json(invalidation_record_path(workspace), worker_host)
     workspace_exists? = workspace_present?(workspace, worker_host)
 
     cond do
       active_binding_owned_by_other_run?(binding, run_instance_id) ->
+        if mode == :startup_sweep do
+          maybe_record_startup_reap_candidate(
+            workspace,
+            identifier,
+            worker_host,
+            run_instance_id,
+            binding,
+            invalidation,
+            delete_evidence
+          )
+        end
+
         :ok
 
       workspace_exists? and mode == :startup_sweep ->
-        maybe_delete_workspace(
+        handle_startup_sweep_cleanup(
           workspace,
           identifier,
           worker_host,
-          mode,
           run_instance_id,
           binding,
+          invalidation,
           delete_evidence
         )
 
@@ -703,12 +738,13 @@ defmodule SymphonyElixir.Workspace do
           mode,
           run_instance_id,
           closing_binding,
+          invalidation,
           delete_evidence
         )
 
         :ok
 
-      delete_allowed?(mode, binding, delete_evidence) ->
+      delete_allowed?(mode, binding, invalidation, delete_evidence) ->
         maybe_delete_workspace(
           workspace,
           identifier,
@@ -716,6 +752,7 @@ defmodule SymphonyElixir.Workspace do
           mode,
           run_instance_id,
           binding,
+          invalidation,
           delete_evidence
         )
 
@@ -726,36 +763,130 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_delete_workspace(workspace, identifier, worker_host, mode, run_instance_id, binding, delete_evidence) do
-    if delete_allowed?(mode, binding, delete_evidence) do
-      write_resource_binding(
-        merge_removed_pending_resource_binding(binding, workspace, identifier, worker_host, run_instance_id),
+  defp handle_startup_sweep_cleanup(
+         workspace,
+         identifier,
+         worker_host,
+         run_instance_id,
+         binding,
+         invalidation,
+         delete_evidence
+       ) do
+    if delete_allowed?(:startup_sweep, binding, invalidation, delete_evidence) do
+      handle_authorized_startup_sweep_cleanup(
         workspace,
-        worker_host
-      )
-
-      write_invalidation_record(
-        workspace,
+        identifier,
         worker_host,
-        build_invalidation_record(binding, identifier, run_instance_id, workspace, worker_host, "workspace_removed")
+        run_instance_id,
+        binding,
+        invalidation,
+        delete_evidence
       )
-
-      remove(workspace, worker_host)
-      clear_invalidation_record(workspace, worker_host)
     else
-      :ok
+      maybe_record_startup_reap_candidate(
+        workspace,
+        identifier,
+        worker_host,
+        run_instance_id,
+        binding,
+        invalidation,
+        delete_evidence
+      )
     end
   end
 
-  defp delete_allowed?(:startup_sweep, binding, delete_evidence),
-    do: removed_pending_binding?(binding) and delete_evidence == :startup_no_live_owner
+  defp handle_authorized_startup_sweep_cleanup(
+         workspace,
+         identifier,
+         worker_host,
+         run_instance_id,
+         binding,
+         invalidation,
+         delete_evidence
+       ) do
+    deleted? =
+      maybe_delete_workspace(
+        workspace,
+        identifier,
+        worker_host,
+        :startup_sweep,
+        run_instance_id,
+        binding,
+        invalidation,
+        delete_evidence
+      )
 
-  defp delete_allowed?(:terminal_cleanup, binding, delete_evidence),
+    if not deleted? do
+      write_invalidation_record(
+        workspace,
+        worker_host,
+        build_invalidation_record(
+          binding,
+          identifier,
+          run_instance_id,
+          workspace,
+          worker_host,
+          "startup_reap_ambiguous"
+        )
+      )
+    end
+  end
+
+  defp maybe_delete_workspace(
+         workspace,
+         identifier,
+         worker_host,
+         mode,
+         run_instance_id,
+         binding,
+         invalidation,
+         delete_evidence
+       ) do
+    if delete_allowed?(mode, binding, invalidation, delete_evidence) do
+      prepare_workspace_for_delete(workspace, identifier, worker_host, mode, run_instance_id, binding)
+      remove_workspace_with_cleanup(workspace, worker_host)
+    else
+      false
+    end
+  end
+
+  defp prepare_workspace_for_delete(workspace, identifier, worker_host, :startup_sweep, run_instance_id, binding) do
+    removed_pending_binding =
+      merge_removed_pending_resource_binding(binding, workspace, identifier, worker_host, run_instance_id)
+
+    write_resource_binding(removed_pending_binding, workspace, worker_host)
+
+    write_invalidation_record(
+      workspace,
+      worker_host,
+      build_invalidation_record(binding, identifier, run_instance_id, workspace, worker_host, "workspace_removed")
+    )
+  end
+
+  defp prepare_workspace_for_delete(_workspace, _identifier, _worker_host, _mode, _run_instance_id, _binding), do: :ok
+
+  defp remove_workspace_with_cleanup(workspace, worker_host) do
+    case remove(workspace, worker_host) do
+      {:ok, _} ->
+        clear_invalidation_record(workspace, worker_host)
+        true
+
+      {:error, _reason, _output} ->
+        false
+    end
+  end
+
+  defp delete_allowed?(:startup_sweep, binding, invalidation, delete_evidence),
+    do:
+      delete_evidence == :startup_no_live_owner and
+        startup_reap_evidence?(binding, invalidation)
+
+  defp delete_allowed?(:terminal_cleanup, binding, _invalidation, delete_evidence),
     do: removable_binding_state?(binding) and delete_evidence in [:no_live_owner, :task_down_confirmed]
 
-  defp delete_allowed?(_mode, _binding, _delete_evidence), do: false
+  defp delete_allowed?(_mode, _binding, _invalidation, _delete_evidence), do: false
 
-  defp removable_binding_state?(%{"state" => state}) when state in ["closing", "removed-pending"],
+  defp removable_binding_state?(%{"state" => state}) when state in ["active", "closing", "removed-pending"],
     do: true
 
   defp removable_binding_state?(_binding), do: false
@@ -776,7 +907,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp resource_binding_takeover_allowed?(%{"state" => "closing"} = binding, invalidation, run_instance_id) do
     same_run_instance_id?(Map.get(binding, "run_instance_id"), run_instance_id) or
-      stale_closing_binding?(binding, invalidation)
+      false_closing_takeover_guard(binding, invalidation)
   end
 
   defp resource_binding_takeover_allowed?(%{"state" => "removed-pending"} = binding, invalidation, run_instance_id) do
@@ -787,22 +918,59 @@ defmodule SymphonyElixir.Workspace do
   defp resource_binding_takeover_allowed?(_binding, _invalidation, _run_instance_id), do: false
 
   defp stale_removed_binding?(binding, invalidation) when is_map(binding) and is_map(invalidation) do
-    Map.get(invalidation, "reason") == "workspace_removed" and
-      Map.get(invalidation, "issue_identifier") == Map.get(binding, "issue_identifier") and
-      Map.get(invalidation, "workspace_path") == Map.get(binding, "workspace_path")
+    Map.get(binding, "state") == "removed-pending" and
+      matching_invalidation_scope?(binding, invalidation) and
+      Map.get(invalidation, "reason") == "workspace_removed"
   end
 
   defp stale_removed_binding?(_binding, _invalidation), do: false
 
-  defp stale_closing_binding?(binding, invalidation) when is_map(binding) and is_map(invalidation) do
-    Map.get(binding, "state") == "closing" and
-      Map.get(invalidation, "reason") == "workspace_removed" and
-      Map.get(invalidation, "issue_identifier") == Map.get(binding, "issue_identifier") and
+  defp matching_invalidation_scope?(binding, invalidation) do
+    Map.get(invalidation, "issue_identifier") == Map.get(binding, "issue_identifier") and
       Map.get(invalidation, "run_instance_id") == Map.get(binding, "run_instance_id") and
       Map.get(invalidation, "workspace_path") == Map.get(binding, "workspace_path")
   end
 
-  defp stale_closing_binding?(_binding, _invalidation), do: false
+  defp startup_reap_evidence?(binding, invalidation) do
+    removed_pending_binding?(binding) and
+      matching_invalidation_scope?(binding, invalidation) and
+      Map.get(invalidation, "reason") == "workspace_removed"
+  end
+
+  defp lifecycle_metadata_present?(workspace, worker_host) do
+    is_map(read_optional_json(resource_binding_path(workspace), worker_host)) or
+      is_map(read_optional_json(invalidation_record_path(workspace), worker_host))
+  end
+
+  defp maybe_record_startup_reap_candidate(
+         workspace,
+         identifier,
+         worker_host,
+         run_instance_id,
+         binding,
+         invalidation,
+         delete_evidence
+       ) do
+    if delete_evidence == :startup_no_live_owner and removable_binding_state?(binding) and
+         not delete_allowed?(:startup_sweep, binding, invalidation, delete_evidence) do
+      write_invalidation_record(
+        workspace,
+        worker_host,
+        build_invalidation_record(
+          binding,
+          identifier,
+          run_instance_id,
+          workspace,
+          worker_host,
+          "startup_reap_ambiguous"
+        )
+      )
+    else
+      :ok
+    end
+  end
+
+  defp false_closing_takeover_guard(_binding, _invalidation), do: false
 
   defp same_run_instance_id?(binding_run_instance_id, run_instance_id)
        when is_binary(binding_run_instance_id) and is_binary(run_instance_id) do

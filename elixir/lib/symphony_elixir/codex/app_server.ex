@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @turn_interrupt_id 4
+  @thread_resume_id 5
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -419,7 +420,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+
+        finalize_completed_turn(
+          port,
+          on_message,
+          tool_executor,
+          auto_approve_requests,
+          thread_id,
+          turn_id
+        )
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -512,6 +521,85 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_id
         )
     end
+  end
+
+  defp finalize_completed_turn(
+         port,
+         on_message,
+         _tool_executor,
+         _auto_approve_requests,
+         thread_id,
+         turn_id
+       ) do
+    case resume_thread(port, thread_id) do
+      {:ok, %{"thread" => thread_payload}} ->
+        finalize_completed_turn_from_thread(thread_payload, turn_id, on_message, port)
+
+      {:error, {:response_error, _} = reason} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp finalize_completed_turn_from_thread(thread_payload, turn_id, on_message, port)
+       when is_map(thread_payload) and is_binary(turn_id) do
+    turns = Map.get(thread_payload, "turns", [])
+
+    case Enum.find(turns, &(Map.get(&1, "id") == turn_id)) do
+      %{"status" => "completed"} ->
+        {:ok, :turn_completed}
+
+      %{"status" => "interrupted"} = turn ->
+        params = interrupted_turn_params(turn)
+        emit_resume_barrier_terminal_event(on_message, :turn_cancelled, params, port)
+        {:error, {:turn_cancelled, params}}
+
+      %{"status" => "failed"} = turn ->
+        params = failed_turn_params(turn)
+        emit_resume_barrier_terminal_event(on_message, :turn_failed, params, port)
+        {:error, {:turn_failed, params}}
+
+      %{"status" => "inProgress"} ->
+        {:error, {:turn_not_finalized, turn_id}}
+
+      nil ->
+        {:error, {:turn_missing_from_resume, turn_id}}
+
+      turn ->
+        {:error, {:unexpected_turn_status, Map.get(turn, "status"), turn_id}}
+    end
+  end
+
+  defp emit_resume_barrier_terminal_event(on_message, event, params, port) do
+    payload = %{"method" => terminal_method_for_event(event), "params" => params}
+    emit_turn_event(on_message, event, payload, Jason.encode!(payload), port, params)
+  end
+
+  defp terminal_method_for_event(:turn_cancelled), do: "turn/cancelled"
+  defp terminal_method_for_event(:turn_failed), do: "turn/failed"
+
+  defp interrupted_turn_params(%{"error" => %{"message" => message}}) when is_binary(message),
+    do: %{"message" => message}
+
+  defp interrupted_turn_params(_turn), do: %{"message" => "turn interrupted"}
+
+  defp failed_turn_params(%{"error" => %{"message" => message}}) when is_binary(message),
+    do: %{"message" => message}
+
+  defp failed_turn_params(_turn), do: %{"message" => "turn failed"}
+
+  defp resume_thread(port, thread_id) when is_port(port) and is_binary(thread_id) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => %{
+        "threadId" => thread_id
+      }
+    })
+
+    await_response(port, @thread_resume_id)
   end
 
   defp interrupt_turn(port, on_message, run_instance_id, reason, thread_id, turn_id) do
