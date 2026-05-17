@@ -35,6 +35,19 @@ skills can make raw Linear GraphQL calls.
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
+Current workflow principles are intentionally stricter than the older multi-reviewer defaults:
+
+- implementation now defaults to a `1+2` collaboration model: one main thread, one implementation
+  subagent, and one zero-context reviewer
+- the document phase must leave a fixed output, then enter `spec freeze`; after that, only one
+  reviewer-triggered focused recheck is allowed
+- `Change Review` and `Push Readiness` are separate reviewer outputs; `Push Readiness` only states
+  whether the next push is allowed and what minimum proof is still missing
+- the live execution board stays only in Linear issue body `## Codex Workpad`, including `Status Board`
+  and `Flow Metrics`; repo docs define the boundary but do not mirror live values
+- in-flight risk gates are conditional, not universal; they trigger only when the diff hits riskier
+  paths such as typed/core, integration, state-machine, concurrency, or similar boundaries
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see

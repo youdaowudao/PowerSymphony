@@ -40,6 +40,7 @@
 - closeout gate 要求
 - 远端 full gate 要求
 - 高风险路径是否有额外验证要求
+- 是否存在条件触发的中途风险门，以及它只回答什么
 
 ## 高风险路径补充约束
 
@@ -55,8 +56,12 @@
 ## 多 Agent 协作规则
 
 - 是否要求 reviewer
-- 是否采用固定协作模式
+- 是否采用固定协作模式，例如默认 `1+2`、例外 `1+1`
+- reviewer 固定输出是否包含 `Change Review` 与 `Push Readiness`
 - 什么时候必须停止当前线程并请求帮助
+- `Push Readiness` 是否只回答“能否 push / 最小缺口”
+- 文档阶段是否有 `spec freeze` 与一次 reviewer 触发的定点补查
+- 活状态板与流程指标是否只允许写在 issue body / `## Codex Workpad`
 
 ## 填充完成检查
 
