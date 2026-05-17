@@ -146,6 +146,35 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec project_run_context_payload(String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error, :project_not_found | :run_not_found | :duplicate_run | :context_unavailable}
+  def project_run_context_payload(project_id, issue_identifier)
+      when is_binary(project_id) and is_binary(issue_identifier) do
+    with {:ok, _project_payload} <- Presenter.project_summary_payload(project_id, project_registry()),
+         {:ok, body} <- project_worker_request(project_id, context_path(issue_identifier)) do
+      {:ok, Presenter.run_context_payload(body)}
+    else
+      {:error, :project_not_found} ->
+        {:error, :project_not_found}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "run_not_found"}}}} ->
+        {:error, :run_not_found}
+
+      {:error, {:worker_status, 409, %{"error" => %{"code" => "duplicate_run"}}}} ->
+        {:error, :duplicate_run}
+
+      {:error, {:worker_status, 503, %{"error" => %{"code" => "context_unavailable"}}}} ->
+        {:error, :context_unavailable}
+
+      {:error, {:worker_status, _status, _body}} ->
+        {:error, :context_unavailable}
+
+      {:error, _reason} ->
+        {:error, :context_unavailable}
+    end
+  end
+
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
     if control_plane_mode?() do
@@ -267,6 +296,37 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec run_context(Conn.t(), map()) :: Conn.t()
+  def run_context(conn, %{"issue_identifier" => issue_identifier}) do
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case SymphonyElixir.Orchestrator.run_context_summary(
+             orchestrator(),
+             issue_identifier,
+             timeout: snapshot_timeout_ms()
+           ) do
+        {:ok, payload} ->
+          json(conn, Presenter.run_context_payload(payload))
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run context not found")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :context_unavailable} ->
+          error_response(conn, 503, "context_unavailable", "Run context is unavailable")
+
+        :timeout ->
+          error_response(conn, 503, "context_unavailable", "Run context is unavailable")
+
+        :unavailable ->
+          error_response(conn, 503, "context_unavailable", "Run context is unavailable")
+      end
+    end
+  end
+
   @spec projects(Conn.t(), map()) :: Conn.t()
   def projects(conn, _params) do
     json(conn, Presenter.projects_payload(project_registry()))
@@ -369,6 +429,30 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
         result ->
           run_event_surface_response(conn, result)
+      end
+    else
+      control_plane_not_available(conn)
+    end
+  end
+
+  @spec project_run_context(Conn.t(), map()) :: Conn.t()
+  def project_run_context(conn, %{"project_id" => project_id, "issue_identifier" => issue_identifier}) do
+    if control_plane_mode?() do
+      case project_run_context_payload(project_id, issue_identifier) do
+        {:ok, payload} ->
+          json(conn, payload)
+
+        {:error, :project_not_found} ->
+          error_response(conn, 404, "project_not_found", "Project not found")
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run context not found")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :context_unavailable} ->
+          error_response(conn, 503, "context_unavailable", "Run context is unavailable")
       end
     else
       control_plane_not_available(conn)
@@ -582,6 +666,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp timeline_path(issue_identifier, cursor) do
     "/api/v1/runs/#{URI.encode(issue_identifier, &URI.char_unreserved?/1)}/timeline#{timeline_query_string(cursor)}"
+  end
+
+  defp context_path(issue_identifier) do
+    "/api/v1/runs/#{URI.encode(issue_identifier, &URI.char_unreserved?/1)}/context"
   end
 
   defp event_detail_path(issue_identifier, event_id) do

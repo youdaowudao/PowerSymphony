@@ -115,6 +115,28 @@ defmodule SymphonyElixir.RunStateStore do
     end
   end
 
+  @spec context_summary_for_running_entries([map()], String.t()) ::
+          {:ok, map()} | {:error, :run_not_found | :duplicate_run | :context_unavailable}
+  def context_summary_for_running_entries(entries, issue_identifier)
+      when is_list(entries) and is_binary(issue_identifier) do
+    with {:ok, entry, trace} <- current_trace_for_issue(entries, issue_identifier),
+         {:ok, context} <-
+           RunTrace.context_summary(
+             trace,
+             run_instance_id: Map.get(entry, :run_instance_id),
+             session_id: Map.get(entry, :session_id),
+             thread_id: Map.get(entry, :thread_id),
+             turn_id: Map.get(entry, :turn_id),
+             turn_count: Map.get(entry, :turn_count)
+           ) do
+      {:ok, context}
+    else
+      {:error, :run_not_found} -> {:error, :run_not_found}
+      {:error, :duplicate_run} -> {:error, :duplicate_run}
+      {:error, _reason} -> {:error, :context_unavailable}
+    end
+  end
+
   defp finalize_summary(summary, events, opts) do
     config = Config.settings!()
     now = Keyword.get(opts, :now, DateTime.utc_now())

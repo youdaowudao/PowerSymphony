@@ -5,7 +5,7 @@ defmodule SymphonyElixir.RunTrace do
 
   require Logger
 
-  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore}
+  alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore, StatusDashboard}
   @surface_names ~w(raw payload prompt shell)
   @preview_limit_bytes 512
   @surface_limit_bytes 4096
@@ -276,8 +276,358 @@ defmodule SymphonyElixir.RunTrace do
     end
   end
 
+  @spec context_summary(t(), keyword()) :: {:ok, map()} | {:error, :context_unavailable}
+  def context_summary(%__MODULE__{} = trace, opts \\ []) when is_list(opts) do
+    run_instance_id = Keyword.get(opts, :run_instance_id)
+    session_id = Keyword.get(opts, :session_id)
+    thread_id = Keyword.get(opts, :thread_id)
+    turn_id = Keyword.get(opts, :turn_id)
+    turn_count = Keyword.get(opts, :turn_count)
+
+    events =
+      trace.trace_file
+      |> read_context_events()
+      |> filter_context_generation(run_instance_id)
+
+    {:ok,
+     build_context_summary(events, %{
+       session_id: session_id,
+       thread_id: thread_id,
+       turn_id: turn_id,
+       turn_count: turn_count
+     })}
+  rescue
+    _error ->
+      {:error, :context_unavailable}
+  end
+
   defp maybe_take_timeline_prefix(stream, nil), do: stream
   defp maybe_take_timeline_prefix(stream, cursor_line) when is_integer(cursor_line), do: Stream.take(stream, cursor_line)
+
+  defp read_context_events(trace_file) when is_binary(trace_file) do
+    if File.exists?(trace_file) do
+      trace_file
+      |> File.stream!(:line, [])
+      |> Enum.map(fn line ->
+        line
+        |> String.trim_trailing("\n")
+        |> Jason.decode!()
+        |> Map.put("__trace_run_dir__", Path.dirname(trace_file))
+      end)
+    else
+      []
+    end
+  end
+
+  defp filter_context_generation(events, run_instance_id) when is_binary(run_instance_id) do
+    Enum.filter(events, &(Map.get(&1, "run_instance_id") == run_instance_id))
+  end
+
+  defp filter_context_generation(events, _run_instance_id), do: events
+
+  defp build_context_summary(events, anchor) do
+    %{
+      anchor: build_context_anchor(events, anchor),
+      conversation: build_conversation_summary(events),
+      continuation: build_continuation_summary(events),
+      tools: %{items: build_tool_items(events)},
+      shell: %{items: build_shell_items(events)},
+      subagents: build_subagent_summary(events)
+    }
+  end
+
+  defp build_context_anchor(_events, anchor) when is_map(anchor) do
+    %{
+      session_id: Map.get(anchor, :session_id),
+      thread_id: Map.get(anchor, :thread_id),
+      turn_id: Map.get(anchor, :turn_id),
+      turn_count: normalize_turn_count(Map.get(anchor, :turn_count))
+    }
+  end
+
+  defp normalize_turn_count(value) when is_integer(value), do: value
+  defp normalize_turn_count(_value), do: nil
+
+  defp build_conversation_summary(events) do
+    items =
+      events
+      |> Enum.flat_map(&conversation_item/1)
+      |> Enum.take(-3)
+      |> Enum.reverse()
+
+    %{
+      items: items,
+      truncated: false
+    }
+  end
+
+  defp conversation_item(event) do
+    payload = event_payload(event)
+    method = map_path(payload, ["method"])
+    event_id = Map.get(event, "event_id")
+
+    case method do
+      "item/reasoning/summaryTextDelta" ->
+        with text when is_binary(text) <- map_path(payload, ["params", "summaryText"]),
+             trimmed when trimmed != "" <- String.trim(text) do
+          [
+            %{
+              event_id: event_id,
+              kind: "reasoning_summary",
+              label: "reasoning",
+              text: render_surface(trimmed, 160).content
+            }
+          ]
+        else
+          _ -> []
+        end
+
+      "item/reasoning/textDelta" ->
+        with text when is_binary(text) <- map_path(payload, ["params", "textDelta"]),
+             trimmed when trimmed != "" <- String.trim(text) do
+          [
+            %{
+              event_id: event_id,
+              kind: "reasoning_text",
+              label: "reasoning",
+              text: render_surface(trimmed, 160).content
+            }
+          ]
+        else
+          _ -> []
+        end
+
+      method when method in ["item/tool/requestUserInput", "tool/requestUserInput"] ->
+        case stable_user_input_text(payload) do
+          text when is_binary(text) ->
+            [
+              %{
+                event_id: event_id,
+                kind: "user_input_request",
+                label: "tool input request",
+                text: render_surface(text, 160).content
+              }
+            ]
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp stable_user_input_text(payload) do
+    map_path(payload, ["params", "question"]) ||
+      map_path(payload, ["params", "prompt"]) ||
+      first_question_text(map_path(payload, ["params", "questions"]))
+  end
+
+  defp first_question_text(questions) when is_list(questions) do
+    Enum.find_value(questions, fn question ->
+      case map_path(question, ["question"]) do
+        text when is_binary(text) and text != "" -> text
+        _ -> nil
+      end
+    end)
+  end
+
+  defp first_question_text(_questions), do: nil
+
+  defp build_continuation_summary(events) do
+    continuation_required =
+      Enum.find(events, fn event ->
+        Map.get(event, "event_type") == "run_result" and
+          map_path(event_payload(event), ["status"]) == "continuation_required"
+      end)
+
+    checking_recheck =
+      Enum.find(events, fn event ->
+        Map.get(event, "event_type") == "retry_scheduled" and
+          map_path(event_payload(event), ["delay_type"]) == "checking_recheck"
+      end)
+
+    retry_scheduled =
+      Enum.find(events, &(Map.get(&1, "event_type") == "retry_scheduled"))
+
+    cond do
+      is_map(continuation_required) ->
+        %{
+          status: "continuation_required",
+          label: "continuation required",
+          event_id: Map.get(continuation_required, "event_id")
+        }
+
+      is_map(checking_recheck) ->
+        %{
+          status: "checking_recheck",
+          label: "checking recheck",
+          event_id: Map.get(checking_recheck, "event_id")
+        }
+
+      is_map(retry_scheduled) ->
+        %{
+          status: "retry_scheduled",
+          label: "retry scheduled",
+          event_id: Map.get(retry_scheduled, "event_id")
+        }
+
+      true ->
+        %{
+          status: "none_observed",
+          label: "none observed",
+          event_id: nil
+        }
+    end
+  end
+
+  defp build_tool_items(events) do
+    events
+    |> Enum.flat_map(&tool_item/1)
+    |> Enum.take(-3)
+    |> Enum.reverse()
+  end
+
+  defp tool_item(event) do
+    event_type = Map.get(event, "event_type")
+    payload = event_payload(event)
+    method = map_path(payload, ["method"])
+    tool = dynamic_tool_name(payload)
+
+    cond do
+      event_type in ["tool_call_completed", "tool_call_failed", "unsupported_tool_call"] ->
+        [
+          %{
+            event_id: Map.get(event, "event_id"),
+            tool: tool,
+            status: tool_event_status(event_type),
+            summary: tool_event_summary(event_type, tool)
+          }
+        ]
+
+      method == "item/tool/call" ->
+        [
+          %{
+            event_id: Map.get(event, "event_id"),
+            tool: tool,
+            status: "completed",
+            summary: StatusDashboard.humanize_codex_message(%{payload: payload})
+          }
+        ]
+
+      true ->
+        []
+    end
+  end
+
+  defp tool_event_status("tool_call_completed"), do: "completed"
+  defp tool_event_status("tool_call_failed"), do: "failed"
+  defp tool_event_status("unsupported_tool_call"), do: "failed"
+  defp tool_event_status(_event_type), do: "completed"
+
+  defp tool_event_summary("tool_call_completed", tool), do: dynamic_tool_summary("dynamic tool call completed", tool)
+  defp tool_event_summary("tool_call_failed", tool), do: dynamic_tool_summary("dynamic tool call failed", tool)
+
+  defp tool_event_summary("unsupported_tool_call", tool),
+    do: dynamic_tool_summary("unsupported dynamic tool call rejected", tool)
+
+  defp tool_event_summary(_event_type, tool), do: dynamic_tool_summary("dynamic tool call", tool)
+
+  defp dynamic_tool_summary(base, tool) when is_binary(tool) do
+    trimmed = String.trim(tool)
+    if trimmed == "", do: base, else: "#{base} (#{trimmed})"
+  end
+
+  defp dynamic_tool_summary(base, _tool), do: base
+
+  defp build_shell_items(events) do
+    events
+    |> Enum.flat_map(&shell_item/1)
+    |> Enum.take(-3)
+    |> Enum.reverse()
+  end
+
+  defp shell_item(event) do
+    payload = event_payload(event)
+    method = map_path(payload, ["method"])
+    event_id = Map.get(event, "event_id")
+
+    case method do
+      "item/commandExecution/outputDelta" ->
+        with text when is_binary(text) <- map_path(payload, ["params", "outputDelta"]),
+             trimmed when trimmed != "" <- String.trim(text) do
+          [%{event_id: event_id, kind: "command_output", text: render_surface(trimmed, 160).content}]
+        else
+          _ -> []
+        end
+
+      "codex/event/exec_command_begin" ->
+        [
+          %{
+            event_id: event_id,
+            kind: "exec_command",
+            text: StatusDashboard.humanize_codex_message(%{payload: payload})
+          }
+        ]
+
+      "codex/event/exec_command_end" ->
+        [
+          %{
+            event_id: event_id,
+            kind: "exec_command",
+            text: StatusDashboard.humanize_codex_message(%{payload: payload})
+          }
+        ]
+
+      _ ->
+        case map_path(payload, ["params", "tool"]) do
+          "shell" ->
+            [
+              %{
+                event_id: event_id,
+                kind: "command",
+                text: StatusDashboard.humanize_codex_message(%{payload: payload})
+              }
+            ]
+
+          _ ->
+            []
+        end
+    end
+  end
+
+  defp build_subagent_summary([]), do: %{items: [], status: "unavailable"}
+
+  defp build_subagent_summary(_events), do: %{items: [], status: "none_observed"}
+
+  defp event_payload(event) do
+    case Map.get(event, "payload_ref") do
+      ref when is_binary(ref) ->
+        event
+        |> Map.get("__trace_run_dir__")
+        |> Path.join(ref)
+        |> File.read!()
+        |> Jason.decode!()
+        |> payload_from_bundle()
+
+      _ ->
+        payload_from_bundle(event)
+    end
+  rescue
+    _error ->
+      %{}
+  end
+
+  defp payload_from_bundle(%{"payload" => payload}), do: payload
+  defp payload_from_bundle(%{payload: payload}), do: payload
+  defp payload_from_bundle(%{} = payload), do: payload
+  defp payload_from_bundle(_payload), do: %{}
+
+  defp dynamic_tool_name(payload) do
+    map_path(payload, ["params", "tool"]) ||
+      map_path(payload, ["params", "name"])
+  end
 
   defp push_recent_timeline_line(window, line, limit) do
     [line | window]
