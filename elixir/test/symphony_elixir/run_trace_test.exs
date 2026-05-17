@@ -290,6 +290,615 @@ defmodule SymphonyElixir.RunTraceTest do
     end
   end
 
+  test "context summary aggregates only the current generation with lightweight capped sections" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-1", identifier: "MT-CONTEXT-1", title: "Context summary", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      base_time = ~U[2026-05-17 01:00:00Z]
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-old",
+        thread_id: "thread-old",
+        turn_id: "turn-old",
+        session_id: "thread-old-turn-old",
+        timestamp: base_time,
+        payload: %{
+          "method" => "item/reasoning/summaryTextDelta",
+          "params" => %{"summaryText" => "legacy reasoning should not leak"}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 1, :second)
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{
+          "method" => "item/reasoning/summaryTextDelta",
+          "params" => %{"summaryText" => "compare retry paths"}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 3, :second),
+        payload: %{
+          "method" => "item/reasoning/textDelta",
+          "params" => %{"textDelta" => repeated_text("reasoning stream ", 20)}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 4, :second),
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{
+            "question" => "Primary question?",
+            "prompt" => "Fallback prompt",
+            "questions" => [%{"question" => "Array prompt"}]
+          }
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :tool_call_completed,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 5, :second),
+        payload: %{"method" => "item/tool/call", "params" => %{"tool" => "shell", "command" => "git status --short"}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :tool_call_failed,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 6, :second),
+        payload: %{"method" => "item/tool/call", "params" => %{"tool" => "web.search"}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 7, :second),
+        payload: %{
+          "method" => "item/commandExecution/outputDelta",
+          "params" => %{"command" => "mix test", "outputDelta" => "2 tests, 0 failures"}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 8, :second),
+        payload: %{
+          "method" => "codex/event/exec_command_begin",
+          "params" => %{"msg" => %{"command" => "git status --short"}}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 9, :second),
+        payload: %{
+          "method" => "codex/event/exec_command_end",
+          "params" => %{"msg" => %{"exit_code" => 0}}
+        }
+      })
+
+      RunTrace.record(trace, :agent_runner, %{
+        event: :run_result,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 10, :second),
+        payload: %{"status" => "continuation_required", "reason" => "issue_still_active", "turn_count" => 4}
+      })
+
+      assert {:ok, summary} =
+               RunTrace.context_summary(
+                 trace,
+                 run_instance_id: "run-current",
+                 session_id: "thread-current-turn-current",
+                 thread_id: "thread-current",
+                 turn_id: "turn-current",
+                 turn_count: 4
+               )
+
+      assert summary.anchor == %{
+               session_id: "thread-current-turn-current",
+               thread_id: "thread-current",
+               turn_id: "turn-current",
+               turn_count: 4
+             }
+
+      assert Enum.count(summary.conversation.items) == 3
+      assert hd(summary.conversation.items).kind == "user_input_request"
+      assert hd(summary.conversation.items).label == "tool input request"
+      assert hd(summary.conversation.items).text == "Primary question?"
+      assert Enum.all?(summary.conversation.items, &is_binary(&1.event_id))
+      assert Enum.any?(summary.conversation.items, &(&1.kind == "reasoning_summary" and &1.text == "compare retry paths"))
+
+      reasoning_text_item = Enum.find(summary.conversation.items, &(&1.kind == "reasoning_text"))
+      assert is_binary(reasoning_text_item.text)
+      assert String.length(reasoning_text_item.text) < String.length(repeated_text("reasoning stream ", 20))
+
+      assert summary.conversation.truncated == false
+
+      assert summary.continuation == %{
+               status: "continuation_required",
+               label: "continuation required",
+               event_id: summary.continuation.event_id
+             }
+
+      assert is_binary(summary.continuation.event_id)
+      assert Enum.count(summary.tools.items) == 2
+      assert Enum.map(summary.tools.items, & &1.tool) == ["web.search", "shell"]
+      assert Enum.map(summary.tools.items, & &1.status) == ["failed", "completed"]
+
+      assert Enum.map(summary.tools.items, & &1.summary) == [
+               "dynamic tool call failed (web.search)",
+               "dynamic tool call completed (shell)"
+             ]
+
+      assert Enum.count(summary.shell.items) == 3
+      assert Enum.map(summary.shell.items, & &1.kind) == ["exec_command", "exec_command", "command_output"]
+      assert Enum.any?(summary.shell.items, &(&1.text == "git status --short"))
+      assert Enum.any?(summary.shell.items, &String.contains?(&1.text, "exit 0"))
+      assert Enum.any?(summary.shell.items, &String.contains?(&1.text, "2 tests, 0 failures"))
+
+      assert summary.subagents == %{items: [], status: "none_observed"}
+
+      flattened = inspect(summary)
+      refute flattened =~ "legacy reasoning should not leak"
+      refute flattened =~ "\"payload\""
+      refute flattened =~ "\"raw_payload\""
+      refute flattened =~ "\"surfaces\""
+      refute flattened =~ "\"cursor\""
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary does not infer subagent activity from arbitrary payload text" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-subagent-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-3", identifier: "MT-CONTEXT-3", title: "Subagent guard", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-subagent-guard",
+        thread_id: "thread-guard",
+        turn_id: "turn-guard",
+        session_id: "thread-guard-turn-guard",
+        timestamp: ~U[2026-05-17 03:30:00Z],
+        payload: %{
+          "method" => "item/reasoning/summaryTextDelta",
+          "params" => %{"summaryText" => "wording mentions subagent but is not a stable trace signal"}
+        }
+      })
+
+      assert {:ok, summary} = RunTrace.context_summary(trace, run_instance_id: "run-subagent-guard")
+      assert summary.subagents == %{items: [], status: "none_observed"}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary prefers continuation and checking retry in the documented order and degrades missing prompts" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-priority-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-2", identifier: "MT-CONTEXT-2", title: "Context priority", state: "Checking"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      base_time = ~U[2026-05-17 02:00:00Z]
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        run_instance_id: "run-checking",
+        thread_id: "thread-checking",
+        turn_id: "turn-checking",
+        session_id: "thread-checking-turn-checking",
+        timestamp: base_time
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-checking",
+        thread_id: "thread-checking",
+        turn_id: "turn-checking",
+        session_id: "thread-checking-turn-checking",
+        timestamp: DateTime.add(base_time, 1, :second),
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"questions" => [%{"header" => "No stable question text"}]}
+        }
+      })
+
+      RunTrace.record(trace, :orchestrator, %{
+        event: :retry_scheduled,
+        run_instance_id: "run-checking",
+        thread_id: "thread-checking",
+        turn_id: "turn-checking",
+        session_id: "thread-checking-turn-checking",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{"delay_type" => "checking_recheck"}
+      })
+
+      assert {:ok, summary} = RunTrace.context_summary(trace, run_instance_id: "run-checking")
+      assert summary.continuation == %{status: "checking_recheck", label: "checking recheck", event_id: summary.continuation.event_id}
+      assert is_binary(summary.continuation.event_id)
+      assert summary.conversation.items == []
+
+      retry_only_trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(retry_only_trace, :orchestrator, %{
+        event: :retry_scheduled,
+        run_instance_id: "run-retry-only",
+        thread_id: "thread-retry",
+        turn_id: "turn-retry",
+        session_id: "thread-retry-turn-retry",
+        timestamp: DateTime.add(base_time, 3, :second),
+        payload: %{"delay_type" => "backoff"}
+      })
+
+      assert {:ok, retry_only} = RunTrace.context_summary(retry_only_trace, run_instance_id: "run-retry-only")
+      assert retry_only.continuation == %{status: "retry_scheduled", label: "retry scheduled", event_id: retry_only.continuation.event_id}
+      assert is_binary(retry_only.continuation.event_id)
+
+      empty_trace = RunTrace.start!(issue, logs_root: logs_root)
+      assert {:ok, empty_summary} = RunTrace.context_summary(empty_trace, run_instance_id: "run-empty")
+      assert empty_summary.continuation == %{status: "none_observed", label: "none observed", event_id: nil}
+      assert empty_summary.tools.items == []
+      assert empty_summary.shell.items == []
+      assert empty_summary.subagents == %{items: [], status: "unavailable"}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary does not infer anchor ids from trace events when anchor opts are missing" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-anchor-no-fallback-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-anchor", identifier: "MT-CONTEXT-ANCHOR", title: "Anchor no fallback", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        run_instance_id: "run-anchor-no-fallback",
+        thread_id: "thread-from-trace",
+        turn_id: "turn-from-trace",
+        session_id: "thread-from-trace-turn-from-trace",
+        timestamp: ~U[2026-05-17 03:30:00Z]
+      })
+
+      assert {:ok, summary} = RunTrace.context_summary(trace, run_instance_id: "run-anchor-no-fallback", turn_count: 5)
+
+      assert summary.anchor == %{
+               session_id: nil,
+               thread_id: nil,
+               turn_id: nil,
+               turn_count: 5
+             }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary covers nil generation filter, question arrays, tool fallback branches, and broken payload refs" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-coverage-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-4", identifier: "MT-CONTEXT-4", title: "Context coverage", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      base_time = ~U[2026-05-17 04:00:00Z]
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-first",
+        thread_id: "thread-first",
+        turn_id: "turn-first",
+        session_id: "thread-first-turn-first",
+        timestamp: base_time,
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"questions" => [%{"question" => "Array question wins"}]}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :tool_call_completed,
+        run_instance_id: "run-second",
+        thread_id: "thread-second",
+        turn_id: "turn-second",
+        session_id: "thread-second-turn-second",
+        timestamp: DateTime.add(base_time, 1, :second),
+        payload: %{"payload" => %{"params" => %{"name" => "linear_graphql"}}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :unsupported_tool_call,
+        run_instance_id: "run-third",
+        thread_id: "thread-third",
+        turn_id: "turn-third",
+        session_id: "thread-third-turn-third",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{payload: %{"params" => %{"tool" => ""}}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-fourth",
+        thread_id: "thread-fourth",
+        turn_id: "turn-fourth",
+        session_id: "thread-fourth-turn-fourth",
+        timestamp: DateTime.add(base_time, 3, :second),
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"questions" => [%{"header" => "missing question"}]}
+        }
+      })
+
+      write_trace_lines!(
+        trace,
+        read_trace_events!(Path.dirname(trace.trace_file)) ++
+          [
+            %{
+              "event_id" => "evt-broken-payload",
+              "timestamp" => "2026-05-17T04:00:05Z",
+              "source" => "codex",
+              "event_type" => "notification",
+              "run_instance_id" => "run-broken",
+              "thread_id" => "thread-broken",
+              "turn_id" => "turn-broken",
+              "session_id" => "thread-broken-turn-broken",
+              "payload_ref" => "payloads/missing.json"
+            }
+          ]
+      )
+
+      assert {:ok, summary} = RunTrace.context_summary(trace)
+
+      assert summary.anchor == %{
+               session_id: nil,
+               thread_id: nil,
+               turn_id: nil,
+               turn_count: nil
+             }
+
+      assert Enum.any?(summary.conversation.items, &(&1.text == "Array question wins"))
+      assert Enum.any?(summary.tools.items, &(&1.tool == "" and &1.status == "failed" and &1.summary == "unsupported dynamic tool call rejected"))
+      assert Enum.any?(summary.tools.items, &(&1.tool == "linear_graphql" and &1.status == "completed" and &1.summary == "dynamic tool call completed (linear_graphql)"))
+      refute Enum.any?(summary.conversation.items, &(&1.event_id == "evt-broken-payload"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary covers fallback helper branches for tools, payload decoding, and empty subagents" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-fallbacks-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-6", identifier: "MT-CONTEXT-6", title: "Fallback helpers", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      base_time = ~U[2026-05-17 05:00:00Z]
+
+      RunTrace.record(nil, :codex, %{"ignored" => true})
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-fallbacks",
+        thread_id: "thread-fallbacks",
+        turn_id: "turn-fallbacks",
+        session_id: "thread-fallbacks-turn-fallbacks",
+        timestamp: base_time,
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"questions" => ["not-a-map"]}
+        }
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-fallbacks",
+        thread_id: "thread-fallbacks",
+        turn_id: "turn-fallbacks",
+        session_id: "thread-fallbacks-turn-fallbacks",
+        timestamp: DateTime.add(base_time, 1, :second),
+        payload: %{payload: %{"method" => "item/tool/call", "params" => %{"name" => 123}}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :unexpected_tool_event,
+        run_instance_id: "run-fallbacks",
+        thread_id: "thread-fallbacks",
+        turn_id: "turn-fallbacks",
+        session_id: "thread-fallbacks-turn-fallbacks",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{payload: %{"method" => "item/tool/call", "params" => %{"tool" => "shell"}}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-fallbacks",
+        thread_id: "thread-fallbacks",
+        turn_id: "turn-fallbacks",
+        session_id: "thread-fallbacks-turn-fallbacks",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{payload: %{"method" => "item/tool/call", "params" => %{tool: "atom-key-tool"}}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-fallbacks",
+        thread_id: "thread-fallbacks",
+        turn_id: "turn-fallbacks",
+        session_id: "thread-fallbacks-turn-fallbacks",
+        timestamp: DateTime.add(base_time, 3, :second),
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"questions" => "not-a-list"}
+        }
+      })
+
+      lines =
+        read_trace_events!(Path.dirname(trace.trace_file)) ++
+          [
+            %{
+              "event_id" => "evt-non-map-payload",
+              "timestamp" => "2026-05-17T05:00:04Z",
+              "source" => "codex",
+              "event_type" => "notification",
+              "run_instance_id" => "run-fallbacks",
+              "thread_id" => "thread-fallbacks",
+              "turn_id" => "turn-fallbacks",
+              "session_id" => "thread-fallbacks-turn-fallbacks",
+              "payload_ref" => "payloads/non_map_payload.json"
+            }
+          ]
+
+      File.write!(Path.join(trace.run_dir, "payloads/non_map_payload.json"), Jason.encode!(["not", "a", "map"]))
+      write_trace_lines!(trace, lines)
+
+      assert {:ok, summary} = RunTrace.context_summary(trace, run_instance_id: "run-fallbacks")
+      assert summary.conversation.items == []
+      assert summary.subagents == %{items: [], status: "none_observed"}
+      assert Enum.any?(summary.tools.items, &(&1.tool == 123 and &1.summary == "dynamic tool call requested"))
+      assert Enum.any?(summary.tools.items, &(&1.tool == "atom-key-tool" and &1.summary == "dynamic tool call requested (atom-key-tool)"))
+      assert Enum.any?(summary.shell.items, &(&1.event_id == "evt-non-map-payload")) == false
+
+      [first_event | _] = read_trace_events!(Path.dirname(trace.trace_file))
+      assert {:error, :surface_not_available} = RunTrace.event_surface(trace, first_event["event_id"], "prompt", run_instance_id: "run-fallbacks")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "event detail redacts atom and non-atom keys in payload surfaces" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-redaction-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-7", identifier: "MT-CONTEXT-7", title: "Redaction", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-redaction",
+        thread_id: "thread-redaction",
+        turn_id: "turn-redaction",
+        session_id: "thread-redaction-turn-redaction",
+        timestamp: ~U[2026-05-17 05:30:00Z],
+        payload: %{
+          method: "item/tool/requestUserInput",
+          params: %{
+            "question" => "Visible question",
+            :authorization => "Bearer secret",
+            123 => "opaque-key"
+          }
+        }
+      })
+
+      [event] = RawEventStore.list_events(trace)
+      assert {:ok, surface} = RunTrace.event_surface(trace, event["event_id"], "payload", run_instance_id: "run-redaction")
+      assert surface.content =~ "[REDACTED]"
+      assert surface.content =~ "opaque-key"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace update does not replace current context when current run_id differs" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-update-other-current-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-trace-update", identifier: "MT-TRACE-UPDATE", title: "Update current mismatch", state: "In Progress"}
+      current_trace = RunTrace.start!(issue, logs_root: logs_root)
+      other_trace = RunTrace.start!(%{issue | id: "issue-trace-update-2", identifier: "MT-TRACE-UPDATE-2"}, logs_root: logs_root)
+
+      RunTrace.with_context(current_trace, fn ->
+        updated = RunTrace.update(other_trace, %{worker_host: "other-worker"})
+        assert updated.worker_host == "other-worker"
+        assert RunTrace.current().run_id == current_trace.run_id
+        assert RunTrace.current().worker_host != "other-worker"
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "event surface returns surface_not_available for events without shell content" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-surface-missing-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-5", identifier: "MT-CONTEXT-5", title: "Surface missing", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-surface-missing",
+        thread_id: "thread-surface",
+        turn_id: "turn-surface",
+        session_id: "thread-surface-turn-surface",
+        timestamp: ~U[2026-05-17 04:30:00Z],
+        payload: %{"method" => "item/reasoning/summaryTextDelta", "params" => %{"summaryText" => "no shell here"}}
+      })
+
+      [event] = RawEventStore.list_events(trace)
+      assert {:error, :surface_not_available} = RunTrace.event_surface(trace, event["event_id"], "shell", run_instance_id: "run-surface-missing")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "run trace timeline defaults to the recent window and returns cursor metadata" do
     test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-timeline-#{System.unique_integer([:positive])}")
     logs_root = set_logs_root!(Path.join(test_root, "logs"))
