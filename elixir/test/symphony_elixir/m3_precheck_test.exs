@@ -150,6 +150,26 @@ defmodule SymphonyElixir.M3PrecheckTest do
     assert result.text =~ "Warnings:\n(none)"
   end
 
+  test "enabled m3 falls back to zero current work when no current_work and active count is invalid" do
+    issue = %Issue{id: "issue-fallback-zero", identifier: "MT-919", title: "Fallback zero", state: "Todo", blocked_by: []}
+
+    result =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: "bad",
+        terminal_states: ["Done"]
+      })
+
+    assert result.current_work == nil
+    assert Enum.map(result.eligible, & &1.identifier) == ["MT-919"]
+    assert Enum.map(result.dispatch, & &1.identifier) == ["MT-919"]
+    assert Enum.map(result.dispatched_todos, & &1.identifier) == ["MT-919"]
+    assert result.capacity_queued_todos == []
+  end
+
   test "structural_errors_for_issue handles nil blockers fallback and project_id cross-project blockers" do
     no_blockers_issue = %Issue{id: "issue-no-blockers", identifier: "MT-920", state: "Todo", blocked_by: nil}
 

@@ -165,6 +165,20 @@ defmodule SymphonyElixir.RunStateStoreTest do
              )
   end
 
+  test "timeline_for_running_entries returns run_not_found when issue identifiers do not match" do
+    entries = [
+      %{
+        issue: issue("MT-TL-OTHER-ATOM")
+      },
+      %{
+        "issue" => %{"identifier" => "MT-TL-OTHER-STRING"}
+      }
+    ]
+
+    assert {:error, :run_not_found} =
+             RunStateStore.timeline_for_running_entries(entries, "MT-NOT-FOUND")
+  end
+
   test "timeline_for_running_entries returns duplicate_run when multiple running entries share the same issue identifier" do
     with_logs_root("timeline-duplicate", fn logs_root ->
       first_trace = RunTrace.start!(issue("MT-TL-DUP"), logs_root: logs_root)
@@ -220,5 +234,9 @@ defmodule SymphonyElixir.RunStateStoreTest do
                  "MT-TL-BROKEN"
                )
     end)
+  end
+
+  test "raw event store streams an empty list when trace file metadata is missing" do
+    assert [] = RawEventStore.stream_events(%{}) |> Enum.to_list()
   end
 end
