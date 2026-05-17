@@ -59,6 +59,10 @@ defmodule SymphonyElixir.RunTraceTest do
     File.write!(trace.trace_file, Enum.map_join(lines, "\n", &Jason.encode!/1) <> "\n")
   end
 
+  defp repeated_text(prefix, count) when is_binary(prefix) and is_integer(count) and count > 0 do
+    Enum.map_join(1..count, "", fn _ -> prefix end)
+  end
+
   test "agent runner creates run trace and records codex plus agent_runner events" do
     test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-#{System.unique_integer([:positive])}")
     logs_root = set_logs_root!(Path.join(test_root, "logs"))
@@ -829,6 +833,551 @@ defmodule SymphonyElixir.RunTraceTest do
       assert completed.status_markers == ["completed"]
       assert attention.status_markers == ["attention"]
       assert session_started.status_markers == ["session_started"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace reads event detail and surfaces with per-surface previews redaction and truncation" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-event-detail-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-1", identifier: "MT-DETAIL-1", title: "Event detail", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      prompt_text = repeated_text("问题：继续执行。", 80)
+      shell_output = repeated_text("shell-output-", 450)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        summary: "command output streaming",
+        timestamp: ~U[2026-05-17 01:02:03Z],
+        session_id: "thread-detail-1-turn-detail-1",
+        thread_id: "thread-detail-1",
+        turn_id: "turn-detail-1",
+        payload: %{
+          "method" => "item/commandExecution/outputDelta",
+          "params" => %{
+            "tool" => "shell",
+            "parsedCmd" => "git status --short",
+            "command" => "export TOKEN=super-secret",
+            "outputDelta" => shell_output,
+            "prompt" => prompt_text,
+            "question" => "Continue?",
+            "input" => [%{"text" => "补充输入"}],
+            "summaryText" => "command reasoning",
+            "authorization" => "Bearer top-secret",
+            "nested" => %{"password" => "p@ssw0rd"}
+          }
+        },
+        raw: %{
+          "headers" => %{"authorization" => "Bearer top-secret"},
+          "token" => "abc123"
+        }
+      })
+
+      [event] = RawEventStore.list_events(trace)
+
+      assert {:ok, detail} = RunTrace.event_detail(trace, event["event_id"])
+      assert detail.event.event_id == event["event_id"]
+      assert detail.event.timestamp == "2026-05-17T01:02:03Z"
+      assert detail.event.source == "codex"
+      assert detail.event.event_type == "item_commandExecution_outputDelta"
+      assert detail.event.event_group == "codex_activity"
+      assert detail.event.summary == "command output streaming"
+      assert detail.run.issue_identifier == "MT-DETAIL-1"
+      assert detail.run.run_id == trace.run_id
+      assert detail.context.session_id == "thread-detail-1-turn-detail-1"
+      assert detail.context.thread_id == "thread-detail-1"
+      assert detail.context.turn_id == "turn-detail-1"
+      assert detail.summaries.tool_call == "shell"
+      assert detail.summaries.prompt =~ "Continue?"
+      assert detail.summaries.shell =~ "git status --short"
+      assert detail.summaries.payload =~ "top-level keys"
+
+      assert detail.surfaces.payload.available == true
+      assert detail.surfaces.payload.truncated == true
+      assert detail.surfaces.payload.byte_size > byte_size(detail.surfaces.payload.preview)
+      assert detail.surfaces.payload.preview =~ "[REDACTED]"
+      refute detail.surfaces.payload.preview =~ "top-secret"
+      refute detail.surfaces.payload.preview =~ "p@ssw0rd"
+
+      assert detail.surfaces.raw.available == true
+      assert detail.surfaces.raw.preview =~ "[REDACTED]"
+      refute detail.surfaces.raw.preview =~ "abc123"
+
+      assert detail.surfaces.prompt.available == true
+      assert detail.surfaces.prompt.truncated == true
+      assert detail.surfaces.prompt.byte_size > byte_size(detail.surfaces.prompt.preview)
+      assert String.valid?(detail.surfaces.prompt.preview)
+
+      assert detail.surfaces.shell.available == true
+      assert detail.surfaces.shell.truncated == true
+      assert detail.surfaces.shell.byte_size > byte_size(detail.surfaces.shell.preview)
+
+      assert {:ok, payload_surface} = RunTrace.event_surface(trace, event["event_id"], "payload")
+      assert payload_surface.surface == "payload"
+      assert payload_surface.available == true
+      assert payload_surface.truncated == true
+      assert payload_surface.byte_size > byte_size(payload_surface.content)
+      assert payload_surface.content =~ "[REDACTED]"
+      refute payload_surface.content =~ "top-secret"
+
+      assert {:ok, prompt_surface} = RunTrace.event_surface(trace, event["event_id"], "prompt")
+      assert prompt_surface.surface == "prompt"
+      assert prompt_surface.available == true
+      assert prompt_surface.truncated == false
+      assert prompt_surface.content =~ "Continue?"
+      assert prompt_surface.content =~ "补充输入"
+
+      assert {:ok, shell_surface} = RunTrace.event_surface(trace, event["event_id"], "shell")
+      assert shell_surface.surface == "shell"
+      assert shell_surface.available == true
+      assert shell_surface.truncated == true
+      assert shell_surface.content =~ "git status --short"
+      assert shell_surface.byte_size > byte_size(shell_surface.content)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace event detail and surface return event-specific errors without falling back" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-event-errors-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-2", identifier: "MT-DETAIL-2", title: "Event errors", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        summary: "no surface here",
+        payload: %{"method" => "turn/completed", "params" => %{}}
+      })
+
+      [event] = RawEventStore.list_events(trace)
+
+      assert {:error, :event_not_found} = RunTrace.event_detail(trace, "evt-missing")
+      assert {:error, :event_not_found} = RunTrace.event_surface(trace, "evt-missing", "payload")
+      assert {:error, :surface_not_available} = RunTrace.event_surface(trace, event["event_id"], "prompt")
+      assert {:error, :invalid_surface} = RunTrace.event_surface(trace, event["event_id"], "weird")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace event detail and surface map payload decode failures separately" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-event-unavailable-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-3", identifier: "MT-DETAIL-3", title: "Broken payload", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        summary: "broken payload",
+        payload: %{"method" => "item/tool/requestUserInput", "params" => %{"question" => "Continue?"}}
+      })
+
+      [event] = RawEventStore.list_events(trace)
+      payload_path = Path.join(trace.run_dir, event["payload_ref"])
+      File.write!(payload_path, "{bad json}")
+
+      assert {:error, :event_detail_unavailable} = RunTrace.event_detail(trace, event["event_id"])
+      assert {:error, :event_surface_unavailable} = RunTrace.event_surface(trace, event["event_id"], "payload")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace event detail and surface stay scoped to the current run_instance_id" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-event-run-instance-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-4", identifier: "MT-DETAIL-4", title: "Run instance scope", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-shared",
+          "run_instance_id" => "run-old",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:00:00Z",
+          "summary" => "old attempt",
+          "payload_ref" => nil
+        },
+        %{
+          "event_id" => "evt-current",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:01:00Z",
+          "summary" => "current attempt",
+          "payload_ref" => nil
+        }
+      ])
+
+      assert {:error, :event_not_found} = RunTrace.event_detail(trace, "evt-shared", run_instance_id: "run-current")
+      assert {:error, :event_not_found} = RunTrace.event_surface(trace, "evt-shared", "payload", run_instance_id: "run-current")
+
+      assert {:ok, detail} = RunTrace.event_detail(trace, "evt-current", run_instance_id: "run-current")
+      assert detail.event.summary == "current attempt"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace maps top-level payload maps to payload surfaces only" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-payload-map-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-5", identifier: "MT-DETAIL-5", title: "Payload map", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-payload-map",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:02:00Z",
+          "summary" => "payload map",
+          "payload_ref" => "payloads/evt-payload-map.json"
+        }
+      ])
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-payload-map.json"),
+        Jason.encode!(%{"jsonrpc" => "2.0", "result" => "ok"})
+      )
+
+      assert {:ok, detail} =
+               RunTrace.event_detail(trace, "evt-payload-map", run_instance_id: "run-current")
+
+      assert detail.surfaces.payload.available == true
+      assert detail.surfaces.payload.preview =~ "\"jsonrpc\":\"2.0\""
+      assert detail.surfaces.raw.available == false
+
+      assert {:ok, payload_surface} =
+               RunTrace.event_surface(trace, "evt-payload-map", "payload", run_instance_id: "run-current")
+
+      assert payload_surface.content =~ "\"jsonrpc\":\"2.0\""
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-payload-map", "raw", run_instance_id: "run-current")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace maps top-level raw strings to raw surfaces only" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-raw-string-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-6", identifier: "MT-DETAIL-6", title: "Raw string", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-raw-string",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:03:00Z",
+          "summary" => "raw string",
+          "payload_ref" => "payloads/evt-raw-string.json"
+        }
+      ])
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-raw-string.json"),
+        Jason.encode!("stdout line 1\nstdout line 2")
+      )
+
+      assert {:ok, detail} =
+               RunTrace.event_detail(trace, "evt-raw-string", run_instance_id: "run-current")
+
+      assert detail.surfaces.raw.available == true
+      assert detail.surfaces.raw.preview =~ "stdout line 1"
+      assert detail.surfaces.payload.available == false
+
+      assert {:ok, raw_surface} =
+               RunTrace.event_surface(trace, "evt-raw-string", "raw", run_instance_id: "run-current")
+
+      assert raw_surface.content =~ "stdout line 1"
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-raw-string", "payload", run_instance_id: "run-current")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace treats missing trace files as unavailable event detail and surface errors" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-missing-file-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-7", identifier: "MT-DETAIL-7", title: "Missing trace file", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      if File.exists?(trace.trace_file), do: File.rm!(trace.trace_file)
+
+      assert {:error, :event_detail_unavailable} = RunTrace.event_detail(trace, "evt-missing-file")
+      assert {:error, :event_surface_unavailable} = RunTrace.event_surface(trace, "evt-missing-file", "payload")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace treats unreadable trace directories as unavailable event detail and surface errors" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-bad-trace-path-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-8", identifier: "MT-DETAIL-8", title: "Bad trace path", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      if File.exists?(trace.trace_file), do: File.rm!(trace.trace_file)
+      File.mkdir_p!(trace.trace_file)
+
+      assert {:error, :event_detail_unavailable} = RunTrace.event_detail(trace, "evt-bad-path")
+      assert {:error, :event_surface_unavailable} = RunTrace.event_surface(trace, "evt-bad-path", "payload")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace handles payload-only bundles plus scalar and list surfaces" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-payload-only-bundle-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-9", identifier: "MT-DETAIL-9", title: "Payload only bundle", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-payload-only-bundle",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:04:00Z",
+          "summary" => "payload only bundle",
+          "payload_ref" => "payloads/evt-payload-only-bundle.json"
+        }
+      ])
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-payload-only-bundle.json"),
+        Jason.encode!(%{
+          "payload" => [
+            %{"token" => "abc123", "authorization" => "Bearer secret-token"},
+            true,
+            7
+          ]
+        })
+      )
+
+      assert {:ok, detail} =
+               RunTrace.event_detail(trace, "evt-payload-only-bundle", run_instance_id: "run-current")
+
+      assert detail.summaries.payload == "JSON array with 3 items"
+      assert detail.surfaces.payload.available == true
+      assert detail.surfaces.payload.preview =~ "[REDACTED]"
+      assert detail.surfaces.payload.preview =~ "true"
+      assert detail.surfaces.payload.preview =~ "7"
+      assert detail.surfaces.raw.available == false
+
+      assert {:ok, payload_surface} =
+               RunTrace.event_surface(trace, "evt-payload-only-bundle", "payload", run_instance_id: "run-current")
+
+      assert payload_surface.content =~ "[REDACTED]"
+      assert payload_surface.content =~ "true"
+      assert payload_surface.content =~ "7"
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-payload-only-bundle", "raw", run_instance_id: "run-current")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace payload summaries cover binary, nil fallback, prompt whitespace, and generic raw values" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-summary-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-10", identifier: "MT-DETAIL-10", title: "Summary branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-binary-payload",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:05:00Z",
+          "summary" => "binary payload",
+          "payload_ref" => "payloads/evt-binary-payload.json"
+        },
+        %{
+          "event_id" => "evt-nil-summary",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:06:00Z",
+          "summary" => "nil summary",
+          "payload_ref" => "payloads/evt-nil-summary.json"
+        },
+        %{
+          "event_id" => "evt-generic-raw",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:07:00Z",
+          "summary" => "generic raw",
+          "payload_ref" => "payloads/evt-generic-raw.json"
+        }
+      ])
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-binary-payload.json"),
+        Jason.encode!(%{"payload" => "authorization: bearer-value"})
+      )
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-nil-summary.json"),
+        Jason.encode!(%{"payload" => %{"params" => %{"input" => [%{"text" => "   "}], "question" => ""}}})
+      )
+
+      File.write!(Path.join(trace.payload_dir, "evt-generic-raw.json"), "42")
+
+      assert {:ok, binary_detail} =
+               RunTrace.event_detail(trace, "evt-binary-payload", run_instance_id: "run-current")
+
+      assert binary_detail.summaries.payload == "authorization: [REDACTED]"
+      assert binary_detail.summaries.prompt == nil
+      assert binary_detail.summaries.shell == nil
+
+      assert {:ok, nil_detail} =
+               RunTrace.event_detail(trace, "evt-nil-summary", run_instance_id: "run-current")
+
+      assert nil_detail.summaries.payload == "JSON object with 1 top-level keys"
+      assert is_nil(nil_detail.summaries.prompt) or String.trim(nil_detail.summaries.prompt) == ""
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-nil-summary", "prompt", run_instance_id: "run-current")
+
+      assert {:ok, raw_surface} =
+               RunTrace.event_surface(trace, "evt-generic-raw", "raw", run_instance_id: "run-current")
+
+      assert raw_surface.content == "42"
+      assert raw_surface.byte_size == 2
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-generic-raw", "payload", run_instance_id: "run-current")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace redacts atom keys and stringifies generic payload values through event surfaces" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-redaction-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-11", identifier: "MT-DETAIL-11", title: "Redaction branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        summary: "atom payload keys",
+        payload: %{token: "abc123", nested: [%{password: "p@ss"}], count: 3}
+      })
+
+      [event] = RawEventStore.list_events(trace)
+
+      assert {:ok, payload_surface} = RunTrace.event_surface(trace, event["event_id"], "payload")
+      assert payload_surface.content =~ "\"token\":\"[REDACTED]\""
+      assert payload_surface.content =~ "\"password\":\"[REDACTED]\""
+      assert payload_surface.content =~ "\"count\":3"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "run trace covers payload summary fallback and generic redaction keys" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-fallback-branches-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-detail-12", identifier: "MT-DETAIL-12", title: "Fallback branches", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      write_trace_lines!(trace, [
+        %{
+          "event_id" => "evt-payload-fallback",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:08:00Z",
+          "summary" => "payload fallback",
+          "payload_ref" => "payloads/evt-payload-fallback.json"
+        },
+        %{
+          "event_id" => "evt-generic-key",
+          "run_instance_id" => "run-current",
+          "source" => "codex",
+          "event_type" => "notification",
+          "event_group" => "codex_activity",
+          "timestamp" => "2026-05-17T01:09:00Z",
+          "summary" => "generic key",
+          "payload_ref" => "payloads/evt-generic-key.json"
+        }
+      ])
+
+      File.write!(Path.join(trace.payload_dir, "evt-payload-fallback.json"), Jason.encode!(%{"payload" => 99}))
+
+      File.write!(
+        Path.join(trace.payload_dir, "evt-generic-key.json"),
+        Jason.encode!(%{"payload" => %{123 => "token=abc123", "params" => %{"prompt" => "   "}}})
+      )
+
+      assert {:ok, fallback_detail} =
+               RunTrace.event_detail(trace, "evt-payload-fallback", run_instance_id: "run-current")
+
+      assert fallback_detail.summaries.payload == nil
+
+      assert {:ok, fallback_payload} =
+               RunTrace.event_surface(trace, "evt-payload-fallback", "payload", run_instance_id: "run-current")
+
+      assert fallback_payload.content == "99"
+
+      assert {:ok, generic_detail} =
+               RunTrace.event_detail(trace, "evt-generic-key", run_instance_id: "run-current")
+
+      assert is_nil(generic_detail.summaries.prompt) or String.trim(generic_detail.summaries.prompt) == ""
+
+      assert {:error, :surface_not_available} =
+               RunTrace.event_surface(trace, "evt-generic-key", "prompt", run_instance_id: "run-current")
+
+      assert {:ok, generic_payload} =
+               RunTrace.event_surface(trace, "evt-generic-key", "payload", run_instance_id: "run-current")
+
+      assert generic_payload.content =~ "\"123\":\"token=[REDACTED]\""
     after
       File.rm_rf(test_root)
     end

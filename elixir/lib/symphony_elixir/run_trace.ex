@@ -6,6 +6,21 @@ defmodule SymphonyElixir.RunTrace do
   require Logger
 
   alias SymphonyElixir.{EventNormalizer, LogFile, RawEventStore}
+  @surface_names ~w(raw payload prompt shell)
+  @preview_limit_bytes 512
+  @surface_limit_bytes 4096
+  @redacted_keys MapSet.new([
+                   "authorization",
+                   "api_key",
+                   "apikey",
+                   "token",
+                   "access_token",
+                   "refresh_token",
+                   "password",
+                   "secret",
+                   "cookie",
+                   "set-cookie"
+                 ])
 
   @context_key {__MODULE__, :current}
 
@@ -102,10 +117,9 @@ defmodule SymphonyElixir.RunTrace do
     try do
       fun.()
     after
-      if previous do
-        Process.put(@context_key, previous)
-      else
-        Process.delete(@context_key)
+      case previous do
+        nil -> Process.delete(@context_key)
+        value -> Process.put(@context_key, value)
       end
     end
   end
@@ -113,11 +127,13 @@ defmodule SymphonyElixir.RunTrace do
   @spec update(t() | nil, map()) :: t() | nil
   def update(%__MODULE__{} = trace, attrs) when is_map(attrs) do
     updated = struct(trace, attrs)
+    run_id = trace.run_id
 
     case write_meta(updated) do
       :ok ->
-        if current() && current().run_id == trace.run_id do
-          Process.put(@context_key, updated)
+        case current() do
+          %__MODULE__{run_id: ^run_id} -> Process.put(@context_key, updated)
+          _ -> :ok
         end
 
         updated
@@ -195,6 +211,68 @@ defmodule SymphonyElixir.RunTrace do
              next_cursor: timeline_next_cursor(page_end, limit)
            }}
         end
+    end
+  end
+
+  @spec event_detail(t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, :event_not_found | :event_detail_unavailable}
+  def event_detail(%__MODULE__{} = trace, event_id, opts \\ [])
+      when is_binary(event_id) and is_list(opts) do
+    case read_event_bundle(trace, event_id, opts) do
+      {:ok, event, payload_bundle} ->
+        {:ok,
+         %{
+           event: %{
+             event_id: Map.get(event, "event_id"),
+             timestamp: Map.get(event, "timestamp"),
+             source: Map.get(event, "source"),
+             event_type: Map.get(event, "event_type"),
+             event_group: Map.get(event, "event_group"),
+             summary: Map.get(event, "summary")
+           },
+           run: %{
+             issue_identifier: trace.issue_identifier,
+             run_id: trace.run_id
+           },
+           context: %{
+             session_id: Map.get(event, "session_id"),
+             thread_id: Map.get(event, "thread_id"),
+             turn_id: Map.get(event, "turn_id")
+           },
+           summaries: detail_summaries(payload_bundle),
+           surfaces: detail_surfaces(payload_bundle)
+         }}
+
+      {:error, :event_not_found} ->
+        {:error, :event_not_found}
+
+      {:error, _reason} ->
+        {:error, :event_detail_unavailable}
+    end
+  end
+
+  @spec event_surface(t(), String.t(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:error, :invalid_surface | :event_not_found | :surface_not_available | :event_surface_unavailable}
+  def event_surface(%__MODULE__{} = trace, event_id, surface, opts \\ [])
+      when is_binary(event_id) and is_binary(surface) and is_list(opts) do
+    with :ok <- validate_surface(surface),
+         {:ok, _event, payload_bundle} <- read_event_bundle(trace, event_id, opts),
+         {:ok, extracted} <- extract_surface(payload_bundle, surface),
+         rendered <- render_surface(extracted, @surface_limit_bytes) do
+      {:ok,
+       %{
+         surface: surface,
+         available: true,
+         content: rendered.content,
+         byte_size: rendered.byte_size,
+         truncated: rendered.truncated
+       }}
+    else
+      {:error, :invalid_surface} -> {:error, :invalid_surface}
+      {:error, :event_not_found} -> {:error, :event_not_found}
+      {:error, :surface_not_available} -> {:error, :surface_not_available}
+      {:error, _reason} -> {:error, :event_surface_unavailable}
     end
   end
 
@@ -280,6 +358,349 @@ defmodule SymphonyElixir.RunTrace do
   defp normalize_timeline_cursor_before(before) when is_integer(before) and before >= 0, do: {:ok, before}
   defp normalize_timeline_cursor_before(before) when is_binary(before), do: decode_legacy_timeline_cursor(before)
   defp normalize_timeline_cursor_before(_before), do: {:error, :invalid_cursor}
+
+  defp validate_surface(surface) when surface in @surface_names, do: :ok
+  defp validate_surface(_surface), do: {:error, :invalid_surface}
+
+  defp read_event_bundle(%__MODULE__{} = trace, event_id, opts) do
+    run_instance_id = Keyword.get(opts, :run_instance_id)
+
+    with {:ok, event} <- read_trace_event(trace.trace_file, event_id, run_instance_id),
+         {:ok, payload_bundle} <- hydrate_payload_bundle(trace, event) do
+      {:ok, event, payload_bundle}
+    end
+  end
+
+  defp read_trace_event(trace_file, event_id, run_instance_id)
+       when is_binary(trace_file) and is_binary(event_id) do
+    case File.exists?(trace_file) do
+      true ->
+        trace_file
+        |> File.stream!(:line, [])
+        |> Enum.reduce_while(
+          {:error, :event_not_found},
+          &reduce_trace_event_match(&1, &2, event_id, run_instance_id)
+        )
+
+      false ->
+        {:error, :trace_unavailable}
+    end
+  rescue
+    _error ->
+      {:error, :trace_unavailable}
+  end
+
+  defp hydrate_payload_bundle(%__MODULE__{} = trace, event) do
+    case Map.get(event, "payload_ref") do
+      ref when is_binary(ref) ->
+        trace.run_dir
+        |> Path.join(ref)
+        |> File.read!()
+        |> Jason.decode!()
+        |> build_payload_bundle()
+
+      _ ->
+        {:ok, %{payload: nil, raw_payload: nil}}
+    end
+  rescue
+    _error ->
+      {:error, :payload_unavailable}
+  end
+
+  defp build_payload_bundle(%{"payload" => payload, "raw_payload" => raw_payload}) do
+    {:ok, %{payload: payload, raw_payload: raw_payload}}
+  end
+
+  defp build_payload_bundle(%{"payload" => payload} = bundle) do
+    {:ok, %{payload: payload, raw_payload: Map.get(bundle, "raw_payload")}}
+  end
+
+  defp build_payload_bundle(%{} = payload) do
+    {:ok, %{payload: payload, raw_payload: nil}}
+  end
+
+  defp build_payload_bundle(payload), do: {:ok, %{payload: nil, raw_payload: payload}}
+
+  defp event_matches_run_instance?(_event, nil), do: true
+
+  defp event_matches_run_instance?(event, run_instance_id) when is_binary(run_instance_id) do
+    Map.get(event, "run_instance_id") == run_instance_id
+  end
+
+  defp trace_event_match?(event, event_id, run_instance_id) do
+    Map.get(event, "event_id") == event_id and
+      event_matches_run_instance?(event, run_instance_id)
+  end
+
+  defp reduce_trace_event_match(line, _acc, event_id, run_instance_id) do
+    event = line |> String.trim_trailing("\n") |> Jason.decode!()
+
+    if trace_event_match?(event, event_id, run_instance_id) do
+      {:halt, {:ok, event}}
+    else
+      {:cont, {:error, :event_not_found}}
+    end
+  end
+
+  defp detail_summaries(payload_bundle) do
+    payload = Map.get(payload_bundle, :payload)
+
+    %{
+      tool_call: tool_call_summary(payload),
+      payload: payload_summary(payload),
+      prompt: prompt_summary(payload),
+      shell: shell_summary(payload)
+    }
+  end
+
+  defp detail_surfaces(payload_bundle) do
+    Enum.into(@surface_names, %{}, fn surface ->
+      key = String.to_atom(surface)
+
+      preview =
+        case extract_surface(payload_bundle, surface) do
+          {:ok, extracted} ->
+            rendered = render_surface(extracted, @preview_limit_bytes)
+
+            {key,
+             %{
+               available: true,
+               byte_size: rendered.byte_size,
+               preview: rendered.content,
+               truncated: rendered.truncated
+             }}
+
+          {:error, :surface_not_available} ->
+            {key,
+             %{
+               available: false,
+               byte_size: 0,
+               preview: nil,
+               truncated: false
+             }}
+        end
+
+      preview
+    end)
+  end
+
+  defp prompt_summary(payload) do
+    [
+      map_path(payload, ["params", "question"]),
+      map_path(payload, ["params", "prompt"]),
+      List.first(input_texts(payload)),
+      map_path(payload, ["params", "summaryText"])
+    ]
+    |> Enum.find_value(fn
+      value when is_binary(value) and value != "" -> render_surface(value, 160).content
+      _ -> nil
+    end)
+  end
+
+  defp shell_summary(payload) do
+    [
+      map_path(payload, ["params", "parsedCmd"]),
+      map_path(payload, ["params", "command"]),
+      map_path(payload, ["params", "outputDelta"]),
+      if(map_path(payload, ["params", "tool"]) == "shell", do: "shell", else: nil)
+    ]
+    |> Enum.find_value(fn
+      value when is_binary(value) and value != "" -> render_surface(value, 160).content
+      _ -> nil
+    end)
+  end
+
+  defp tool_call_summary(payload) do
+    payload
+    |> map_path(["params", "tool"])
+    |> case do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp payload_summary(nil), do: nil
+
+  defp payload_summary(%{} = payload) do
+    "JSON object with #{map_size(payload)} top-level keys"
+  end
+
+  defp payload_summary(payload) when is_list(payload) do
+    "JSON array with #{length(payload)} items"
+  end
+
+  defp payload_summary(payload) when is_binary(payload) do
+    rendered = render_surface(payload, 160)
+    rendered.content
+  end
+
+  defp payload_summary(_payload), do: nil
+
+  defp extract_surface(payload_bundle, "payload") do
+    case Map.get(payload_bundle, :payload) do
+      nil -> {:error, :surface_not_available}
+      payload -> {:ok, payload}
+    end
+  end
+
+  defp extract_surface(payload_bundle, "raw") do
+    case Map.get(payload_bundle, :raw_payload) do
+      nil -> {:error, :surface_not_available}
+      payload -> {:ok, payload}
+    end
+  end
+
+  defp extract_surface(payload_bundle, "prompt") do
+    payload_bundle
+    |> Map.get(:payload)
+    |> prompt_candidates()
+    |> join_surface_lines()
+  end
+
+  defp extract_surface(payload_bundle, "shell") do
+    payload_bundle
+    |> Map.get(:payload)
+    |> shell_candidates()
+    |> join_surface_lines()
+  end
+
+  defp prompt_candidates(payload) do
+    [
+      map_path(payload, ["params", "prompt"]),
+      map_path(payload, ["params", "question"]),
+      input_texts(payload),
+      map_path(payload, ["params", "summaryText"])
+    ]
+    |> List.flatten()
+    |> Enum.filter(&present_binary?/1)
+  end
+
+  defp shell_candidates(payload) do
+    tool = map_path(payload, ["params", "tool"])
+
+    [
+      if(tool == "shell", do: tool, else: nil),
+      map_path(payload, ["params", "parsedCmd"]),
+      map_path(payload, ["params", "command"]),
+      map_path(payload, ["params", "outputDelta"])
+    ]
+    |> Enum.filter(&present_binary?/1)
+  end
+
+  defp input_texts(payload) do
+    case map_path(payload, ["params", "input"]) do
+      values when is_list(values) ->
+        Enum.map(values, &map_path(&1, ["text"]))
+
+      _ ->
+        []
+    end
+  end
+
+  defp join_surface_lines([]), do: {:error, :surface_not_available}
+
+  defp join_surface_lines(values) when is_list(values) do
+    values
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
+    |> case do
+      "" -> {:error, :surface_not_available}
+      text -> {:ok, text}
+    end
+  end
+
+  defp render_surface(value, limit) when is_integer(limit) and limit > 0 do
+    redacted = redact_value(value)
+    serialized = stringify_surface(redacted)
+    byte_size = byte_size(serialized)
+    content = utf8_truncate(serialized, limit)
+
+    %{
+      content: content,
+      byte_size: byte_size,
+      truncated: byte_size > byte_size(content)
+    }
+  end
+
+  defp redact_value(%{} = value) do
+    value
+    |> Enum.into(%{}, fn {key, nested_value} ->
+      normalized_key = normalize_redaction_key(key)
+
+      if MapSet.member?(@redacted_keys, normalized_key) do
+        {key, "[REDACTED]"}
+      else
+        {key, redact_value(nested_value)}
+      end
+    end)
+  end
+
+  defp redact_value(value) when is_list(value), do: Enum.map(value, &redact_value/1)
+  defp redact_value(value) when is_binary(value), do: redact_text(value)
+  defp redact_value(value), do: value
+
+  defp redact_text(value) when is_binary(value) do
+    value
+    |> then(&Regex.replace(~r/Bearer\s+\S+/iu, &1, "Bearer [REDACTED]"))
+    |> then(&Regex.replace(~r/(authorization\s*:\s*)(\S+)/iu, &1, "\\1[REDACTED]"))
+    |> then(&Regex.replace(~r/((?:api_key|token|password)\s*=\s*)(\S+)/iu, &1, "\\1[REDACTED]"))
+  end
+
+  defp stringify_surface(%{} = value), do: Jason.encode!(value)
+  defp stringify_surface(value) when is_list(value), do: Jason.encode!(value)
+  defp stringify_surface(value) when is_binary(value), do: value
+  defp stringify_surface(value), do: to_string(value)
+
+  defp utf8_truncate(value, limit) when byte_size(value) <= limit, do: value
+
+  defp utf8_truncate(value, limit) do
+    candidate = binary_part(value, 0, limit)
+
+    if String.valid?(candidate) do
+      candidate
+    else
+      utf8_truncate(value, limit - 1)
+    end
+  end
+
+  defp present_binary?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_binary?(_value), do: false
+
+  defp normalize_redaction_key(key) when is_atom(key), do: key |> Atom.to_string() |> String.downcase()
+  defp normalize_redaction_key(key) when is_binary(key), do: String.downcase(key)
+  defp normalize_redaction_key(key), do: key |> to_string() |> String.downcase()
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    case fetch_path_value(data, key) do
+      {:ok, value} -> map_path(value, rest)
+      :error -> nil
+    end
+  end
+
+  defp map_path(data, []) do
+    data
+  end
+
+  defp map_path(_data, _path), do: nil
+
+  defp fetch_path_value(data, key) when is_map(data) and is_binary(key) do
+    case Map.fetch(data, key) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        Enum.find_value(data, :error, &match_atom_key(&1, key))
+    end
+  end
+
+  defp fetch_path_value(_data, _key), do: :error
+
+  defp match_atom_key({map_key, value}, key) when is_atom(map_key) do
+    if Atom.to_string(map_key) == key, do: {:ok, value}
+  end
+
+  defp match_atom_key(_entry, _key), do: nil
 
   defp meta_payload(trace) do
     %{

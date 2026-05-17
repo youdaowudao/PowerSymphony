@@ -236,6 +236,160 @@ defmodule SymphonyElixir.RunStateStoreTest do
     end)
   end
 
+  test "event detail and surface for running entries stay scoped to the current running trace" do
+    with_logs_root("event-detail-success", fn logs_root ->
+      current_trace = RunTrace.start!(issue("MT-EVT-STATE-1"), logs_root: logs_root)
+      older_trace = RunTrace.start!(issue("MT-EVT-STATE-1"), logs_root: logs_root)
+
+      RunTrace.record(current_trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-MT-EVT-STATE-1",
+        summary: "current event",
+        session_id: "thread-current-turn-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        payload: %{
+          "method" => "item/commandExecution/outputDelta",
+          "params" => %{"tool" => "shell", "parsedCmd" => "mix test", "outputDelta" => "ok"}
+        }
+      })
+
+      RunTrace.record(older_trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-MT-OTHER",
+        summary: "older event",
+        payload: %{
+          "method" => "item/tool/requestUserInput",
+          "params" => %{"question" => "legacy"}
+        }
+      })
+
+      [current_event] = RawEventStore.list_events(current_trace)
+      [older_event] = RawEventStore.list_events(older_trace)
+
+      entries = [
+        timeline_entry("MT-EVT-STATE-1", current_trace),
+        timeline_entry("MT-OTHER", older_trace)
+      ]
+
+      assert {:ok, detail} =
+               RunStateStore.event_detail_for_running_entries(
+                 entries,
+                 "MT-EVT-STATE-1",
+                 current_event["event_id"]
+               )
+
+      assert detail.event.event_id == current_event["event_id"]
+      assert detail.context.thread_id == "thread-current"
+
+      assert {:ok, surface} =
+               RunStateStore.event_surface_for_running_entries(
+                 entries,
+                 "MT-EVT-STATE-1",
+                 current_event["event_id"],
+                 "shell"
+               )
+
+      assert surface.surface == "shell"
+      assert surface.content =~ "mix test"
+
+      assert {:error, :event_not_found} =
+               RunStateStore.event_detail_for_running_entries(
+                 entries,
+                 "MT-EVT-STATE-1",
+                 older_event["event_id"]
+               )
+    end)
+  end
+
+  test "event detail and surface for running entries preserve duplicate run and unavailable errors" do
+    with_logs_root("event-detail-errors", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-EVT-STATE-2"), logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-MT-EVT-STATE-2",
+        summary: "question",
+        payload: %{"method" => "item/tool/requestUserInput", "params" => %{"question" => "Continue?"}}
+      })
+
+      [event] = RawEventStore.list_events(trace)
+      payload_path = Path.join(trace.run_dir, event["payload_ref"])
+
+      duplicate_entries = [
+        timeline_entry("MT-EVT-DUP", trace),
+        timeline_entry("MT-EVT-DUP", trace, %{run_instance_id: "run-second"})
+      ]
+
+      assert {:error, :duplicate_run} =
+               RunStateStore.event_detail_for_running_entries(
+                 duplicate_entries,
+                 "MT-EVT-DUP",
+                 event["event_id"]
+               )
+
+      assert {:error, :run_not_found} =
+               RunStateStore.event_detail_for_running_entries([], "MT-EVT-STATE-2", event["event_id"])
+
+      File.write!(payload_path, "{bad json}")
+
+      assert {:error, :event_detail_unavailable} =
+               RunStateStore.event_detail_for_running_entries(
+                 [timeline_entry("MT-EVT-STATE-2", trace)],
+                 "MT-EVT-STATE-2",
+                 event["event_id"]
+               )
+
+      assert {:error, :event_surface_unavailable} =
+               RunStateStore.event_surface_for_running_entries(
+                 [timeline_entry("MT-EVT-STATE-2", trace)],
+                 "MT-EVT-STATE-2",
+                 event["event_id"],
+                 "prompt"
+               )
+    end)
+  end
+
+  test "event detail for running entries ignores events from older attempts in the same trace" do
+    with_logs_root("event-detail-run-instance", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-EVT-STATE-3"), logs_root: logs_root)
+
+      File.write!(
+        trace.trace_file,
+        Enum.map_join(
+          [
+            %{
+              "event_id" => "evt-shared",
+              "run_instance_id" => "run-old",
+              "source" => "codex",
+              "event_type" => "notification",
+              "timestamp" => "2026-05-17T01:00:00Z"
+            },
+            %{
+              "event_id" => "evt-current",
+              "run_instance_id" => "run-current",
+              "source" => "codex",
+              "event_type" => "notification",
+              "timestamp" => "2026-05-17T01:01:00Z"
+            }
+          ],
+          "\n",
+          &Jason.encode!/1
+        ) <> "\n"
+      )
+
+      entry = timeline_entry("MT-EVT-STATE-3", trace, %{run_instance_id: "run-current"})
+
+      assert {:error, :event_not_found} =
+               RunStateStore.event_detail_for_running_entries([entry], "MT-EVT-STATE-3", "evt-shared")
+
+      assert {:ok, detail} =
+               RunStateStore.event_detail_for_running_entries([entry], "MT-EVT-STATE-3", "evt-current")
+
+      assert detail.event.event_id == "evt-current"
+    end)
+  end
+
   test "raw event store streams an empty list when trace file metadata is missing" do
     assert [] = RawEventStore.stream_events(%{}) |> Enum.to_list()
   end
