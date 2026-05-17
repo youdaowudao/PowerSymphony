@@ -14,32 +14,21 @@
 ### 预计核心实现文件
 
 - `elixir/lib/symphony_elixir/workspace.ex`
-  - resource binding
-  - cleanup fencing
-  - local / remote 路径一致性
-- `elixir/lib/symphony_elixir/orchestrator.ex`
-  - running cleanup
-  - startup sweep
-  - retry cleanup
-  - blocked-claim cleanup
-  - `premature_turn_end` 收口复用
-- `elixir/lib/symphony_elixir/agent_runner.ex`
-  - per-turn validity gate
-  - continuation 判断时机后移
-- `elixir/lib/symphony_elixir/codex/app_server.ex`
-  - terminal settle
-  - finalized success 与冲突终态归并
-- 如有需要：
+  - resource binding 的职责收紧
+  - cleanup 生命周期入口与低层删除原语的边界澄清
+- `elixir/lib/symphony_elixir/state_reducer.ex`
+  - raw codex `turn_completed` 观察层 provisional phase
+  - 不影响 `agent_runner run_result(status=completed)` 已收敛成功语义
+- 如有必要：
   - `elixir/lib/symphony_elixir/event_normalizer.ex`
   - `elixir/lib/symphony_elixir/run_state_store.ex`
-  - `elixir/lib/symphony_elixir/state_reducer.ex`
 
 ### 预计核心测试文件
 
 - `elixir/test/symphony_elixir/workspace_and_config_test.exs`
-- `elixir/test/symphony_elixir/app_server_test.exs`
-- `elixir/test/symphony_elixir/extensions_test.exs`
-- 如有现成更贴近 orchestrator cleanup 的测试文件，也可能补到对应 orchestrator 测试
+- `elixir/test/symphony_elixir/run_trace_test.exs`
+- 如有必要：
+  - `elixir/test/symphony_elixir/extensions_test.exs`
 
 ## 合同覆盖矩阵
 
@@ -54,131 +43,66 @@
 | local worker | 本地路径安全、远端路径漂移 | 本地合同成立 |
 | remote worker | SSH / remote remove / hook 分叉 | 与本地保持同一 contract，允许实现手段不同 |
 
-## Phase 1: Workspace Lifecycle
+## 当前最小实现范围
 
 ### 目标
 
-把 cleanup side-path、delete evidence、startup sweep 和 stale workspace 报错收拢成一套统一合同。
+先完成一个最小但完整的收口，确保 coder 不会把当前代码边界误读成“raw codex completed 已 finalized”或“Workspace.remove/2 是生命周期入口”。
 
 ### 计划步骤
 
 1. 先锁测试矩阵
-   - running cleanup 不得误删新 run 已接管的 workspace
-   - startup sweep 遇到 ambiguous binding 时必须保守跳过
-   - retry cleanup / blocked-claim cleanup 与 running cleanup 走同一判定
-   - stale session 在 turn 前得到 lifecycle invalid，而不是裸路径错误
-   - stale invalidation / binding 不会污染新 run 接管
+   - raw codex `turn_completed` event 映射到 provisional finalization pending phase
+   - raw codex `notification(method=turn/completed)` 映射到同一 provisional phase
+   - `agent_runner run_result(status=completed)` 仍保持既有成功 phase
+   - `cleanup_issue_workspace/2` 仍是生命周期收口入口；`remove/2` 只做物理删除
 
-2. 收紧 `Workspace` 合同
-   - 明确 binding 的状态迁移
-   - 明确 invalidation record 的从属地位
-   - 明确 delete evidence 的最小集合
-   - 明确 ambiguous reap candidate 的再次判定与治理口径
+2. 最小改 `StateReducer`
+   - 只改观察层 phase 名称
+   - 不扩散到 `run_result(status=completed)` 路径
+   - 若 timeline/status marker 仍把 raw codex `turn_completed` 表述成 finalized success，则同步收紧为 provisional marker；不改事件类型
 
-3. 收紧 orchestrator side-path
-   - running terminal cleanup
-   - startup terminal sweep
-   - retry terminal cleanup
-   - blocked-claim terminal cleanup
+3. 最小改 `Workspace`
+   - 收紧模块文档、函数文档与命名口径
+   - 不私有化 `remove/2`
+   - 不大改调用图
 
-4. 验证 local / remote 对齐
-   - SSH 路径不能出现“本地安全、远端仍盲删”的分叉
+4. 更新 change 文档
+   - 明确当前是 `resume-barrier based finalization gate`
+   - 明确 binding、ambiguous workspace、`remove/2`、观察层口径的真实边界
 
-### 第一阶段完成判据
+### 当前完成判据
 
-- cleanup side-path 都已走 generation-aware contract
-- 新 run 不会被旧 cleanup 误删 workspace
-- stale run 不会继续撞到底层路径错误才发现失效
-- ambiguous workspace 不会无限悬空，至少有稳定的再次判定与人工介入口径
-
-## Phase 2: Turn Finalization
-
-### 目标
-
-把 continuation 从“第一次 `turn/completed`”后移到“terminal 已稳定 finalized”之后。
-
-### 计划步骤
-
-1. 先锁测试矩阵
-   - `late cancel after completed`
-   - `late aborted after completed`
-   - 正常健康 turn 仍能 continuation
-   - 正常 `turn/failed` / `turn/cancelled` 仍回到 `premature_turn_end`
-
-2. 改 `AppServer`
-   - `turn/completed` 进入 settle，而不是立即成功返回
-   - settle 内若晚到 cancel / fail，返回 conflict terminal
-   - settle 成功后才返回 finalized success
-   - 明确 settle 的结束条件、冲突条件、超时去向与健康路径延迟上界
-
-3. 改 `AgentRunner`
-   - continuation 判断后移到 finalized success 之后
-   - `late cancel after completed` 回收至现有 `handle_turn_error -> premature_turn_end`
-   - 明确 validity gate 检查点，而不是只在“每轮 turn 前”模糊处理
-
-4. 复用 orchestrator 现有保守路径
-   - hold
-   - blocked-claim
-   - 不新增新的 continuation side-channel
-
-### 第二阶段完成判据
-
-- `turn/completed` 不再直接等于 continuation 通行证
-- `late cancel/aborted after completed` 不再误推进下一轮 continuation
-- 健康路径续跑没有被不必要地打断
+- raw codex `turn_completed` 不再在观察层伪装成 finalized success
+- `agent_runner run_result(status=completed)` 不受影响
+- `Workspace.remove/2` 的低层原语定位被明确写死
+- c-52 文档与代码真实边界一致，不再宣称完整 settle 状态机已交付
 
 ## 最小测试矩阵
 
-### Workspace Lifecycle
-
-- running issue terminal cleanup
-- startup terminal workspace sweep
-- retry issue terminal cleanup
-- blocked claim terminal cleanup
-- local worker
-- remote worker
-- stale invalidation / binding takeover
-- cleanup `declare closing -> delete` 之间崩溃/重入
-- `before_remove` 部分失败或 remote partial delete
-- 旧 worker 在 `closing` 后迟到写回 binding/terminal
-
-### Turn Finalization
-
-- normal completed -> finalized -> continuation
-- completed -> late cancelled
-- completed -> late aborted/failed
-- ordinary cancelled / failed
-- `premature_turn_end` 进入 hold，必要时 converged 到 blocked-claim
-- settle 超时后的统一去向
-- transport EOF / network 抖动与 terminal conflict 的分类优先级
-
-### Validity Gate 检查点矩阵
-
-- turn start 前
-- tool call 执行前（若当前结构允许拦截）
-- turn completed 到 continuation 判断之间
-- cleanup delete 前
-- startup sweep reap 前
-
-### 口径回归
-
-- `01:38 interrupted` 这类场景在状态/事件口径上能区分：
-  - turn terminal conflict
-  - transport/network failure
+- raw codex `turn_completed` phase rename
+- raw codex `turn/completed` notification phase rename
+- `agent_runner run_result(status=completed)` 保持 `turn_completed`
+- `cleanup_issue_workspace/2` 先进入 closing，`remove/2` 再做物理删除
+- 观察层文案承认 `turn_completed` 仍有语义风险，不能作为 finalized 证据
 
 ## closeout gate
 
-准备进入 PR 更新前，至少执行：
+准备 create PR / update open PR 前，必须先按当前分支或 PR latest head 相对 PR base 的累计 diff 选择 `Next Push Gate`。
 
-- `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`
-- `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint`
-- 改动面对应的定向测试
+- 若累计 diff 命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md`，则本地前置硬门就是：
+  `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all`
+  成功后才允许 push。
+- 若累计 diff 未命中上述 full-gate 路径，则 closeout gate 至少包含：
+  - `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`
+  - `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint`
+  - 改动面对应的定向测试
 
-如果这轮实现后 CI 失败，再按仓库规则：
+如果 CI 失败，顺序仍是：
 
 1. 先看 CI 报错
 2. 本地做定向修复
-3. 修完后再考虑 `make all` 最终确认
+3. 只要修复后的下一次 PR update 仍命中 full-gate 路径，就必须在再次 push 前重新跑本地 `make all`
 
 ## 零上下文 review 要点
 

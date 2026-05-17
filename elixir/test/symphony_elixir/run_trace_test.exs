@@ -821,22 +821,35 @@ defmodule SymphonyElixir.RunTraceTest do
           "timestamp" => DateTime.to_iso8601(trace.started_at)
         },
         %{
+          "source" => "agent_runner",
+          "event_type" => "run_result",
+          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 1, :second)),
+          "payload" => %{"status" => "completed"}
+        },
+        %{
           "source" => "codex",
           "event_type" => "tool_call_failed",
-          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 1, :second))
+          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 2, :second))
         },
         %{
           "source" => "codex",
           "event_type" => "session_started",
-          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 2, :second))
+          "timestamp" => DateTime.to_iso8601(DateTime.add(trace.started_at, 3, :second))
         }
       ])
 
       assert {:ok, page} = RunTrace.timeline(trace)
-      assert Enum.map(page.items, & &1.summary) == ["codex:turn_completed", "codex:tool_call_failed", "codex:session_started"]
 
-      [completed, attention, session_started] = page.items
-      assert completed.status_markers == ["completed"]
+      assert Enum.map(page.items, & &1.summary) == [
+               "codex:turn_completed",
+               "agent_runner:run_result",
+               "codex:tool_call_failed",
+               "codex:session_started"
+             ]
+
+      [turn_completed, run_result, attention, session_started] = page.items
+      assert turn_completed.status_markers == ["pending_finalization"]
+      assert run_result.status_markers == ["completed"]
       assert attention.status_markers == ["attention"]
       assert session_started.status_markers == ["session_started"]
     after
@@ -1481,8 +1494,9 @@ defmodule SymphonyElixir.RunTraceTest do
       })
 
       state = RunStateStore.summary_for_trace(trace)
-      assert state.current_phase == "turn_completed"
+      assert state.current_phase == "turn_completed_pending_finalization"
       assert state.current_action =~ "turn completed"
+      assert state.current_action =~ "pending finalization"
       assert state.linear_state == "In Progress"
     after
       File.rm_rf(test_root)
@@ -2117,7 +2131,20 @@ defmodule SymphonyElixir.RunTraceTest do
         "payload" => %{"method" => "turn/completed"}
       })
 
-    assert turn_completed_notification.current_phase == "turn_completed"
+    assert turn_completed_notification.current_phase == "turn_completed_pending_finalization"
+    assert turn_completed_notification.current_action =~ "turn completed"
+    assert turn_completed_notification.current_action =~ "pending finalization"
+
+    completed_run_result =
+      StateReducer.reduce_event(base, %{
+        "source" => "agent_runner",
+        "event_type" => "run_result",
+        "timestamp" => DateTime.to_iso8601(now),
+        "payload" => %{"status" => "completed"}
+      })
+
+    assert completed_run_result.current_phase == "turn_completed"
+    refute completed_run_result.current_action =~ "pending finalization"
 
     params_type_completed =
       StateReducer.reduce_event(base, %{
