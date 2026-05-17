@@ -19,6 +19,14 @@ description:
   branches.
 - Treat manual merge as a fallback path. The default path should already have
   attempted auto-merge immediately after the latest successful push.
+- Reuse the same explicit `Next Push Gate` logic as the `push` skill for every
+  repair-loop branch update.
+- Keep `.codex/skills/github_api.py` as the only normal GitHub write path for
+  review replies, audit comments, and merge in this flow.
+- If any key GitHub write is found to have happened through GitHub UI, `gh`,
+  ad-hoc CLI, or another helper without explicit user authorization or a
+  recorded `github_api.py unavailable` blocker, stop merge/closeout until that
+  out-of-band write has been audited and the PR state has been re-checked.
 
 ## Preconditions
 
@@ -29,7 +37,16 @@ description:
 ## Steps
 
 1. Locate the PR for the current branch.
-2. Confirm the required local validation for this diff is green, following `AGENTS.md`.
+2. Confirm which `Next Push Gate` applies to the next branch update:
+   - Base the decision on the cumulative diff that the updated branch / PR head
+     will have against PR base after the next push. Do not classify an open PR
+     update from only the latest local patch.
+   - `local make all` when the next push will update an open PR and that
+     cumulative diff hits `.github/workflows/make-all.yml`, `elixir/**`,
+     `AGENTS.md`, or `SPEC.md`
+   - `closeout gate` when the next push will update an open PR without hitting
+     those full-gate paths in that cumulative diff
+   - `light validation` only when no PR create/update push will happen
 3. If the working tree has uncommitted changes, commit with the `commit` skill
    and push with the `push` skill before proceeding.
 4. Check mergeability and conflicts against main.
@@ -39,23 +56,36 @@ description:
    fixes are handled before merging.
 7. Watch checks until complete.
 8. If checks fail, pull logs, fix the issue, commit with the `commit` skill,
-   push with the `push` skill, and re-run checks.
-9. When all checks are green and review feedback is addressed, squash-merge and
-   delete the branch using the PR title/body for the merge subject/body.
-10. **Context guard:** Before implementing review feedback, confirm it does not
+   rerun the exact `Next Push Gate` required for the next PR update push, then
+   push with the `push` skill and re-run checks.
+9. If you discover any out-of-band key GitHub write during the landing flow, stop normal merge execution immediately.
+   - Recovery order is fixed: record the exact fact and reason through `.codex/skills/github_api.py`, then refresh PR state, review delta, latest head required checks, and finally rerun the applicable gate before resuming.
+10. When all checks are green and review feedback is addressed, prefer waiting
+   for the existing auto-merge path to complete.
+   - Manual squash-merge is allowed only as an explicit fallback after one of
+     these conditions is true for the latest head:
+     - the latest auto-merge attempt returned exact `clean status`, and latest
+       head SHA required checks are green
+     - the latest auto-merge attempt failed for another reason, that exact
+       failure has already been audited in the PR or issue comment stream, and
+       latest head SHA required checks are green
+   - Only then may you squash-merge using `.codex/skills/github_api.py` plus
+     the PR title/body for the merge subject/body. Do not use GitHub UI, `gh`,
+     ad-hoc CLI, or other helpers for normal merge execution.
+11. **Context guard:** Before implementing review feedback, confirm it does not
     conflict with the user’s stated intent or task context. If it conflicts,
     respond inline with a justification and ask the user before changing code.
-11. **Pushback template:** When disagreeing, reply inline with: acknowledge +
+12. **Pushback template:** When disagreeing, reply inline with: acknowledge +
     rationale + offer alternative.
-12. **Ambiguity gate:** When ambiguity blocks progress, use the clarification
+13. **Ambiguity gate:** When ambiguity blocks progress, use the clarification
     flow (assign PR to current GH user, mention them, wait for response). Do not
     implement until ambiguity is resolved.
     - If you are confident you know better than the reviewer, you may proceed
       without asking the user, but reply inline with your rationale.
-13. **Per-comment mode:** For each review comment, choose one of: accept,
+14. **Per-comment mode:** For each review comment, choose one of: accept,
     clarify, or push back. Reply inline (or in the issue thread for Codex
     reviews) stating the mode before changing code.
-14. **Reply before change:** Always respond with intended action before pushing
+15. **Reply before change:** Always respond with intended action before pushing
     code changes (inline for review comments, issue thread for Codex reviews).
 
 ## Commands
@@ -104,8 +134,12 @@ fi
 # check-runs, and head updates through `.codex/skills/github_api.py`.
 python3 .codex/skills/land/land_watch.py
 
-# Squash-merge fallback (only after checks are green and auto-merge fallback
-# rules have been satisfied)
+# Squash-merge fallback. This is not the default path.
+# Run it only after the latest auto-merge attempt either:
+# 1) returned exact `clean status`, or
+# 2) failed for another reason whose exact failure has already been audited in
+#    the PR/issue comment stream;
+# and in both cases only when latest head SHA required checks are green.
 python3 .codex/skills/github_api.py merge-pr \
   --number "$pr_number" \
   --method squash \
@@ -134,6 +168,13 @@ Exit codes:
   inspect the corresponding GitHub run details or logs through your available
   GitHub read path, then fix locally, commit with the `commit` skill, push with
   the `push` skill, and re-run the watch.
+- Do not relax the gate inside `land`. If the repaired cumulative branch/PR
+  diff against PR base still updates an open PR on `.github/workflows/make-all.yml`,
+  `elixir/**`, `AGENTS.md`, or `SPEC.md`, rerun local `make all` before the next
+  push. `land` does not get a looser branch than `push`.
+- The same PR-bound rule from `push` still applies here: a branch update that
+  will continue the current PR must be classified from the updated cumulative
+  branch/PR diff, not from only the latest repair patch.
 - Use judgment to identify flaky failures. If a failure is a flake (e.g., a
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not
@@ -149,12 +190,21 @@ Exit codes:
   that review feedback is available.
 - If auto-merge is already active, prefer waiting for the auto-merge path over
   forcing a manual merge.
-- If auto-merge was not activated, manual merge is allowed only after the exact
-  auto-merge failure reason has been reported in the PR or issue comment stream
-  and the latest head SHA required checks are green.
-- If the latest auto-merge attempt failed only because the PR was already in
-  clean status, treat that as “auto-merge no longer necessary”, not as a
-  permission blocker.
+- Manual merge is never the default interpretation of “checks are green”.
+  Checks being green only means the fallback may be considered; it does not by
+  itself authorize merge.
+- If auto-merge was not activated because the latest attempt failed for another
+  reason, manual merge is allowed only after that exact failure reason has been
+  reported in the PR or issue comment stream and the latest head SHA required
+  checks are green.
+- If the latest auto-merge attempt returned exact `clean status`, treat that as
+  “auto-merge no longer necessary”, not as a permission blocker; manual merge
+  may then be used as the documented fallback once latest head SHA required
+  checks are green.
+- If the first remote full gate on the latest repaired head still exposes
+  coverage, dialyzer, or similar full-gate failures, treat that as a missed or
+  non-compliant local `make all` gate unless you have concrete evidence of
+  environment drift or instability.
 - If the remote PR branch advanced due to your own prior force-push or merge,
   avoid redundant merges; re-run the formatter locally if needed and
   `git push --force-with-lease`.
@@ -171,6 +221,15 @@ Exit codes:
   (batching is fine) before closing the thread.
 - Fetch review comments via `.codex/skills/github_api.py` and reply with a
   prefixed comment.
+- Inline review replies and PR/issue audit comments must use
+  `.codex/skills/github_api.py`. Do not use GitHub UI, `gh`, ad-hoc CLI, or
+  other helpers for those writes unless the user explicitly authorizes it or
+  `github_api.py` is unavailable and that blocker is already recorded.
+- If such an out-of-band write is discovered anyway, stop closeout/merge
+  first, publish an audit note describing the exact fact and reason through
+  `.codex/skills/github_api.py`, then refresh PR state, review delta, and
+  latest head required checks, rerun the applicable gate, and only then
+  resume.
 - Use review comment endpoints (not issue comments) to find inline feedback:
   - List PR review comments:
     ```

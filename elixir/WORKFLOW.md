@@ -272,6 +272,13 @@ If command output is in English, keep the original output first, then add a brie
   - Special case: if a PR is already attached, treat as feedback/rework loop and run a PR feedback sweep before new feature work.
 - `In Progress` -> implementation actively underway.
   - PR created / updated is only the entry signal into the PR closeout path, not the completion signal.
+  - Before every push attempt, explicitly set `Next Push Gate` to exactly one of `local make all`, `closeout gate`, or `light validation`.
+  - Ordinary development branches are PR-bound by default when they will later create/update a PR.
+  - For PR create/update pushes, compute `Next Push Gate` from the cumulative diff that the updated branch / PR head will have against PR base after the push. For a branch without PR, use the intended base, normally `origin/main`. For open PR updates, and for a planned PR create that reuses the current head, do not classify from only the newest local patch.
+  - If the next push will create or update an open PR and that cumulative diff hits `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`, `Next Push Gate` must be `local make all`.
+  - If a branch push previously ran as non-PR push but the same head is now going to create a PR, the run must first make up the now-applicable `Next Push Gate`; do not create the PR before that make-up gate passes.
+  - If any key GitHub write for the current PR flow is found to have happened through GitHub UI, `gh`, ad-hoc CLI, or another helper without explicit user authorization or a recorded `github_api.py unavailable` blocker, stop closeout first, publish an audit note through `.codex/skills/github_api.py`, then re-check PR state, review delta, latest head required checks, and rerun the applicable gate before continuing.
+  - For a first-time PR create, create the PR first because no PR exists yet; immediately after that create write succeeds, the first-priority next GitHub write must be the auto-merge attempt.
   - After every successful PR creation or branch update push, immediately attempt to enable auto-merge for the current PR before reading checks or mergeability.
 - `Checking` -> stop the current implementation run after the bounded PR closeout pass.
   - Entry condition: PR already exists, the latest branch update has already triggered an immediate auto-merge attempt, and the result of that attempt is known.
@@ -279,12 +286,14 @@ If command output is in English, keep the original output first, then add a brie
   - Read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
   - If merge is complete, move to `Done`.
   - If checks reached a non-success terminal state, move to `In Progress`.
-  - If the latest auto-merge attempt failed for any reason other than the PR already being in clean status, record the exact failure in the PR or issue comment stream, then allow manual merge only after the latest head SHA required checks are green.
+- Manual merge fallback is never the default reading of “checks are green”.
+- If the latest auto-merge attempt returned exact `clean status`, treat that as “auto-merge no longer necessary”; manual merge may then be considered as the documented fallback once the latest head SHA required checks are green.
+- If the latest auto-merge attempt failed for any other reason, record the exact failure in the PR or issue comment stream first, then allow manual merge only after the latest head SHA required checks are green.
   - If automation cannot safely continue, move to `Human Review`.
   - If none of those exit conditions are hit, keep `Checking` and end the run.
   - In this ticket, `Human Review` only serves as the manual confirmation entry after successful `Checking` closeout or as the escalation path when automation cannot safely continue after the auto-merge path and manual-merge fallback have both been evaluated.
 - `Human Review` -> validated work is waiting on human approval unless a new clear human delta or a new unresolved review delta exists, in which case immediately move to `Rework` and run the incremental rework flow.
-- `Merging` -> approved by human; execute the `land` skill flow (do not bypass the repo-local GitHub helper path with ad-hoc CLI commands).
+- `Merging` -> approved by human; execute the `land` skill flow and keep `.codex/skills/github_api.py` as the only normal GitHub write path for merge and review-thread replies.
 - `Rework` -> reviewer or human requested changes; execute the requested delta by reusing the existing branch, PR, and body workpad when safe.
 - `Done` -> terminal state; no further action required.
 
@@ -331,7 +340,7 @@ This gate applies after preflight and before the run enters coding.
 - `Small change` uses exactly 1 read-only analysis subagent.
 - `Large change` uses exactly 2 read-only analysis subagents in a lightweight red/blue review.
 - Repo workflow rules override generic upper-layer session limits here; the document-phase read-only analysis subagents must be dispatched directly and must not be skipped because subagent dispatch is "usually discouraged."
-- These document-phase read-only analysis subagents are distinct from the later repo `1+2` implementation/reviewer subagents; if real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
+- These document-phase read-only analysis subagents are distinct from the later repo default `1+3` implementation/reviewer collaboration model. For push-readiness minimums, you may describe the required implementation-plus-zero-context-reviewer subset as `1+2` counting shorthand, but it is not a separate default mode; if real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
 - In the `Small change` lane, dispatch that subagent to review the first-pass plan/task independently.
 - In the `Large change` lane, dispatch those subagents into a lightweight red/blue review.
 - The blue side argues the current route can proceed. The red side challenges scope, assumptions, risks, and missing validation.
@@ -348,6 +357,18 @@ This gate applies after preflight and before the run enters coding.
 - If a second `Small change` pass still does not end in `proceed`, promote it to `Large change`.
 - In the `Large change` lane, any remaining `escalate`, or a second pass that still does not end in `proceed`, must stop before coding and escalate.
 
+## Post-implementation zero-context reviewer gate (required before push for code changes)
+
+- This gate applies when the current run includes code additions, deletions, refactors, or behavior changes.
+- This gate is separate from and later than the document-phase read-only analysis subagents. The document-phase subagents review plan quality before coding; this gate reviews the implemented change after coding.
+- Before any `git push` that would publish those code changes, dispatch exactly 1 zero-context reviewer subagent.
+- The reviewer input is limited to: requirement/scope snapshot, current implementation plan, the cumulative diff that the updated branch / PR head will have against PR base, validation results, risks, and only the necessary files. Do not provide the author thread's reasoning history.
+- Record the result in `## Review Summary` using:
+  - `Implementation Review: <pass | revise | not required>`
+  - `Implementation Review Notes: <compact zero-context reviewer conclusion or None>`
+- If the result is not `pass`, set `Push Readiness` to `not ready`, do not push, and do not move to `Human Review`.
+- A failed implementation review must return to implementation/rework, then rerun the same zero-context reviewer gate. This follows the repo's existing rework and second-repair rules; it is not satisfied by rerunning the document-phase analysis subagents.
+
 ## Step 1: Start/continue execution (Todo or In Progress)
 
 1. Do not normalize the issue body into a forced canonical order.
@@ -356,6 +377,8 @@ This gate applies after preflight and before the run enters coding.
    - Ensure `## Execution Brief` accurately reflects the latest confirmed result, the next required action, and whether a human decision is needed.
    - Ensure `## Acceptance Criteria` is current and still makes sense for the task.
    - Ensure `## Review Summary` contains only compact, still-relevant review outcomes. If no actionable review batch exists, set the review-request fields to `None`.
+   - Ensure `## Review Summary` also carries `Implementation Review` and `Implementation Review Notes`, and that both reflect the latest post-implementation zero-context reviewer result instead of a stale earlier pass.
+   - Ensure `## Review Summary` also carries `Push Readiness` and `Push Readiness Notes`, and that both reflect the current pre-push reality rather than a stale earlier conclusion.
    - Ensure `## Blockers` reflects only active blockers.
    - Ensure `## Codex Workpad` remains the main execution record.
 4. Start work by writing or updating a hierarchical plan in `## Codex Workpad`.
@@ -367,6 +390,7 @@ This gate applies after preflight and before the run enters coding.
    - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
    - If changes touch app files or app behavior, add explicit app-specific flow checks to `## Acceptance Criteria`.
    - If the ticket description already includes `Validation`, `Test Plan`, or `Testing`, carry those requirements into `## Acceptance Criteria` and `## Codex Workpad > Validation` as required checkboxes.
+   - Add or refresh `Next Push Gate` in `## Codex Workpad` as one of `local make all`, `closeout gate`, or `light validation`.
 7. Run a principal-style self-review of the plan and refine it in `## Codex Workpad`.
 8. Before implementing, capture a concrete reproduction signal and record it in `## Codex Workpad > Notes`.
 9. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull or sync result in `## Codex Workpad > Notes`.
@@ -379,18 +403,22 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 
 1. Identify the PR number from issue links or attachments.
 2. In review-sensitive states, gather only the new or still-unresolved feedback required for this pass from the necessary channels:
-   - Top-level PR comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
-   - Inline review comments (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
-   - Review summaries or states (via the repo-local GitHub helper or equivalent authenticated GitHub API path).
+   - Top-level PR comments (via `.codex/skills/github_api.py`).
+   - Inline review comments (via `.codex/skills/github_api.py`).
+   - Review summaries or states (via `.codex/skills/github_api.py`).
    - Only the necessary short current-issue comments that add review context or human decisions not yet reflected in the issue body.
 3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
    - code, test, or docs updated to address it, or
-   - explicit, justified pushback reply is posted on that thread.
+   - explicit, justified pushback reply is posted on that thread through `.codex/skills/github_api.py`.
 4. Update `## Review Summary` with:
    - `Latest Review Request`: the exact compact summary of the latest actionable review batch, or `None` when none exists.
    - `Handled Review Request`: the exact same summary once fully handled, or `None` when no actionable review batch exists.
+   - `Implementation Review`: `pass` only when the latest required post-implementation zero-context reviewer has passed for the current code delta; otherwise `revise` or `not required`.
+   - `Implementation Review Notes`: the current zero-context reviewer conclusion, missing items, or `None`.
    - `Open Items`: the current outstanding items and their resolution status.
    - `Resolved Items`: only a short summary of already-closed items when useful.
+   - `Push Readiness`: `ready` only when the current `Next Push Gate` is already satisfied for the next push and `Implementation Review` is `pass` or `not required`; otherwise `not ready`.
+   - `Push Readiness Notes`: the exact missing proof or blocker for the next push, or `None`.
    - When no actionable review batch remains, set both `Latest Review Request` and `Handled Review Request` to `None`.
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this incremental sweep until there are no outstanding actionable comments for the current pass.
@@ -413,11 +441,16 @@ Use this only when completion is blocked by missing required tools or missing au
 - Checks from an older head SHA do not satisfy the closeout requirement for the latest commit.
 - If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA.
 - Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed.
+- For every latest-head repair loop, recompute `Next Push Gate` before the next push instead of reusing a stale earlier gate decision.
+- Do not treat a generic closeout gate as sufficient when the next push will create or update an open PR whose updated cumulative branch/PR diff against PR base hits `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`; that branch must stay on `local make all`.
 - Every PR create/update push must be followed immediately by an auto-merge attempt for the current PR before reading checks, mergeability, or other closeout signals.
 - Treat `already enabled` as a successful auto-merge outcome.
-- If the auto-merge attempt returns that the PR is already in clean status, do not treat that as a permission blocker; it means the PR has already advanced to the direct-merge stage and can use the manual-merge fallback once latest head SHA required checks are green.
+- If the auto-merge attempt returns exact `clean status`, do not treat that as a permission blocker; it means the PR has already advanced to the direct-merge stage and can use the manual-merge fallback once latest head SHA required checks are green.
 - Only when the latest auto-merge attempt failed for another reason should the run preserve a manual-merge fallback path, and that fallback must be called out explicitly in a PR or issue comment before any manual merge happens.
+- PR create/update, review replies, PR/issue audit comments, and merge are key GitHub writes. If any of them are discovered to have happened through GitHub UI, `gh`, ad-hoc CLI, or another helper without explicit user authorization or a recorded `github_api.py unavailable` blocker, treat that as workflow violation rather than normal variance.
+- On that violation path, stop closeout / merge immediately, record the exact out-of-band write fact and reason through `.codex/skills/github_api.py` in the PR or issue comment stream, then re-check PR state, review delta, latest head required checks, and rerun the applicable `Next Push Gate` before continuing.
 - When an attached PR already exists, do not move to `Human Review` merely because the PR exists.
+- If the first remote full gate on the latest head still surfaces coverage, dialyzer, or similar full-gate failures, treat that as a missed or non-compliant local `make all` gate unless concrete evidence shows environment drift or instability.
 - During `Checking`, read only three signal classes: latest PR merge status, latest head SHA required checks, and the newest human review delta.
 - If merge is complete, move to `Done`.
 - If required checks on the latest head SHA reach a non-success terminal state, move to `In Progress`.
@@ -456,22 +489,47 @@ Use this only when completion is blocked by missing required tools or missing au
    - Document these temporary proof steps and outcomes in `## Codex Workpad > Validation` or `Notes`.
    - If app-touching, run `launch-app` validation and capture or upload media before handoff.
 7. Re-check all completion criteria and close any gaps.
-8. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-9. Attach PR URL to the issue (prefer attachment; use the issue body only if attachment is unavailable).
-   - Ensure the GitHub PR has label `symphony` (add it if missing).
-   - Immediately after PR creation or branch-update push succeeds, attempt to enable auto-merge for the current PR before reading checks, mergeability, or other closeout signals.
-   - If the auto-merge attempt fails for any reason other than `already enabled` or `clean status`, record that exact failure in the PR or issue comment stream and preserve manual merge only as an explicit fallback after latest head SHA required checks are green.
-10. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
-11. Update the execution sections with final checklist status and validation notes.
+8. If the run includes code additions, deletions, refactors, or behavior changes, run the post-implementation zero-context reviewer gate now.
+   - This is a distinct gate from the document-phase analysis subagents and cannot be replaced by them.
+   - The reviewer must evaluate the implemented cumulative branch/PR diff against PR base together with the latest validation evidence.
+   - Record the result in `## Review Summary`.
+   - If `Implementation Review` is not `pass`, keep `Push Readiness` at `not ready`, do not push, and do not move to `Human Review`.
+9. Before every `git push` attempt, answer these questions and record the result in `## Codex Workpad` and `## Review Summary`:
+   - Will this push create a PR or update an open PR?
+   - Is this branch already effectively PR-bound even if the PR does not exist yet, because the current head will be used for PR creation/update?
+   - What cumulative diff will the updated branch / PR head have against PR base after this push? For a branch without PR, use the intended base, normally `origin/main`. For open PR updates, or for a planned PR create on the same head, ignore any attempt to classify only the latest local patch.
+   - Does that cumulative diff hit `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`?
+   - Is the correct `Next Push Gate` therefore `local make all`, `closeout gate`, or `light validation`?
+   - If code changed, is `Implementation Review` already `pass` for this exact cumulative diff?
+   - Has that gate already passed for the current next push?
+   - If the answer is `local make all`, have you avoided falling back to a generic closeout gate for this push?
+   - If an earlier push on this same head used `light validation`, but the head is now going to create a PR, have you rerun the gate that now applies before attempting PR creation?
+   - Has any key GitHub write for this PR flow happened out-of-band, and if so, have you already stopped, audited it through `.codex/skills/github_api.py`, rechecked PR state/review delta/latest head required checks, and only then resumed?
+   Then act on the answer:
+   - `local make all` -> run `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all` before pushing.
+   - `closeout gate` -> run format check, lint, and targeted tests before pushing.
+   - `light validation` -> run the lightest validation that proves the change before pushing.
+   If the selected gate fails, or `Implementation Review` is not `pass` when required, set `Push Readiness` to `not ready`, fix the issue, rerun the same gate, and do not push until it passes.
+10. For the PR create/update path, keep the immediate auto-merge attempt ahead of every other post-push GitHub write.
+   - If this push created a PR, create the PR first, then immediately attempt auto-merge for that new PR.
+   - If this push updated an open PR, the first-priority GitHub write after the successful branch-update push must be the auto-merge attempt itself; do not refresh labels, title/body, review replies, or other GitHub writes first.
+   - If the auto-merge attempt fails for any reason other than exact `already enabled` or exact `clean status`, record that exact failure through `.codex/skills/github_api.py` in the PR or issue comment stream and preserve manual merge only as an explicit fallback after latest head SHA required checks are green.
+   - If you discover that a key GitHub write for this flow already happened through GitHub UI, `gh`, ad-hoc CLI, or another helper without explicit user authorization or a recorded `github_api.py unavailable` blocker, stop normal closeout here, publish the exact out-of-band write fact and reason through `.codex/skills/github_api.py`, then refresh PR state, review delta, latest head required checks, and rerun the applicable gate before resuming.
+11. Only after the immediate auto-merge attempt has been made, attach PR URL to the issue (prefer attachment; use the issue body only if attachment is unavailable) and ensure the GitHub PR has label `symphony` (add it if missing).
+12. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
+13. Update the execution sections with final checklist status and validation notes.
    - Mark completed items in `## Acceptance Criteria` and `## Codex Workpad` as checked.
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
+   - Refresh `Next Push Gate`, `Push Readiness`, and `Push Readiness Notes` so they describe the next actual push or explicitly say `None` when no further push is planned in this run.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
-12. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
+14. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm that the latest PR create/update push already triggered an immediate auto-merge attempt; do not defer that attempt until after checks are read.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
+   - Confirm `Implementation Review` is `pass` or `not required`; if not, do not push further changes, do not move to `Human Review`, and return to implementation/rework.
+   - Confirm `Push Readiness` no longer blocks the next push; if another push is needed, recalculate `Next Push Gate` before doing it.
    - If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`.
    - Do not treat checks on an older head SHA as sufficient for closeout after newer commits land.
    - Confirm every required ticket-provided validation or test-plan item is explicitly marked complete in the issue body.
@@ -481,19 +539,19 @@ Use this only when completion is blocked by missing required tools or missing au
    - If the bounded pass succeeds and auto-merge is active, move to `Checking` and stop this implementation run.
    - If the bounded pass succeeds, the latest auto-merge attempt reported clean status, and latest head SHA required checks are green, manual merge may proceed as the documented fallback without first treating clean status as a blocker.
    - Refresh `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, `## Blockers`, and `## Codex Workpad` so they reflect the completed work accurately.
-13. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
+15. Do not move directly from `In Progress` to `Human Review` on a successful closeout pass; move to `Checking` first.
    - Exception: if blocked by missing required non-GitHub tools or auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-14. For `Todo` tickets that already had a PR attached at kickoff:
+16. For `Todo` tickets that already had a PR attached at kickoff:
    - Ensure all existing PR feedback was reviewed and resolved, including inline review comments.
    - Ensure branch was pushed with any required updates.
    - Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists.
-15. Add a short issue comment only at a significant external checkpoint:
+17. Add a short issue comment only at a significant external checkpoint:
    - entering `Human Review`,
    - a true blocker requiring human action,
    - a completed rework pass after review feedback,
    - or final completion when a short thread-visible note is useful.
    Keep these comments brief and never use them as the sole source of current instructions or progress state.
-16. Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff.
+18. Before stopping this run from normal execution, do not force the issue to `Human Review` unless `Checking` has closed successfully or an explicit escalation path requires a human handoff.
 
 ## Step 3: Human Review and merge handling
 
@@ -531,6 +589,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Validation or tests are green for the latest commit.
 - PR feedback sweep is complete.
 - If the PR already has review comments, top-level PR comments, or review threads, no actionable comments remain and `## Review Summary` accurately reflects that there is no unresolved review delta.
+- `## Review Summary` accurately reflects current `Push Readiness`, and `## Codex Workpad` accurately reflects the current or most recent `Next Push Gate`.
 - PR is still valid, the latest head SHA required checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation or media requirements are complete.
@@ -579,6 +638,10 @@ Do not force this structure when the issue body already has useful human-authore
 
 - Latest Review Request: <exact compact summary of the latest actionable review batch or None>
 - Handled Review Request: <exact same summary once fully handled, or None>
+- Implementation Review: <pass | revise | not required>
+- Implementation Review Notes: <compact zero-context reviewer conclusion or None>
+- Push Readiness: <ready | not ready>
+- Push Readiness Notes: <what is still missing before the next push, or None>
 - Open Items: <review item / source / status; if none write None>
 - Resolved Items: <optional short summary>
 
@@ -591,6 +654,9 @@ Do not force this structure when the issue body already has useful human-authore
 ```text
 <hostname>:<abs-path>@<short-sha>
 ```
+
+Next Push Gate: <local make all | closeout gate | light validation | None>
+Out-of-Band GitHub Write Audit: <not needed | pending | recorded in PR/issue comment stream>
 
 ### Plan
 
