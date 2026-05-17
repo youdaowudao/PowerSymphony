@@ -66,6 +66,29 @@ defmodule SymphonyElixir.RunStateStore do
     end
   end
 
+  @spec timeline_for_running_entries([map()], String.t(), keyword()) ::
+          {:ok, %{items: [map()], next_cursor: String.t() | nil}}
+          | {:error, :run_not_found | :duplicate_run | :invalid_cursor | :timeline_unavailable}
+  def timeline_for_running_entries(entries, issue_identifier, opts \\ [])
+      when is_list(entries) and is_binary(issue_identifier) do
+    case matching_timeline_entries(entries, issue_identifier) do
+      [] ->
+        {:error, :run_not_found}
+
+      [_entry, _other | _rest] ->
+        {:error, :duplicate_run}
+
+      [entry] ->
+        case Map.get(entry, :run_trace) do
+          %RunTrace{} = trace ->
+            read_timeline(trace, opts)
+
+          _ ->
+            {:error, :run_not_found}
+        end
+    end
+  end
+
   defp finalize_summary(summary, events, opts) do
     config = Config.settings!()
     now = Keyword.get(opts, :now, DateTime.utc_now())
@@ -231,4 +254,30 @@ defmodule SymphonyElixir.RunStateStore do
   defp fallback_value?(nil), do: true
   defp fallback_value?("unknown"), do: true
   defp fallback_value?(value), do: value == StateReducer.fallback_action()
+
+  defp matching_timeline_entries(entries, issue_identifier) do
+    Enum.filter(entries, fn entry ->
+      running_entry_issue_identifier(entry) == issue_identifier
+    end)
+  end
+
+  defp running_entry_issue_identifier(entry) when is_map(entry) do
+    Map.get(entry, :identifier) ||
+      entry |> Map.get(:issue, %{}) |> Map.get(:identifier) ||
+      Map.get(entry, "identifier") ||
+      entry |> Map.get("issue", %{}) |> Map.get("identifier")
+  end
+
+  defp read_timeline(%RunTrace{} = trace, opts) do
+    case RunTrace.timeline(trace, opts) do
+      {:ok, timeline} ->
+        {:ok, timeline}
+
+      {:error, :invalid_cursor} ->
+        {:error, :invalid_cursor}
+    end
+  rescue
+    _error ->
+      {:error, :timeline_unavailable}
+  end
 end

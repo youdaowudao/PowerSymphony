@@ -121,7 +121,12 @@ defmodule SymphonyElixirWeb.ProjectLive do
     end
   end
 
-  defp run_path(project_id, issue_identifier), do: "/projects/#{project_id}/runs/#{issue_identifier}"
+  defp run_path(project_id, issue_identifier) do
+    encoded_project_id = URI.encode(to_string(project_id), &URI.char_unreserved?/1)
+    encoded_issue_identifier = URI.encode(to_string(issue_identifier), &URI.char_unreserved?/1)
+
+    "/projects/#{encoded_project_id}/runs/#{encoded_issue_identifier}"
+  end
 
   defp state_badge_class(state) do
     base = "state-badge"
