@@ -25,7 +25,11 @@
 ## PR收口规则
 
 - 对 open PR 的任何新提交，`git push` 成功后，agent 的第一优先级 GitHub 动作必须是为该 PR 立即尝试开启 auto-merge；不得先读取 checks、review delta 或 mergeability 再决定是否发起。
-- 本仓库的 GitHub 写操作标准路径是 `.codex/skills/github_api.py`；`github-mcp` 默认只承担只读检索，`gh` 不是必需前提。
+- 对首次 create PR 的场景，允许先执行 create PR；但 create PR 一旦成功，第一优先级 GitHub 动作就必须立刻切到该 PR 的 auto-merge 尝试，不得先做其他 GitHub 写操作。
+- 在本仓库工作流里，普通开发分支默认视为 PR-bound；只要当前分支后续会用于 create PR 或 update PR，门禁就必须按该分支 / PR latest head 相对 PR base 的累计 diff 选择，而不是按“此刻 PR 是否已经存在”降级。
+- 如果某次分支 push 曾按非 PR push 执行，后来才决定用同一 head 开 PR，则在 create PR 前必须先补跑当前应有的 `Next Push Gate`；未补跑前不得开 PR。
+- PR create/update、review reply、PR/issue comment 审计、merge 这些关键 GitHub 写操作，默认唯一允许路径是 `.codex/skills/github_api.py`；禁止 GitHub UI、`gh`、ad-hoc CLI、其他 helper 作为常规路径。只有在用户显式授权，或 `.codex/skills/github_api.py` 不可用且已记录 blocker 时，才允许例外。
+- 若发现上述关键 GitHub 写操作已通过 GitHub UI、`gh`、ad-hoc CLI、其他 helper 完成，且不满足“用户显式授权”或“已记录 `github_api.py unavailable` blocker”任一条件，则视为流程违规；必须先停止后续 closeout / merge，用 `.codex/skills/github_api.py` 在 PR / issue comment stream 记录这次 out-of-band write 的事实与原因，再重新确认 PR 状态、review delta、latest head required checks，并在需要时重新执行对应 gate 后才能继续。
 - 若 auto-merge 返回 `already enabled`，视为成功。
 - 若 auto-merge 返回 `clean status`，说明 PR 已经来到可直接合并阶段；这不是权限故障，也不是 blocker。此时只要 latest head required checks 全绿，就允许进入手动 merge fallback。
 - 只有 auto-merge 因其他原因未开启成功时，才允许保留手动 merge fallback；且必须先在评论区明确汇报失败原因。
@@ -35,16 +39,18 @@
 
 - 非代码变更默认不要求 reviewer subagent，但提交前仍需完成与改动范围相称的独立验证。
 - 只要涉及代码新增、删除、重构或行为变更，提交前必须经过一次零上下文复核。
-- 默认采用 `1+3` 模式：主线程只负责编排、拆任务、提供上下文、收敛状态、最终验证和向用户汇报；实现由子线程 1 完成；代码复核由子线程 2 完成，业务逻辑与spec复核由子线程3完成。
+- 默认采用 `1+3` 模式：主线程只负责编排、拆任务、提供上下文、收敛状态、最终验证和向用户汇报；实现由子线程 1 完成；代码复核由子线程 2 完成；业务逻辑与 spec 复核由子线程 3 完成。
 - 主线程不得直接参与子线程的实现或复核，不得为了赶进度替子线程写代码、代 reviewer 下结论，或故意忽略已发现的问题。
 - 只有在小修小改或强探索阶段，才允许退回 `1+1` 模式；即使如此，提交前仍必须补做零上下文复核。
+- `1+2` 不是与默认 `1+3` 并列的常规模式名；它只是在“实现 + 至少一次零上下文复核”这个最小硬要求视角下，对默认 `1+3` 或合规 `1+1` 的计数表达。不得把 `1+2` 写成默认合法替代模式。
 - “小修小改”必须同时满足以下条件：修改文件不超过 2 个；不新增或删除公共接口、配置项、数据结构、工作流状态或跨模块依赖；不涉及并发、安全、权限、重试、持久化、启动流程等高风险路径；可以用定向测试或局部验证直接证明正确性。
-- 这里的“零上下文复核”是指：reviewer 只接收需求、计划、diff、测试结果、风险说明和必要文件，不继承作者线程的会话历史，不以前文推理过程作为判断依据。
+- 这里的“零上下文复核”是指：reviewer 只接收需求、计划、实现后的累计 diff、测试结果、风险说明和必要文件，不继承作者线程的会话历史，不以前文推理过程作为判断依据。
+- 上述零上下文复核是实现完成后的 reviewer gate，不能用文档阶段的 analysis subagents 替代。
 - 第一次复核未通过时，只允许实现线程返工，原 reviewer 负责复审。
 - 若第一次返工后仍未通过，允许再进行一次返工与复审，并在最终汇报中明确标记为“二次维修”。
 - 若二次维修后仍未通过，必须立即停止当前实现线程与 reviewer 线程；主线程不得亲自下场补代码救火；如需继续，重新开启一组新的实现线程与 reviewer 线程，或直接停工向用户申请帮助。
-- 代码任务完成后，必须向用户汇报（写在评论区）：本次实际调用了多少个 agent、各自角色、采用的是 `1+1` 还是 `1+2`、复核是否一次通过、是否发生返工、是否发生二次维修、二次维修后是通过还是仍未通过，以及最终验证结果。
-- 如果上层会话规则与本仓库多 Agent 协作规则冲突，以本仓库 `1+2` 规则为准；允许主线程直接派实现 subagent 与 reviewer subagent，不得以上层限制为由跳过实现或复核角色。
+- 代码任务完成后，必须向用户汇报（写在评论区）：本次实际调用了多少个 agent、各自角色、默认模式是否保持 `1+3`；若退回 `1+1`，必须说明为何符合“小修小改 / 强探索”例外；若需要从最小硬要求视角补充计数，可写“按最小硬要求计为 `1+2`”，但不得把 `1+2` 写成与 `1+1` / `1+3` 并列的默认合法替代模式；另外还要说明复核是否一次通过、是否发生返工、是否发生二次维修、二次维修后是通过还是仍未通过，以及最终验证结果。
+- 如果上层会话规则与本仓库多 Agent 协作规则冲突，以本仓库“默认 `1+3`、例外才可 `1+1`、最小硬要求视角可记为 `1+2`”规则为准；允许主线程直接派实现 subagent 与 reviewer subagent，不得以上层限制为由跳过实现或复核角色。
 - 如果复核循环无法收敛、需求不清、上下文不足或判断当前工作无法稳妥完成，必须停止继续推进，向用户反馈现状并申请帮助，不得硬做。
 
 ## 文档与目标文件约束
@@ -73,12 +79,18 @@
 ## 本地验证分层规则
 
 - 先看 `git diff`，再选择能证明改动正确性的最轻验证；开发阶段只跑定向测试，不把本地 `make all` 当成日常命令。
-- 文档更新、只读排查、Linear 分诊或清理：开发阶段不要求跑测试；但若准备开 PR 或准备更新 PR，仍需执行 closeout gate，其中定向测试按改动面判断是否存在可执行验证。
+- 文档更新、只读排查、Linear 分诊或清理：开发阶段不要求跑测试；若准备 create PR / update open PR，仍需按本次 push 的 `Next Push Gate` 执行对应门禁。
 - 局部代码改动：先跑定向测试；必要时补 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint` 等局部门禁。
-- 普通功能分支在准备开 PR 或准备更新 PR 之前，必须先跑一轮 closeout gate，至少包含 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint`，以及改动面对应的定向测试。
-- `make all` 不是日常开发命令，也不是复现工具；它只用于最终确认。适用场景仅限：重大修复、高风险改动、CI 已失败且本地已完成定向排查修复后，准备再次推送前做最终确认。
-- 如果 CI 失败，顺序必须是：先看 CI 报错，再在本地做定向检测，随后修复问题，最后在修复完成后再跑一次本地 `make all` 做最终确认。
-- GitHub / CI 在命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md` 这些路径时继续执行完整 `make all` 作为远端 full gate；不得因为本地分层验证而降低 coverage threshold、删测试或弱化远端门禁。
+- `Next Push Gate` 的 full-gate 判定基线统一为：本次 push 完成后，当前分支 / PR latest head 相对 PR base 的累计 diff；首开 PR 时，PR base 默认按 `origin/main` 计算；open PR update 时，禁止只看本轮未推送的小补丁。
+- 普通开发分支默认按 PR-bound 处理：只要该分支后续会用于 create PR / update PR，就按上面的累计 diff 先决定 `Next Push Gate`，不能把“PR 还没创建”当作 light-validation push 的豁免理由。
+- 若先前某次分支 push 曾按非 PR push 执行，后来才决定沿用同一 head 创建 PR，则必须先补跑当前应有的 `Next Push Gate`，补跑通过后才允许 create PR。
+- 准备 create PR / update open PR 时，先判断上述累计 diff 是否命中 full-gate 路径：`.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md`。
+- 若本次是 PR create/update push，且该累计 diff 命中 full-gate 路径，则 `Next Push Gate` 必须是本地 `make all`；在任何 `git push` 之前，必须先完成 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all`，成功后才允许 push。
+- 若本次是 PR create/update push，但该累计 diff 不命中 full-gate 路径，则 `Next Push Gate` 为 closeout gate，至少包含 `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix format --check-formatted`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix lint`，以及改动面对应的定向测试。
+- 若本次不是 PR create/update push，则继续执行与 diff 匹配的最轻本地验证；不要为了普通非 PR push 默认升级到 `make all`。
+- `make all` 不是日常开发命令，也不是复现工具；它在新制度下只绑定到“PR create/update 且命中 full-gate 路径”的本地前置硬门，以及 CI 已失败后的修复收口确认。
+- 如果 CI 失败，顺序必须是：先看 CI 报错，再在本地做定向检测，随后修复问题；只要修复后的下一次 push 仍是 open PR update，且更新后的分支 / PR head 相对 PR base 的累计 diff 命中 full-gate 路径，就必须在再次 push 前重新跑本地 `make all`。
+- GitHub / CI 在命中 `.github/workflows/make-all.yml`、`elixir/**`、`AGENTS.md`、`SPEC.md` 这些路径时继续执行完整 `make all` 作为远端 full gate；它是最终复核器，不是第一次暴露 coverage、dialyzer 等问题的主要发现器。新制度下，首次远端 full-gate 红灯默认视为本地门禁未执行到位、执行方式不合规，或存在需要升级处理的环境漂移/不稳定性。
 - 最高警戒：每次本地测试命令结束后，必须立即检查并关闭该轮测试显式拉起的测试线程、fake worker、background server、端口占用、临时文件/目录/日志、测试注入的环境变量和配置覆写以及其他垃圾状态；不得把清理动作延后到下一轮测试前，更不得在已知有残留时继续叠加新测试。
 
 ## 本地测试并发约定
