@@ -55,6 +55,45 @@ defmodule SymphonyElixir.CoreTest do
 
   def continuation_retry_callback_issue, do: @continuation_retry_callback_issue
 
+  defmodule M3PrecheckOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts) do
+      running = Keyword.get(opts, :running, %{})
+
+      state = %SymphonyElixir.Orchestrator.State{
+        running: running,
+        claimed: MapSet.new(),
+        blocked_claims: %{},
+        retry_attempts: %{},
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: Keyword.get(opts, :max_concurrent_agents, 10)
+      }
+
+      {:ok, state}
+    end
+
+    def handle_call(:snapshot, _from, %SymphonyElixir.Orchestrator.State{} = state) do
+      snapshot = %{
+        running: [],
+        retrying: [],
+        codex_totals: state.codex_totals || %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        rate_limits: nil
+      }
+
+      {:reply, snapshot, state}
+    end
+
+    def handle_call(:request_refresh, _from, state) do
+      {:reply, :unavailable, state}
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -839,7 +878,7 @@ defmodule SymphonyElixir.CoreTest do
     orchestrator_name = Module.concat(__MODULE__, :M3PrecheckCurrentWorkOrchestrator)
 
     start_supervised!(
-      {SymphonyElixir.ExtensionsTest.M3PrecheckOrchestrator,
+      {M3PrecheckOrchestrator,
        name: orchestrator_name,
        max_concurrent_agents: 2,
        running: %{
@@ -2106,27 +2145,21 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
-      count=0
+      #!/usr/bin/env bash
+      set -euo pipefail
+
       while IFS= read -r line; do
-        count=$((count + 1))
-        case "$count" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            ;;
-        esac
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-1","status":{"type":"idle"},"turns":[{"id":"turn-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 
@@ -2191,26 +2224,20 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(
         codex_binary,
         """
-        #!/bin/sh
-        count=0
+        #!/usr/bin/env bash
+        set -euo pipefail
         while IFS= read -r line; do
-          count=$((count + 1))
-          case "$count" in
-            1)
-              printf '%s\\n' '{\"id\":1,\"result\":{}}'
-              ;;
-            2)
-              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
-              ;;
-            3)
-              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
-              ;;
-            4)
-              printf '%s\\n' '{\"method\":\"turn/completed\"}'
-              ;;
-            *)
-              ;;
-          esac
+          if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+            printf '%s\\n' '{"id":1,"result":{}}'
+          elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-live"}}}'
+          elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-live"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+          elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-live","status":{"type":"idle"},"turns":[{"id":"turn-live","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+            exit 0
+          fi
         done
         """
       )
@@ -2348,33 +2375,36 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
       run_id="$(date +%s%N)-$$"
       printf 'RUN:%s\\n' "$run_id" >> "$trace_file"
-      count=0
+      turn_count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          turn_count=$((turn_count + 1))
+          if [ "$turn_count" -eq 2 ]; then
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+          else
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
+          fi
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          if [ "$turn_count" -ge 2 ]; then
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-cont","status":{"type":"idle"},"turns":[{"id":"turn-cont-1","status":"completed","items":[],"startedAt":1,"completedAt":2},{"id":"turn-cont-2","status":"completed","items":[],"startedAt":3,"completedAt":4}]}}}'
+            exit 0
+          else
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-cont","status":{"type":"idle"},"turns":[{"id":"turn-cont-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          fi
+        fi
       done
       """)
 
@@ -2479,31 +2509,33 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
+      turn_count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-result"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-result-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-result"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          turn_count=$((turn_count + 1))
+          if [ "$turn_count" -eq 2 ]; then
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-result-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+          else
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-result-1"}}}'
+          fi
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          if [ "$turn_count" -ge 2 ]; then
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-result","status":{"type":"idle"},"turns":[{"id":"turn-result-1","status":"completed","items":[],"startedAt":1,"completedAt":2},{"id":"turn-result-2","status":"completed","items":[],"startedAt":3,"completedAt":4}]}}}'
+          else
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-result","status":{"type":"idle"},"turns":[{"id":"turn-result-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          fi
+        fi
       done
       """)
 
@@ -2571,7 +2603,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner stops before a stale continuation turn when workspace binding is closing" do
+  test "agent runner fails current turn when workspace becomes invalid before continuation decision" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -2600,23 +2632,17 @@ defmodule SymphonyElixir.CoreTest do
       while IFS= read -r line; do
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale-turn"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stale-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale-turn"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stale-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-stale-turn","status":{"type":"idle"},"turns":[{"id":"turn-stale-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
       done
       """)
 
@@ -2682,20 +2708,31 @@ defmodule SymphonyElixir.CoreTest do
                )
 
       assert_receive(
-        {:agent_run_result, ^issue_id, %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}},
-        500
-      )
-
-      assert_receive(
         {:agent_run_result, ^issue_id,
          %{
            status: :failed,
            reason: :workspace_lifecycle_invalid,
-           turn_count: 2,
+           turn_count: 1,
            run_instance_id: "run-stale-continuation"
          }},
         500
       )
+
+      refute_receive(
+        {:agent_run_result, ^issue_id, %{status: :continuation_required, reason: :issue_still_active, turn_count: 1}},
+        200
+      )
+
+      turn_start_count =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.count(&(&1["method"] == "turn/start"))
+
+      assert turn_start_count == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -2782,27 +2819,23 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-blocked"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-blocked-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-blocked"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-blocked-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-blocked","status":{"type":"idle"},"turns":[{"id":"turn-blocked-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
       done
       """)
 
@@ -2880,31 +2913,23 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-checking","status":{"type":"idle"},"turns":[{"id":"turn-checking-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
       done
       """)
 
@@ -2981,31 +3006,23 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking-recheck"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-recheck-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-recheck-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-checking-recheck"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-checking-recheck-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-checking-recheck","status":{"type":"idle"},"turns":[{"id":"turn-checking-recheck-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
       done
       """)
 
@@ -3086,31 +3103,23 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-rerouted"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rerouted-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rerouted-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-rerouted"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rerouted-1"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-rerouted","status":{"type":"idle"},"turns":[{"id":"turn-rerouted-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
       done
       """)
 
@@ -3189,32 +3198,34 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
       printf 'RUN\\n' >> "$trace_file"
-      count=0
+      turn_count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          turn_count=$((turn_count + 1))
+          if [ "$turn_count" -eq 2 ]; then
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+          else
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
+          fi
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          if [ "$turn_count" -ge 2 ]; then
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-max","status":{"type":"idle"},"turns":[{"id":"turn-max-1","status":"completed","items":[],"startedAt":1,"completedAt":2},{"id":"turn-max-2","status":"completed","items":[],"startedAt":3,"completedAt":4}]}}}'
+          else
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-max","status":{"type":"idle"},"turns":[{"id":"turn-max-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          fi
+        fi
       done
       """)
 
@@ -3286,31 +3297,33 @@ defmodule SymphonyElixir.CoreTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
-      count=0
+      turn_count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max-result"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-result-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max-result"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          turn_count=$((turn_count + 1))
+          if [ "$turn_count" -eq 2 ]; then
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-result-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+          else
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-result-1"}}}'
+          fi
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          if [ "$turn_count" -ge 2 ]; then
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-max-result","status":{"type":"idle"},"turns":[{"id":"turn-max-result-1","status":"completed","items":[],"startedAt":1,"completedAt":2},{"id":"turn-max-result-2","status":"completed","items":[],"startedAt":3,"completedAt":4}]}}}'
+          else
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-max-result","status":{"type":"idle"},"turns":[{"id":"turn-max-result-1","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          fi
+        fi
       done
       """)
 
@@ -3516,6 +3529,191 @@ defmodule SymphonyElixir.CoreTest do
 
       assert_receive {:agent_run_result, "issue-turn-cancelled-result", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
                      500
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner reports failed run result when turn is cancelled after a provisional completed event" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-completed-then-cancelled-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/usr/bin/env bash
+      set -euo pipefail
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-completed-then-cancelled"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-completed-then-cancelled"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+          printf '%s\\n' '{"method":"turn/cancelled","params":{"message":"late cancellation"}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-completed-then-cancelled","status":{"type":"idle"},"turns":[{"id":"turn-completed-then-cancelled","status":"interrupted","error":{"message":"late cancellation"},"items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2
+      )
+
+      issue = %Issue{
+        id: "issue-completed-then-cancelled",
+        identifier: "MT-CTC",
+        title: "Turn cancelled after completed",
+        description: "Late cancellation must block continuation",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-CTC",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        send(self(), :issue_state_fetch_called_after_provisional_completion)
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-completed-then-cancelled",
+             identifier: "MT-CTC",
+             title: "Turn cancelled after completed",
+             description: "Late cancellation must block continuation",
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive {:agent_run_result, "issue-completed-then-cancelled", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+                     500
+
+      refute_receive :issue_state_fetch_called_after_provisional_completion, 200
+      refute_receive {:agent_run_result, "issue-completed-then-cancelled", %{status: :continuation_required}}, 200
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner does not continue after completed when resume barrier reports interrupted turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-completed-then-interrupted-barrier-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/usr/bin/env bash
+      set -euo pipefail
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner-interrupted-barrier"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-runner-interrupted-barrier"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+          printf '%s\\n' '{"method":"turn/cancelled","params":{"message":"late cancellation after barrier wait"}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-runner-interrupted-barrier","status":{"type":"idle"},"turns":[{"id":"turn-runner-interrupted-barrier","status":"interrupted","error":{"message":"late cancellation after barrier wait"},"items":[],"startedAt":1,"completedAt":2}]}}}'
+        fi
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2
+      )
+
+      issue = %Issue{
+        id: "issue-runner-interrupted-barrier",
+        identifier: "MT-RIB",
+        title: "Resume barrier interrupted turn",
+        description: "Late interrupted barrier result must not continuation",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RIB",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        send(self(), :issue_state_fetch_called_after_interrupted_barrier)
+
+        {:ok,
+         [
+           %Issue{
+             id: issue.id,
+             identifier: issue.identifier,
+             title: issue.title,
+             description: issue.description,
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive {:agent_run_result, "issue-runner-interrupted-barrier", %{status: :failed, reason: :premature_turn_end, turn_count: 1}},
+                     500
+
+      refute_receive :issue_state_fetch_called_after_interrupted_barrier, 200
+      refute_receive {:agent_run_result, "issue-runner-interrupted-barrier", %{status: :continuation_required}}, 200
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -4126,33 +4324,25 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-args.trace}"
-      count=0
       printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
       printf 'CWD:%s\\n' \"$PWD\" >> \"$trace_file\"
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-77\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-77"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-77"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-77","status":{"type":"idle"},"turns":[{"id":"turn-77","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 
@@ -4260,31 +4450,23 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
-      count=0
       printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
 
       while IFS= read -r line; do
-        count=$((count + 1))
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-88"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-88"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-88","status":{"type":"idle"},"turns":[{"id":"turn-88","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 
@@ -4345,32 +4527,23 @@ defmodule SymphonyElixir.CoreTest do
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
-      #!/bin/sh
+      #!/usr/bin/env bash
+      set -euo pipefail
       trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-policy-overrides.trace}"
-      count=0
 
       while IFS= read -r line; do
-        count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
-
-        case "$count" in
-          1)
-            printf '%s\\n' '{"id":1,"result":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{"method":"turn/completed"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
+        if printf '%s\\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\\n' '{"id":1,"result":{}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+        elif printf '%s\\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\\n' '{"id":5,"result":{"thread":{"id":"thread-99","status":{"type":"idle"},"turns":[{"id":"turn-99","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 

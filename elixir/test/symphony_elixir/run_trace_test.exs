@@ -80,18 +80,21 @@ defmodule SymphonyElixir.RunTraceTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
-      count=0
-      while IFS= read -r _line; do
-        count=$((count + 1))
-        case "$count" in
-          1) printf '%s\n' '{"id":1,"result":{}}' ;;
-          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-trace"}}}' ;;
-          3)
-            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-trace"}}}'
-            printf '%s\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      while IFS= read -r line; do
+        if printf '%s\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\n' '{"id":1,"result":{}}'
+        elif printf '%s\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-trace"}}}'
+        elif printf '%s\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-trace"}}}'
+          printf '%s\n' '{"method":"turn/completed"}'
+        elif printf '%s\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\n' '{"id":5,"result":{"thread":{"id":"thread-trace","status":{"type":"idle"},"turns":[{"id":"turn-trace","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 
@@ -197,18 +200,21 @@ defmodule SymphonyElixir.RunTraceTest do
       System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
-      #!/bin/sh
-      count=0
-      while IFS= read -r _line; do
-        count=$((count + 1))
-        case "$count" in
-          1) printf '%s\n' '{"id":1,"result":{}}' ;;
-          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-broken"}}}' ;;
-          3)
-            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-broken"}}}'
-            printf '%s\n' '{"method":"turn/completed"}'
-            ;;
-        esac
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      while IFS= read -r line; do
+        if printf '%s\n' "$line" | grep -q '"method":"initialize"'; then
+          printf '%s\n' '{"id":1,"result":{}}'
+        elif printf '%s\n' "$line" | grep -q '"method":"thread/start"'; then
+          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-broken"}}}'
+        elif printf '%s\n' "$line" | grep -q '"method":"turn/start"'; then
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-broken"}}}'
+          printf '%s\n' '{"method":"turn/completed"}'
+        elif printf '%s\n' "$line" | grep -q '"method":"thread/resume"'; then
+          printf '%s\n' '{"id":5,"result":{"thread":{"id":"thread-broken","status":{"type":"idle"},"turns":[{"id":"turn-broken","status":"completed","items":[],"startedAt":1,"completedAt":2}]}}}'
+          exit 0
+        fi
       done
       """)
 
