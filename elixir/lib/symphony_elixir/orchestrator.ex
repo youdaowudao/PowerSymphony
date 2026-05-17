@@ -2198,6 +2198,54 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec run_event_detail(GenServer.server(), String.t(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:error, :run_not_found | :duplicate_run | :event_not_found | :event_detail_unavailable}
+          | :timeout
+          | :unavailable
+  def run_event_detail(server, issue_identifier, event_id, opts \\ [])
+      when is_binary(issue_identifier) and is_binary(event_id) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:run_event_detail, issue_identifier, event_id}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @spec run_event_surface(GenServer.server(), String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:error,
+             :run_not_found
+             | :duplicate_run
+             | :invalid_surface
+             | :event_not_found
+             | :surface_not_available
+             | :event_surface_unavailable}
+          | :timeout
+          | :unavailable
+  def run_event_surface(server, issue_identifier, event_id, surface, opts \\ [])
+      when is_binary(issue_identifier) and is_binary(event_id) and is_binary(surface) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:run_event_surface, issue_identifier, event_id, surface}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2293,6 +2341,28 @@ defmodule SymphonyElixir.Orchestrator do
         running_entries,
         issue_identifier,
         cursor: cursor
+      )
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:run_event_detail, issue_identifier, event_id}, _from, state)
+      when is_binary(issue_identifier) and is_binary(event_id) do
+    running_entries = Map.values(state.running)
+    reply = RunStateStore.event_detail_for_running_entries(running_entries, issue_identifier, event_id)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:run_event_surface, issue_identifier, event_id, surface}, _from, state)
+      when is_binary(issue_identifier) and is_binary(event_id) and is_binary(surface) do
+    running_entries = Map.values(state.running)
+
+    reply =
+      RunStateStore.event_surface_for_running_entries(
+        running_entries,
+        issue_identifier,
+        event_id,
+        surface
       )
 
     {:reply, reply, state}

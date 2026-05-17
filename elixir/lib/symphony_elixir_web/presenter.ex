@@ -154,6 +154,28 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  @spec run_event_detail_payload(map()) :: map()
+  def run_event_detail_payload(%{} = payload) do
+    %{
+      event: run_event_detail_section(map_value(payload, :event)),
+      run: run_event_run_section(map_value(payload, :run)),
+      context: run_event_context_section(map_value(payload, :context)),
+      summaries: run_event_summaries_section(map_value(payload, :summaries)),
+      surfaces: run_event_surfaces_section(map_value(payload, :surfaces))
+    }
+  end
+
+  @spec run_event_surface_payload(map()) :: map()
+  def run_event_surface_payload(%{} = payload) do
+    %{
+      surface: map_value(payload, :surface),
+      available: map_value(payload, :available) == true,
+      content: map_value(payload, :content),
+      byte_size: map_integer_value(payload, :byte_size) || 0,
+      truncated: map_value(payload, :truncated) == true
+    }
+  end
+
   @spec find_project_run_summary(map(), String.t()) :: map() | nil
   def find_project_run_summary(project, issue_identifier)
       when is_map(project) and is_binary(issue_identifier) do
@@ -383,6 +405,91 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp timeline_item_payload(_item), do: %{}
+
+  defp run_event_detail_section(section) when is_map(section) do
+    %{
+      event_id: map_value(section, :event_id),
+      timestamp: map_value(section, :timestamp),
+      source: map_value(section, :source),
+      event_type: map_value(section, :event_type),
+      event_group: map_value(section, :event_group),
+      summary: map_value(section, :summary)
+    }
+  end
+
+  defp run_event_detail_section(_section) do
+    %{
+      event_id: nil,
+      timestamp: nil,
+      source: nil,
+      event_type: nil,
+      event_group: nil,
+      summary: nil
+    }
+  end
+
+  defp run_event_run_section(section) when is_map(section) do
+    %{
+      issue_identifier: map_value(section, :issue_identifier),
+      run_id: map_value(section, :run_id)
+    }
+  end
+
+  defp run_event_run_section(_section), do: %{issue_identifier: nil, run_id: nil}
+
+  defp run_event_context_section(section) when is_map(section) do
+    %{
+      session_id: map_value(section, :session_id),
+      thread_id: map_value(section, :thread_id),
+      turn_id: map_value(section, :turn_id)
+    }
+  end
+
+  defp run_event_context_section(_section), do: %{session_id: nil, thread_id: nil, turn_id: nil}
+
+  defp run_event_summaries_section(section) when is_map(section) do
+    %{
+      tool_call: map_value(section, :tool_call),
+      payload: map_value(section, :payload),
+      prompt: map_value(section, :prompt),
+      shell: map_value(section, :shell)
+    }
+  end
+
+  defp run_event_summaries_section(_section) do
+    %{tool_call: nil, payload: nil, prompt: nil, shell: nil}
+  end
+
+  defp run_event_surfaces_section(section) when is_map(section) do
+    %{
+      raw: run_event_surface_preview(map_value(section, :raw)),
+      payload: run_event_surface_preview(map_value(section, :payload)),
+      prompt: run_event_surface_preview(map_value(section, :prompt)),
+      shell: run_event_surface_preview(map_value(section, :shell))
+    }
+  end
+
+  defp run_event_surfaces_section(_section) do
+    %{
+      raw: run_event_surface_preview(nil),
+      payload: run_event_surface_preview(nil),
+      prompt: run_event_surface_preview(nil),
+      shell: run_event_surface_preview(nil)
+    }
+  end
+
+  defp run_event_surface_preview(section) when is_map(section) do
+    %{
+      available: map_value(section, :available) == true,
+      byte_size: map_integer_value(section, :byte_size) || 0,
+      preview: map_value(section, :preview),
+      truncated: map_value(section, :truncated) == true
+    }
+  end
+
+  defp run_event_surface_preview(_section) do
+    %{available: false, byte_size: 0, preview: nil, truncated: false}
+  end
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
 

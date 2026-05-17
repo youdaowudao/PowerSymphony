@@ -62,6 +62,90 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec project_run_event_detail_payload(String.t(), String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error,
+             :project_not_found
+             | :run_not_found
+             | :event_not_found
+             | :duplicate_run
+             | :event_detail_unavailable}
+  def project_run_event_detail_payload(project_id, issue_identifier, event_id)
+      when is_binary(project_id) and is_binary(issue_identifier) and is_binary(event_id) do
+    with {:ok, _project_payload} <- Presenter.project_summary_payload(project_id, project_registry()),
+         {:ok, body} <- project_worker_request(project_id, event_detail_path(issue_identifier, event_id)) do
+      {:ok, Presenter.run_event_detail_payload(body)}
+    else
+      {:error, :project_not_found} ->
+        {:error, :project_not_found}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "run_not_found"}}}} ->
+        {:error, :run_not_found}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "event_not_found"}}}} ->
+        {:error, :event_not_found}
+
+      {:error, {:worker_status, 409, %{"error" => %{"code" => "duplicate_run"}}}} ->
+        {:error, :duplicate_run}
+
+      {:error, {:worker_status, 503, %{"error" => %{"code" => "event_detail_unavailable"}}}} ->
+        {:error, :event_detail_unavailable}
+
+      {:error, {:worker_status, _status, _body}} ->
+        {:error, :event_detail_unavailable}
+
+      {:error, _reason} ->
+        {:error, :event_detail_unavailable}
+    end
+  end
+
+  @spec project_run_event_surface_payload(String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error,
+             :project_not_found
+             | :run_not_found
+             | :invalid_surface
+             | :event_not_found
+             | :surface_not_available
+             | :duplicate_run
+             | :event_surface_unavailable}
+  def project_run_event_surface_payload(project_id, issue_identifier, event_id, surface)
+      when is_binary(project_id) and is_binary(issue_identifier) and is_binary(event_id) and
+             is_binary(surface) do
+    with {:ok, _project_payload} <- Presenter.project_summary_payload(project_id, project_registry()),
+         {:ok, body} <-
+           project_worker_request(project_id, event_surface_path(issue_identifier, event_id, surface)) do
+      {:ok, Presenter.run_event_surface_payload(body)}
+    else
+      {:error, :project_not_found} ->
+        {:error, :project_not_found}
+
+      {:error, {:worker_status, 400, %{"error" => %{"code" => "invalid_surface"}}}} ->
+        {:error, :invalid_surface}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "run_not_found"}}}} ->
+        {:error, :run_not_found}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "event_not_found"}}}} ->
+        {:error, :event_not_found}
+
+      {:error, {:worker_status, 404, %{"error" => %{"code" => "surface_not_available"}}}} ->
+        {:error, :surface_not_available}
+
+      {:error, {:worker_status, 409, %{"error" => %{"code" => "duplicate_run"}}}} ->
+        {:error, :duplicate_run}
+
+      {:error, {:worker_status, 503, %{"error" => %{"code" => "event_surface_unavailable"}}}} ->
+        {:error, :event_surface_unavailable}
+
+      {:error, {:worker_status, _status, _body}} ->
+        {:error, :event_surface_unavailable}
+
+      {:error, _reason} ->
+        {:error, :event_surface_unavailable}
+    end
+  end
+
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
     if control_plane_mode?() do
@@ -123,6 +207,66 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec run_event_detail(Conn.t(), map()) :: Conn.t()
+  def run_event_detail(conn, %{"issue_identifier" => issue_identifier, "event_id" => event_id}) do
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case SymphonyElixir.Orchestrator.run_event_detail(
+             orchestrator(),
+             issue_identifier,
+             event_id,
+             timeout: snapshot_timeout_ms()
+           ) do
+        {:ok, payload} ->
+          json(conn, Presenter.run_event_detail_payload(payload))
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run not found")
+
+        {:error, :event_not_found} ->
+          error_response(conn, 404, "event_not_found", "Event not found")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :event_detail_unavailable} ->
+          error_response(conn, 503, "event_detail_unavailable", "Run event detail is unavailable")
+
+        :timeout ->
+          error_response(conn, 503, "event_detail_unavailable", "Run event detail is unavailable")
+
+        :unavailable ->
+          error_response(conn, 503, "event_detail_unavailable", "Run event detail is unavailable")
+      end
+    end
+  end
+
+  @spec run_event_surface(Conn.t(), map()) :: Conn.t()
+  def run_event_surface(conn, %{
+        "issue_identifier" => issue_identifier,
+        "event_id" => event_id,
+        "surface" => surface
+      }) do
+    if control_plane_mode?() do
+      control_plane_not_available(conn)
+    else
+      case SymphonyElixir.Orchestrator.run_event_surface(
+             orchestrator(),
+             issue_identifier,
+             event_id,
+             surface,
+             timeout: snapshot_timeout_ms()
+           ) do
+        {:ok, payload} ->
+          json(conn, Presenter.run_event_surface_payload(payload))
+
+        result ->
+          run_event_surface_response(conn, result)
+      end
+    end
+  end
+
   @spec projects(Conn.t(), map()) :: Conn.t()
   def projects(conn, _params) do
     json(conn, Presenter.projects_payload(project_registry()))
@@ -171,6 +315,60 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
         {:error, :timeline_unavailable} ->
           error_response(conn, 503, "timeline_unavailable", "Run timeline is unavailable")
+      end
+    else
+      control_plane_not_available(conn)
+    end
+  end
+
+  @spec project_run_event_detail(Conn.t(), map()) :: Conn.t()
+  def project_run_event_detail(conn, %{
+        "project_id" => project_id,
+        "issue_identifier" => issue_identifier,
+        "event_id" => event_id
+      }) do
+    if control_plane_mode?() do
+      case project_run_event_detail_payload(project_id, issue_identifier, event_id) do
+        {:ok, payload} ->
+          json(conn, payload)
+
+        {:error, :project_not_found} ->
+          error_response(conn, 404, "project_not_found", "Project not found")
+
+        {:error, :run_not_found} ->
+          error_response(conn, 404, "run_not_found", "Run not found")
+
+        {:error, :event_not_found} ->
+          error_response(conn, 404, "event_not_found", "Event not found")
+
+        {:error, :duplicate_run} ->
+          error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+
+        {:error, :event_detail_unavailable} ->
+          error_response(conn, 503, "event_detail_unavailable", "Run event detail is unavailable")
+      end
+    else
+      control_plane_not_available(conn)
+    end
+  end
+
+  @spec project_run_event_surface(Conn.t(), map()) :: Conn.t()
+  def project_run_event_surface(conn, %{
+        "project_id" => project_id,
+        "issue_identifier" => issue_identifier,
+        "event_id" => event_id,
+        "surface" => surface
+      }) do
+    if control_plane_mode?() do
+      case project_run_event_surface_payload(project_id, issue_identifier, event_id, surface) do
+        {:ok, payload} ->
+          json(conn, payload)
+
+        {:error, :project_not_found} ->
+          error_response(conn, 404, "project_not_found", "Project not found")
+
+        result ->
+          run_event_surface_response(conn, result)
       end
     else
       control_plane_not_available(conn)
@@ -248,6 +446,38 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     conn
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
+  end
+
+  defp run_event_surface_response(conn, {:error, :invalid_surface}) do
+    error_response(conn, 400, "invalid_surface", "Event surface is invalid")
+  end
+
+  defp run_event_surface_response(conn, {:error, :run_not_found}) do
+    error_response(conn, 404, "run_not_found", "Run not found")
+  end
+
+  defp run_event_surface_response(conn, {:error, :event_not_found}) do
+    error_response(conn, 404, "event_not_found", "Event not found")
+  end
+
+  defp run_event_surface_response(conn, {:error, :surface_not_available}) do
+    error_response(conn, 404, "surface_not_available", "Event surface is unavailable")
+  end
+
+  defp run_event_surface_response(conn, {:error, :duplicate_run}) do
+    error_response(conn, 409, "duplicate_run", "Multiple running entries matched this run")
+  end
+
+  defp run_event_surface_response(conn, {:error, :event_surface_unavailable}) do
+    error_response(conn, 503, "event_surface_unavailable", "Run event surface is unavailable")
+  end
+
+  defp run_event_surface_response(conn, :timeout) do
+    error_response(conn, 503, "event_surface_unavailable", "Run event surface is unavailable")
+  end
+
+  defp run_event_surface_response(conn, :unavailable) do
+    error_response(conn, 503, "event_surface_unavailable", "Run event surface is unavailable")
   end
 
   defp control_plane_not_available(conn) do
@@ -352,5 +582,14 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp timeline_path(issue_identifier, cursor) do
     "/api/v1/runs/#{URI.encode(issue_identifier, &URI.char_unreserved?/1)}/timeline#{timeline_query_string(cursor)}"
+  end
+
+  defp event_detail_path(issue_identifier, event_id) do
+    "/api/v1/runs/#{URI.encode(issue_identifier, &URI.char_unreserved?/1)}/events/#{URI.encode(event_id, &URI.char_unreserved?/1)}"
+  end
+
+  defp event_surface_path(issue_identifier, event_id, surface) do
+    event_detail_path(issue_identifier, event_id) <>
+      "/#{URI.encode(surface, &URI.char_unreserved?/1)}"
   end
 end
