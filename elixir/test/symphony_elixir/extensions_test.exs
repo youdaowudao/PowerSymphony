@@ -84,6 +84,16 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Map.get(results, {issue_identifier, cursor}, {:error, :run_not_found}), state}
     end
 
+    def handle_call({:run_event_detail, issue_identifier, event_id}, _from, state) do
+      results = Keyword.get(state, :run_event_detail_results, %{})
+      {:reply, Map.get(results, {issue_identifier, event_id}, {:error, :run_not_found}), state}
+    end
+
+    def handle_call({:run_event_surface, issue_identifier, event_id, surface}, _from, state) do
+      results = Keyword.get(state, :run_event_surface_results, %{})
+      {:reply, Map.get(results, {issue_identifier, event_id, surface}, {:error, :run_not_found}), state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
@@ -1464,6 +1474,108 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "workflow event detail and surface api maps orchestrator payload and errors" do
+    orchestrator_name = Module.concat(__MODULE__, :EventWorkflowOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_event_detail_results: %{
+          {"MT-HTTP", "evt-1"} =>
+            {:ok,
+             %{
+               event: %{event_id: "evt-1", timestamp: "2026-05-17T01:02:03Z", source: "codex", event_type: "turn_completed", event_group: "codex_activity", summary: "done"},
+               run: %{issue_identifier: "MT-HTTP", run_id: "run-1"},
+               context: %{session_id: "session-1", thread_id: "thread-1", turn_id: "turn-1"},
+               summaries: %{tool_call: "shell", payload: "JSON object with 2 top-level keys", prompt: "Continue?", shell: "git status"},
+               surfaces: %{
+                 raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+                 payload: %{available: true, byte_size: 32, preview: "{\"tool\":\"shell\"}", truncated: false},
+                 prompt: %{available: true, byte_size: 9, preview: "Continue?", truncated: false},
+                 shell: %{available: true, byte_size: 10, preview: "git status", truncated: false}
+               }
+             }},
+          {"MT-MISSING-RUN-EVENT", "evt-run-404"} => {:error, :run_not_found},
+          {"MT-MISSING-EVENT", "evt-404"} => {:error, :event_not_found},
+          {"MT-DUP-EVENT", "evt-dup"} => {:error, :duplicate_run},
+          {"MT-DOWN-EVENT", "evt-down"} => {:error, :event_detail_unavailable}
+        },
+        run_event_surface_results: %{
+          {"MT-HTTP", "evt-1", "shell"} => {:ok, %{surface: "shell", available: true, content: "git status", byte_size: 10, truncated: false}},
+          {"MT-HTTP", "evt-1", "bad"} => {:error, :invalid_surface},
+          {"MT-MISSING-RUN-EVENT", "evt-run-404", "shell"} => {:error, :run_not_found},
+          {"MT-HTTP", "evt-404", "shell"} => {:error, :event_not_found},
+          {"MT-HTTP", "evt-1", "prompt"} => {:error, :surface_not_available},
+          {"MT-DUP-EVENT", "evt-dup", "shell"} => {:error, :duplicate_run},
+          {"MT-DOWN-EVENT", "evt-down", "shell"} => {:error, :event_surface_unavailable}
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events/evt-1"), 200) == %{
+             "event" => %{
+               "event_id" => "evt-1",
+               "timestamp" => "2026-05-17T01:02:03Z",
+               "source" => "codex",
+               "event_type" => "turn_completed",
+               "event_group" => "codex_activity",
+               "summary" => "done"
+             },
+             "run" => %{"issue_identifier" => "MT-HTTP", "run_id" => "run-1"},
+             "context" => %{"session_id" => "session-1", "thread_id" => "thread-1", "turn_id" => "turn-1"},
+             "summaries" => %{
+               "tool_call" => "shell",
+               "payload" => "JSON object with 2 top-level keys",
+               "prompt" => "Continue?",
+               "shell" => "git status"
+             },
+             "surfaces" => %{
+               "raw" => %{"available" => false, "byte_size" => 0, "preview" => nil, "truncated" => false},
+               "payload" => %{"available" => true, "byte_size" => 32, "preview" => "{\"tool\":\"shell\"}", "truncated" => false},
+               "prompt" => %{"available" => true, "byte_size" => 9, "preview" => "Continue?", "truncated" => false},
+               "shell" => %{"available" => true, "byte_size" => 10, "preview" => "git status", "truncated" => false}
+             }
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events/evt-1/shell"), 200) == %{
+             "surface" => "shell",
+             "available" => true,
+             "content" => "git status",
+             "byte_size" => 10,
+             "truncated" => false
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events/evt-1/bad"), 400) == %{
+             "error" => %{"code" => "invalid_surface", "message" => "Event surface is invalid"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-MISSING-RUN-EVENT/events/evt-run-404"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-MISSING-EVENT/events/evt-404"), 404) == %{
+             "error" => %{"code" => "event_not_found", "message" => "Event not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-MISSING-RUN-EVENT/events/evt-run-404/shell"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events/evt-1/prompt"), 404) == %{
+             "error" => %{"code" => "surface_not_available", "message" => "Event surface is unavailable"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-DUP-EVENT/events/evt-dup"), 409) == %{
+             "error" => %{"code" => "duplicate_run", "message" => "Multiple running entries matched this run"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-DOWN-EVENT/events/evt-down/shell"), 503) == %{
+             "error" => %{"code" => "event_surface_unavailable", "message" => "Run event surface is unavailable"}
+           }
+  end
+
   test "control-plane timeline api proxies worker responses and preserves timeline-specific errors" do
     manager_name = Module.concat(__MODULE__, TimelineProxyManager)
 
@@ -1568,6 +1680,109 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-DOWN/timeline"), 503) == %{
              "error" => %{"code" => "timeline_unavailable", "message" => "Run timeline is unavailable"}
+           }
+  end
+
+  test "control-plane event detail and surface api proxies worker responses and preserves event-specific errors" do
+    manager_name = Module.concat(__MODULE__, EventProxyManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-1" ->
+          {200,
+           %{
+             event: %{event_id: "evt-1", timestamp: "2026-05-17T01:02:03Z", source: "codex", event_type: "turn_completed", event_group: "codex_activity", summary: "done"},
+             run: %{issue_identifier: "MT-ALPHA-1", run_id: "run-1"},
+             context: %{session_id: "session-1", thread_id: "thread-1", turn_id: "turn-1"},
+             summaries: %{tool_call: "shell", payload: "JSON object with 1 top-level keys", prompt: nil, shell: "git status"},
+             surfaces: %{
+               raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               payload: %{available: true, byte_size: 14, preview: "{\"tool\":\"shell\"}", truncated: false},
+               prompt: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               shell: %{available: true, byte_size: 10, preview: "git status", truncated: false}
+             }
+           }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-1/shell" ->
+          {200, %{surface: "shell", available: true, content: "git status", byte_size: 10, truncated: false}}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-1/bad" ->
+          {400, %{error: %{code: "invalid_surface", message: "worker bad surface"}}}
+
+        "GET", "/api/v1/runs/MT-MISSING-RUN/events/evt-run-404" ->
+          {404, %{error: %{code: "run_not_found", message: "worker missing run"}}}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-404" ->
+          {404, %{error: %{code: "event_not_found", message: "worker missing event"}}}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-1/prompt" ->
+          {404, %{error: %{code: "surface_not_available", message: "worker no prompt"}}}
+
+        "GET", "/api/v1/runs/MT-MISSING-RUN/events/evt-run-404/shell" ->
+          {404, %{error: %{code: "run_not_found", message: "worker missing run"}}}
+
+        "GET", "/api/v1/runs/MT-DUP/events/evt-dup" ->
+          {409, %{error: %{code: "duplicate_run", message: "worker duplicate"}}}
+
+        "GET", "/api/v1/runs/MT-DOWN/events/evt-down/shell" ->
+          {503, %{error: %{code: "event_surface_unavailable", message: "worker down"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: [%{issue_identifier: "MT-ALPHA-1", title: "Alpha run"}]}
+          }
+        ]
+      }
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/events/evt-1"), 200)["event"]["event_id"] == "evt-1"
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/events/evt-1/shell"), 200) == %{
+             "surface" => "shell",
+             "available" => true,
+             "content" => "git status",
+             "byte_size" => 10,
+             "truncated" => false
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/events/evt-1/bad"), 400) == %{
+             "error" => %{"code" => "invalid_surface", "message" => "Event surface is invalid"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-MISSING-RUN/events/evt-run-404"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/events/evt-404"), 404) == %{
+             "error" => %{"code" => "event_not_found", "message" => "Event not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-MISSING-RUN/events/evt-run-404/shell"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-ALPHA-1/events/evt-1/prompt"), 404) == %{
+             "error" => %{"code" => "surface_not_available", "message" => "Event surface is unavailable"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-DUP/events/evt-dup"), 409) == %{
+             "error" => %{"code" => "duplicate_run", "message" => "Multiple running entries matched this run"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-DOWN/events/evt-down/shell"), 503) == %{
+             "error" => %{"code" => "event_surface_unavailable", "message" => "Run event surface is unavailable"}
            }
   end
 
@@ -3022,8 +3237,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute rendered =~ "Load more"
   end
 
-  test "run deep view renders recent timeline, quiet notice, load more, and detail placeholder independently from summary" do
+  test "run deep view lazily loads event detail and surface content independently from timeline" do
     manager_name = Module.concat(__MODULE__, RunLiveTimelineManager)
+    test_pid = self()
 
     {:ok, port} =
       start_stub_http_server(fn
@@ -3072,6 +3288,8 @@ defmodule SymphonyElixir.ExtensionsTest do
            }}
 
         "GET", "/api/v1/runs/MT-ALPHA-1/timeline?cursor=older" ->
+          send(test_pid, {:stub_request, "timeline", "older"})
+
           {200,
            %{
              items: [
@@ -3087,6 +3305,31 @@ defmodule SymphonyElixir.ExtensionsTest do
              ],
              next_cursor: nil
            }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-4" ->
+          send(test_pid, {:stub_request, "detail", "evt-4"})
+
+          {200,
+           %{
+             event: %{event_id: "evt-4", timestamp: "2026-05-14T02:01:00Z", source: "codex", event_type: "turn_completed", event_group: "turn", summary: "turn finished"},
+             run: %{issue_identifier: "MT-ALPHA-1", run_id: "run-evt-4"},
+             context: %{session_id: "thread-alpha-turn-9", thread_id: "thread-alpha", turn_id: "turn-9"},
+             summaries: %{tool_call: "shell", payload: "JSON object with 2 top-level keys", prompt: "Continue?", shell: "git status --short"},
+             surfaces: %{
+               raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               payload: %{available: true, byte_size: 64, preview: "{\"tool\":\"shell\"}", truncated: false},
+               prompt: %{available: true, byte_size: 9, preview: "Continue?", truncated: false},
+               shell: %{available: true, byte_size: 18, preview: "git status --short", truncated: false}
+             }
+           }}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-4/shell" ->
+          send(test_pid, {:stub_request, "surface", "shell"})
+          {200, %{surface: "shell", available: true, content: "git status --short", byte_size: 18, truncated: false}}
+
+        "GET", "/api/v1/runs/MT-ALPHA-1/events/evt-4/prompt" ->
+          send(test_pid, {:stub_request, "surface", "prompt"})
+          {404, %{error: %{code: "surface_not_available", message: "no prompt"}}}
       end)
 
     start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
@@ -3128,6 +3371,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Alpha task"
     assert html =~ "Timeline"
 
+    refute_receive {:stub_request, "detail", _}
+    refute_receive {:stub_request, "surface", _}
+
     assert_eventually(fn ->
       rendered = render(view)
 
@@ -3153,11 +3399,460 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     render_click(element(view, "button[phx-value-event_id='evt-4']"))
+    assert_receive {:stub_request, "detail", "evt-4"}
 
     assert_eventually(fn ->
       rendered = render(view)
-      rendered =~ "Detail placeholder" and rendered =~ "evt-4"
+
+      rendered =~ "event_id: evt-4" and
+        rendered =~ "thread: thread-alpha" and
+        rendered =~ "prompt summary: Continue?" and
+        rendered =~ "Load shell" and
+        rendered =~ "Surface body stays unloaded."
     end)
+
+    refute_receive {:stub_request, "surface", _}
+
+    render_click(element(view, "button[phx-value-surface='shell']"))
+    assert_receive {:stub_request, "surface", "shell"}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "git status --short"
+    end)
+
+    render_click(element(view, "button[phx-value-surface='prompt']"))
+    assert_receive {:stub_request, "surface", "prompt"}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Surface unavailable for this event" and
+        rendered =~ "workspace ready" and
+        rendered =~ "turn finished"
+    end)
+  end
+
+  test "run deep view ignores surface clicks before detail is ready and renders detail errors" do
+    manager_name = Module.concat(__MODULE__, RunLiveDetailErrorManager)
+    test_pid = self()
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-DETAIL-ERROR/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-error",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "broken detail",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-DETAIL-ERROR/events/evt-error" ->
+          send(test_pid, {:stub_request, "detail", "evt-error"})
+          {503, %{error: %{code: "event_detail_unavailable", message: "detail down"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-DETAIL-ERROR", "Detail error")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-DETAIL-ERROR")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "broken detail" and rendered =~ "Entry point only. Event body stays unloaded by default."
+    end)
+
+    render_click(view, "load_event_surface", %{"surface" => "prompt"})
+    refute_receive {:stub_request, "surface", _}
+
+    render_click(element(view, "button[phx-value-event_id='evt-error']"))
+    assert_receive {:stub_request, "detail", "evt-error"}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "Event detail unavailable" and rendered =~ "broken detail"
+    end)
+
+    render_click(view, "load_event_surface", %{"surface" => "prompt"})
+    refute_receive {:stub_request, "surface", _}
+  end
+
+  test "run deep view ignores stale detail and surface completion messages" do
+    manager_name = Module.concat(__MODULE__, RunLiveStaleMessageManager)
+    test_pid = self()
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-STALE/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-stale",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "stale candidate",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-STALE/events/evt-stale" ->
+          send(test_pid, {:stub_request, "detail", "evt-stale"})
+          {200, run_live_detail_payload("evt-stale")}
+
+        "GET", "/api/v1/runs/MT-STALE/events/evt-stale/shell" ->
+          send(test_pid, {:stub_request, "surface", "shell"})
+          {200, %{surface: "shell", available: true, content: "echo ok", byte_size: 7, truncated: false}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-STALE", "Stale run")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-STALE")
+
+    assert_eventually(fn ->
+      render(view) =~ "stale candidate"
+    end)
+
+    send(view.pid, {:load_event_detail, 403})
+    refute_receive {:stub_request, "detail", _}
+
+    send(view.pid, {:event_detail_loaded, 403, {:error, :event_detail_unavailable}})
+    assert render(view) =~ "Entry point only. Event body stays unloaded by default."
+
+    render_click(element(view, "button[phx-value-event_id='evt-stale']"))
+    assert_receive {:stub_request, "detail", "evt-stale"}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "event_id: evt-stale" and rendered =~ "Load shell"
+    end)
+
+    send(view.pid, {:event_detail_loaded, "evt-other", {:error, :event_detail_unavailable}})
+    rendered_after_stale_detail = render(view)
+    assert rendered_after_stale_detail =~ "event_id: evt-stale"
+    refute rendered_after_stale_detail =~ "Event detail unavailable"
+
+    send(view.pid, {:load_event_surface, "evt-other", "shell"})
+    refute_receive {:stub_request, "surface", _}
+
+    send(view.pid, {:load_event_surface, "evt-stale", 445})
+    refute_receive {:stub_request, "surface", _}
+
+    render_click(element(view, "button[phx-value-surface='shell']"))
+    assert_receive {:stub_request, "surface", "shell"}
+
+    assert_eventually(fn ->
+      render(view) =~ "echo ok"
+    end)
+
+    send(view.pid, {:event_surface_loaded, "evt-other", "shell", {:error, :surface_not_available}})
+    send(view.pid, {:event_surface_loaded, "evt-stale", "unknown", {:error, :surface_not_available}})
+
+    rendered_after_stale_surface = render(view)
+    assert rendered_after_stale_surface =~ "echo ok"
+    refute rendered_after_stale_surface =~ "Surface unavailable for this event"
+  end
+
+  test "workflow run deep view maps worker event detail and surface responses" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowEventHelpersOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-WORKFLOW-EVENTS", nil} =>
+            {:ok,
+             %{
+               items: [
+                 %{
+                   event_id: "evt-ok",
+                   timestamp: "2026-05-16T01:00:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "ok event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-error",
+                   timestamp: "2026-05-16T01:01:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "error event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-timeout",
+                   timestamp: "2026-05-16T01:02:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "timeout event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-down",
+                   timestamp: "2026-05-16T01:03:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "down event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-surface-error",
+                   timestamp: "2026-05-16T01:04:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "surface error event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-surface-timeout",
+                   timestamp: "2026-05-16T01:05:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "surface timeout event",
+                   status_markers: []
+                 },
+                 %{
+                   event_id: "evt-surface-down",
+                   timestamp: "2026-05-16T01:06:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "surface down event",
+                   status_markers: []
+                 }
+               ],
+               next_cursor: nil
+             }}
+        },
+        run_event_detail_results: %{
+          {"MT-WORKFLOW-EVENTS", "evt-ok"} => {:ok, run_live_detail_payload("evt-ok")},
+          {"MT-WORKFLOW-EVENTS", "evt-error"} => {:error, :event_not_found},
+          {"MT-WORKFLOW-EVENTS", "evt-timeout"} => :timeout,
+          {"MT-WORKFLOW-EVENTS", "evt-down"} => :unavailable,
+          {"MT-WORKFLOW-EVENTS", "evt-surface-error"} => {:ok, run_live_detail_payload("evt-surface-error")},
+          {"MT-WORKFLOW-EVENTS", "evt-surface-timeout"} => {:ok, run_live_detail_payload("evt-surface-timeout")},
+          {"MT-WORKFLOW-EVENTS", "evt-surface-down"} => {:ok, run_live_detail_payload("evt-surface-down")}
+        },
+        run_event_surface_results: %{
+          {"MT-WORKFLOW-EVENTS", "evt-ok", "shell"} => {:ok, %{surface: "shell", available: true, content: "workflow shell", byte_size: 14, truncated: false}},
+          {"MT-WORKFLOW-EVENTS", "evt-surface-error", "shell"} => {:error, :surface_not_available},
+          {"MT-WORKFLOW-EVENTS", "evt-surface-timeout", "payload"} => :timeout,
+          {"MT-WORKFLOW-EVENTS", "evt-surface-down", "prompt"} => :unavailable
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW-EVENTS", "Workflow event helpers")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-EVENTS")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "ok event" and rendered =~ "error event" and rendered =~ "timeout event" and
+        rendered =~ "surface error event"
+    end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-ok']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "event_id: evt-ok" and rendered =~ "shell summary: git status --short" and
+        rendered =~ "prompt summary: n/a"
+    end)
+
+    render_click(element(view, "button[phx-value-surface='shell']"))
+
+    assert_eventually(fn ->
+      render(view) =~ "workflow shell"
+    end)
+
+    send(view.pid, {:event_surface_loaded, "evt-ok", "shell", {:error, :invalid_surface}})
+    assert_eventually(fn -> render(view) =~ "Surface unavailable for this event" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-error']"))
+    assert_eventually(fn -> render(view) =~ "Event detail unavailable" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-timeout']"))
+    assert_eventually(fn -> render(view) =~ "Event detail unavailable" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-down']"))
+    assert_eventually(fn -> render(view) =~ "Event detail unavailable" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-surface-error']"))
+
+    assert_eventually(fn ->
+      render(view) =~ "event_id: evt-surface-error"
+    end)
+
+    render_click(element(view, "button[phx-value-surface='shell']"))
+    assert_eventually(fn -> render(view) =~ "Surface unavailable for this event" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-surface-timeout']"))
+
+    assert_eventually(fn ->
+      render(view) =~ "event_id: evt-surface-timeout"
+    end)
+
+    render_click(element(view, "button[phx-value-surface='payload']"))
+    assert_eventually(fn -> render(view) =~ "Surface unavailable for this event" end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-surface-down']"))
+
+    assert_eventually(fn ->
+      render(view) =~ "event_id: evt-surface-down"
+    end)
+
+    render_click(element(view, "button[phx-value-surface='prompt']"))
+    assert_eventually(fn -> render(view) =~ "Surface unavailable for this event" end)
+  end
+
+  test "run deep view renders empty detail summaries as n/a and preview fallback text" do
+    manager_name = Module.concat(__MODULE__, RunLivePreviewFallbackManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-PREVIEW/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-preview",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "preview event",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-PREVIEW/events/evt-preview" ->
+          {200,
+           %{
+             event: %{event_id: "evt-preview", timestamp: "2026-05-14T02:01:00Z", source: "codex", event_type: "turn_completed", event_group: "turn", summary: "preview event"},
+             run: %{issue_identifier: "MT-PREVIEW", run_id: "run-preview"},
+             context: %{session_id: "session-preview", thread_id: "thread-preview", turn_id: "turn-preview"},
+             summaries: %{tool_call: "", payload: "", prompt: "", shell: ""},
+             surfaces: %{
+               raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               payload: %{available: true, byte_size: 0, preview: nil, truncated: false},
+               prompt: %{available: true, byte_size: 0, preview: "", truncated: false},
+               shell: %{available: false, byte_size: 0, preview: nil, truncated: false}
+             }
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-PREVIEW", "Preview fallback")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-PREVIEW")
+
+    assert_eventually(fn ->
+      render(view) =~ "preview event"
+    end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-preview']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "tool summary: n/a" and rendered =~ "payload summary: n/a" and
+        rendered =~ "prompt summary: n/a" and rendered =~ "shell summary: n/a" and
+        rendered =~ "Preview unavailable"
+    end)
+  end
+
+  test "control-plane event detail lookup does not depend on current timeline page items" do
+    manager_name = Module.concat(__MODULE__, RunLiveDetailOffPageManager)
+    test_pid = self()
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-OFFPAGE/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-visible",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "visible item",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-OFFPAGE/events/evt-hidden" ->
+          send(test_pid, {:stub_request, "detail", "evt-hidden"})
+
+          {200,
+           %{
+             event: %{event_id: "evt-hidden", timestamp: "2026-05-14T02:01:00Z", source: "codex", event_type: "notification", event_group: "turn", summary: "hidden item"},
+             run: %{issue_identifier: "MT-OFFPAGE", run_id: "run-hidden"},
+             context: %{session_id: "session-hidden", thread_id: "thread-hidden", turn_id: "turn-hidden"},
+             summaries: %{tool_call: nil, payload: nil, prompt: nil, shell: nil},
+             surfaces: %{
+               raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               payload: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               prompt: %{available: false, byte_size: 0, preview: nil, truncated: false},
+               shell: %{available: false, byte_size: 0, preview: nil, truncated: false}
+             }
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-OFFPAGE", "Off-page detail")
+    )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-OFFPAGE/events/evt-hidden"), 200)["event"]["event_id"] == "evt-hidden"
+    assert_receive {:stub_request, "detail", "evt-hidden"}
   end
 
   test "run deep view keeps summary visible when timeline load and load-more fail" do
@@ -4453,6 +5148,33 @@ defmodule SymphonyElixir.ExtensionsTest do
           }
         }
       ]
+    }
+  end
+
+  defp run_live_detail_payload(event_id) do
+    %{
+      event: %{
+        event_id: event_id,
+        timestamp: "2026-05-14T02:01:00Z",
+        source: "codex",
+        event_type: "turn_completed",
+        event_group: "turn",
+        summary: "#{event_id} summary"
+      },
+      run: %{issue_identifier: "MT-WORKFLOW-EVENTS", run_id: "run-#{event_id}"},
+      context: %{session_id: "session-#{event_id}", thread_id: "thread-#{event_id}", turn_id: "turn-#{event_id}"},
+      summaries: %{
+        tool_call: "shell",
+        payload: "JSON object with 1 top-level keys",
+        prompt: nil,
+        shell: "git status --short"
+      },
+      surfaces: %{
+        raw: %{available: false, byte_size: 0, preview: nil, truncated: false},
+        payload: %{available: true, byte_size: 18, preview: "{\"tool\":\"shell\"}", truncated: false},
+        prompt: %{available: false, byte_size: 0, preview: nil, truncated: false},
+        shell: %{available: true, byte_size: 18, preview: "git status --short", truncated: false}
+      }
     }
   end
 

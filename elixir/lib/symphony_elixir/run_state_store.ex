@@ -89,6 +89,32 @@ defmodule SymphonyElixir.RunStateStore do
     end
   end
 
+  @spec event_detail_for_running_entries([map()], String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error, :run_not_found | :duplicate_run | :event_not_found | :event_detail_unavailable}
+  def event_detail_for_running_entries(entries, issue_identifier, event_id)
+      when is_list(entries) and is_binary(issue_identifier) and is_binary(event_id) do
+    with {:ok, entry, trace} <- current_trace_for_issue(entries, issue_identifier) do
+      RunTrace.event_detail(trace, event_id, run_instance_id: Map.get(entry, :run_instance_id))
+    end
+  end
+
+  @spec event_surface_for_running_entries([map()], String.t(), String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error,
+             :run_not_found
+             | :duplicate_run
+             | :invalid_surface
+             | :event_not_found
+             | :surface_not_available
+             | :event_surface_unavailable}
+  def event_surface_for_running_entries(entries, issue_identifier, event_id, surface)
+      when is_list(entries) and is_binary(issue_identifier) and is_binary(event_id) and is_binary(surface) do
+    with {:ok, entry, trace} <- current_trace_for_issue(entries, issue_identifier) do
+      RunTrace.event_surface(trace, event_id, surface, run_instance_id: Map.get(entry, :run_instance_id))
+    end
+  end
+
   defp finalize_summary(summary, events, opts) do
     config = Config.settings!()
     now = Keyword.get(opts, :now, DateTime.utc_now())
@@ -259,6 +285,22 @@ defmodule SymphonyElixir.RunStateStore do
     Enum.filter(entries, fn entry ->
       running_entry_issue_identifier(entry) == issue_identifier
     end)
+  end
+
+  defp current_trace_for_issue(entries, issue_identifier) do
+    case matching_timeline_entries(entries, issue_identifier) do
+      [] ->
+        {:error, :run_not_found}
+
+      [_entry, _other | _rest] ->
+        {:error, :duplicate_run}
+
+      [entry] ->
+        case Map.get(entry, :run_trace) do
+          %RunTrace{} = trace -> {:ok, entry, trace}
+          _ -> {:error, :run_not_found}
+        end
+    end
   end
 
   defp running_entry_issue_identifier(entry) when is_map(entry) do
