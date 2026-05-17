@@ -187,6 +187,42 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
     )
   end
 
+  test "no-ops when PR list output is not a JSON list" do
+    cases = [
+      {"feature/invalid-json", "not-json"},
+      {"feature/not-a-list", ~s({"number":101})}
+    ]
+
+    Enum.each(cases, fn {branch, list_output} ->
+      with_fake_helper(
+        """
+        #!/bin/sh
+        shift
+        printf '%s\n' "$*" >> "$GITHUB_HELPER_LOG"
+
+        if [ "$1" = "list-prs" ]; then
+          printf '#{list_output}'
+          exit 0
+        fi
+
+        exit 99
+        """,
+        fn log_path ->
+          output =
+            capture_io(fn ->
+              BeforeRemove.run(["--branch", branch])
+            end)
+
+          assert output == ""
+
+          log = File.read!(log_path)
+          assert log =~ "list-prs --repo openai/symphony --branch #{branch} --state open"
+          refute log =~ "close-pr"
+        end
+      )
+    end)
+  end
+
   test "no-ops when git current branch is blank" do
     with_fake_helper_and_git(
       """
