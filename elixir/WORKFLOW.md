@@ -340,7 +340,7 @@ This gate applies after preflight and before the run enters coding.
 - `Small change` uses exactly 1 read-only analysis subagent.
 - `Large change` uses exactly 2 read-only analysis subagents in a lightweight red/blue review.
 - Repo workflow rules override generic upper-layer session limits here; the document-phase read-only analysis subagents must be dispatched directly and must not be skipped because subagent dispatch is "usually discouraged."
-- These document-phase read-only analysis subagents are distinct from the later repo default `1+3` implementation/reviewer collaboration model. For push-readiness minimums, you may describe the required implementation-plus-zero-context-reviewer subset as `1+2` counting shorthand, but it is not a separate default mode; if real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
+- These document-phase read-only analysis subagents are distinct from the later repo default `1+2` implementation/reviewer collaboration model. The document phase is planning analysis only; the post-implementation reviewer gate is still mandatory for code changes. If real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
 - In the `Small change` lane, dispatch that subagent to review the first-pass plan/task independently.
 - In the `Large change` lane, dispatch those subagents into a lightweight red/blue review.
 - The blue side argues the current route can proceed. The red side challenges scope, assumptions, risks, and missing validation.
@@ -351,6 +351,15 @@ This gate applies after preflight and before the run enters coding.
   - `revise`
   - `escalate`
 - `proceed` means the current plan/task split and validation route are sufficiently clear and bounded for coding.
+- A `proceed` result must leave a fixed document-phase artifact in `## Codex Workpad` that records:
+  - the chosen lane (`Small change` or `Large change`)
+  - the frozen scope snapshot
+  - the validation route
+  - the currently known risks
+  - whether one reviewer-triggered focused recheck remains unused or has been consumed
+- Once `proceed` is recorded, the run enters `spec freeze`.
+- Under `spec freeze`, do not reopen broad exploratory analysis or spawn new broad analysis subagents.
+- One reviewer-triggered focused recheck is allowed after freeze only when it answers a single concrete missing proof or blocker. It must update the same frozen artifact instead of reopening the whole document phase.
 - `revise` means the route is close but incomplete; the main thread must revise the plan/task and run the same evaluation lane again.
 - `escalate` means the route is unsafe, under-specified, or crossing the current lane's boundary.
 - In the `Small change` lane, `escalate` promotes the run to the `Large change` lane immediately.
@@ -364,10 +373,33 @@ This gate applies after preflight and before the run enters coding.
 - Before any `git push` that would publish those code changes, dispatch exactly 1 zero-context reviewer subagent.
 - The reviewer input is limited to: requirement/scope snapshot, current implementation plan, the cumulative diff that the updated branch / PR head will have against PR base, validation results, risks, and only the necessary files. Do not provide the author thread's reasoning history.
 - Record the result in `## Review Summary` using:
-  - `Implementation Review: <pass | revise | not required>`
-  - `Implementation Review Notes: <compact zero-context reviewer conclusion or None>`
+  - `Change Review: <pass | revise | not required>`
+  - `Change Review Notes: <compact zero-context reviewer conclusion or None>`
 - If the result is not `pass`, set `Push Readiness` to `not ready`, do not push, and do not move to `Human Review`.
 - A failed implementation review must return to implementation/rework, then rerun the same zero-context reviewer gate. This follows the repo's existing rework and second-repair rules; it is not satisfied by rerunning the document-phase analysis subagents.
+
+## Conditional in-flight risk gate
+
+- This gate applies only when at least one high-risk trigger is hit during implementation or rework.
+- Trigger the gate when any of the following becomes true:
+  - the cumulative diff touches a BEAM / typed core path
+  - the cumulative diff touches event normalization
+  - the cumulative diff touches a state machine or concurrency boundary
+  - a reviewer explicitly marks type or integration risk
+  - the run is already in rework and the remaining diff still spans multiple risk areas
+- When triggered, stop adding new scope and record the gate through `## Codex Workpad > Current Blocker / Next Gate` or `## Codex Workpad > Notes`, not as a separate `Status Board` schema expansion.
+- Use the gate to answer only:
+  - which risk was activated
+  - what proof is required before the next push or closeout step
+  - whether the next push gate must be elevated
+- The gate may raise the next push requirement from `light validation` or `closeout gate` to `local make all` when the repo rules require it, but it must not invent a new merge state, reviewer state, or approval layer.
+- If the gate finds a missing requirement that changes scope, route back through a light document refresh path instead of continuing hidden scope growth.
+- Light document refresh path means:
+  - return to a lightweight document review pass
+  - refresh the existing frozen artifact only
+  - do not reopen broad exploration
+  - do not consume an additional focused recheck
+  - once the frozen artifact is refreshed, resume implementation and validation
 
 ## Step 1: Start/continue execution (Todo or In Progress)
 
@@ -377,7 +409,7 @@ This gate applies after preflight and before the run enters coding.
    - Ensure `## Execution Brief` accurately reflects the latest confirmed result, the next required action, and whether a human decision is needed.
    - Ensure `## Acceptance Criteria` is current and still makes sense for the task.
    - Ensure `## Review Summary` contains only compact, still-relevant review outcomes. If no actionable review batch exists, set the review-request fields to `None`.
-   - Ensure `## Review Summary` also carries `Implementation Review` and `Implementation Review Notes`, and that both reflect the latest post-implementation zero-context reviewer result instead of a stale earlier pass.
+   - Ensure `## Review Summary` also carries `Change Review` and `Change Review Notes`, and that both reflect the latest post-implementation zero-context reviewer result instead of a stale earlier pass.
    - Ensure `## Review Summary` also carries `Push Readiness` and `Push Readiness Notes`, and that both reflect the current pre-push reality rather than a stale earlier conclusion.
    - Ensure `## Blockers` reflects only active blockers.
    - Ensure `## Codex Workpad` remains the main execution record.
@@ -391,11 +423,16 @@ This gate applies after preflight and before the run enters coding.
    - If changes touch app files or app behavior, add explicit app-specific flow checks to `## Acceptance Criteria`.
    - If the ticket description already includes `Validation`, `Test Plan`, or `Testing`, carry those requirements into `## Acceptance Criteria` and `## Codex Workpad > Validation` as required checkboxes.
    - Add or refresh `Next Push Gate` in `## Codex Workpad` as one of `local make all`, `closeout gate`, or `light validation`.
+   - Add or refresh `Status Board` and `Flow Metrics` in `## Codex Workpad`; these are the only live status and flow counters for the run.
 7. Run a principal-style self-review of the plan and refine it in `## Codex Workpad`.
 8. Before implementing, capture a concrete reproduction signal and record it in `## Codex Workpad > Notes`.
 9. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull or sync result in `## Codex Workpad > Notes`.
    - Include `pull skill evidence` with merge source(s), result (`clean` or `conflicts resolved`), and resulting `HEAD` short SHA.
-10. Compact old low-value agent-generated notes when necessary and proceed to execution.
+10. Respect `spec freeze` after kickoff:
+   - do not expand into broad new investigation after coding starts
+   - only a reviewer-triggered focused recheck may consume the one precise missing-proof slot, and it must answer the blocker or gap the reviewer explicitly identified
+   - if the missing proof changes scope rather than clarifies it, return through the light document refresh path: refresh the existing frozen artifact only, do not reopen broad exploration, do not add another focused recheck, then resume implementation and validation
+11. Compact old low-value agent-generated notes when necessary and proceed to execution.
 
 ## PR feedback sweep protocol (required)
 
@@ -413,11 +450,11 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 4. Update `## Review Summary` with:
    - `Latest Review Request`: the exact compact summary of the latest actionable review batch, or `None` when none exists.
    - `Handled Review Request`: the exact same summary once fully handled, or `None` when no actionable review batch exists.
-   - `Implementation Review`: `pass` only when the latest required post-implementation zero-context reviewer has passed for the current code delta; otherwise `revise` or `not required`.
-   - `Implementation Review Notes`: the current zero-context reviewer conclusion, missing items, or `None`.
+   - `Change Review`: `pass` only when the latest required post-implementation zero-context reviewer has passed for the current code delta; otherwise `revise` or `not required`.
+   - `Change Review Notes`: the current zero-context reviewer conclusion, missing items, or `None`.
    - `Open Items`: the current outstanding items and their resolution status.
    - `Resolved Items`: only a short summary of already-closed items when useful.
-   - `Push Readiness`: `ready` only when the current `Next Push Gate` is already satisfied for the next push and `Implementation Review` is `pass` or `not required`; otherwise `not ready`.
+   - `Push Readiness`: `ready` only when the current `Next Push Gate` is already satisfied for the next push and `Change Review` is `pass` or `not required`; otherwise `not ready`.
    - `Push Readiness Notes`: the exact missing proof or blocker for the next push, or `None`.
    - When no actionable review batch remains, set both `Latest Review Request` and `Handled Review Request` to `None`.
 5. Re-run validation after feedback-driven changes and push updates.
@@ -493,14 +530,14 @@ Use this only when completion is blocked by missing required tools or missing au
    - This is a distinct gate from the document-phase analysis subagents and cannot be replaced by them.
    - The reviewer must evaluate the implemented cumulative branch/PR diff against PR base together with the latest validation evidence.
    - Record the result in `## Review Summary`.
-   - If `Implementation Review` is not `pass`, keep `Push Readiness` at `not ready`, do not push, and do not move to `Human Review`.
+   - If `Change Review` is not `pass`, keep `Push Readiness` at `not ready`, do not push, and do not move to `Human Review`.
 9. Before every `git push` attempt, answer these questions and record the result in `## Codex Workpad` and `## Review Summary`:
    - Will this push create a PR or update an open PR?
    - Is this branch already effectively PR-bound even if the PR does not exist yet, because the current head will be used for PR creation/update?
    - What cumulative diff will the updated branch / PR head have against PR base after this push? For a branch without PR, use the intended base, normally `origin/main`. For open PR updates, or for a planned PR create on the same head, ignore any attempt to classify only the latest local patch.
    - Does that cumulative diff hit `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`?
    - Is the correct `Next Push Gate` therefore `local make all`, `closeout gate`, or `light validation`?
-   - If code changed, is `Implementation Review` already `pass` for this exact cumulative diff?
+   - If code changed, is `Change Review` already `pass` for this exact cumulative diff?
    - Has that gate already passed for the current next push?
    - If the answer is `local make all`, have you avoided falling back to a generic closeout gate for this push?
    - If an earlier push on this same head used `light validation`, but the head is now going to create a PR, have you rerun the gate that now applies before attempting PR creation?
@@ -509,7 +546,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - `local make all` -> run `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all` before pushing.
    - `closeout gate` -> run format check, lint, and targeted tests before pushing.
    - `light validation` -> run the lightest validation that proves the change before pushing.
-   If the selected gate fails, or `Implementation Review` is not `pass` when required, set `Push Readiness` to `not ready`, fix the issue, rerun the same gate, and do not push until it passes.
+   If the selected gate fails, or `Change Review` is not `pass` when required, set `Push Readiness` to `not ready`, fix the issue, rerun the same gate, and do not push until it passes.
 10. For the PR create/update path, keep the immediate auto-merge attempt ahead of every other post-push GitHub write.
    - If this push created a PR, create the PR first, then immediately attempt auto-merge for that new PR.
    - If this push updated an open PR, the first-priority GitHub write after the successful branch-update push must be the auto-merge attempt itself; do not refresh labels, title/body, review replies, or other GitHub writes first.
@@ -521,14 +558,14 @@ Use this only when completion is blocked by missing required tools or missing au
    - Mark completed items in `## Acceptance Criteria` and `## Codex Workpad` as checked.
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
-   - Refresh `Next Push Gate`, `Push Readiness`, and `Push Readiness Notes` so they describe the next actual push or explicitly say `None` when no further push is planned in this run.
+   - Refresh `Next Push Gate`, `Push Readiness`, and `Push Readiness Notes` so they describe the next actual push. Keep `Push Readiness` as `ready` or `not ready` only; when no further push is planned in this run, record that in `Next Push Gate` or `Push Readiness Notes` instead of adding a third value.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
 14. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm that the latest PR create/update push already triggered an immediate auto-merge attempt; do not defer that attempt until after checks are read.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
-   - Confirm `Implementation Review` is `pass` or `not required`; if not, do not push further changes, do not move to `Human Review`, and return to implementation/rework.
+   - Confirm `Change Review` is `pass` or `not required`; if not, do not push further changes, do not move to `Human Review`, and return to implementation/rework.
    - Confirm `Push Readiness` no longer blocks the next push; if another push is needed, recalculate `Next Push Gate` before doing it.
    - If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`.
    - Do not treat checks on an older head SHA as sufficient for closeout after newer commits land.
@@ -638,8 +675,8 @@ Do not force this structure when the issue body already has useful human-authore
 
 - Latest Review Request: <exact compact summary of the latest actionable review batch or None>
 - Handled Review Request: <exact same summary once fully handled, or None>
-- Implementation Review: <pass | revise | not required>
-- Implementation Review Notes: <compact zero-context reviewer conclusion or None>
+- Change Review: <pass | revise | not required>
+- Change Review Notes: <compact zero-context reviewer conclusion or None>
 - Push Readiness: <ready | not ready>
 - Push Readiness Notes: <what is still missing before the next push, or None>
 - Open Items: <review item / source / status; if none write None>
@@ -658,6 +695,23 @@ Do not force this structure when the issue body already has useful human-authore
 Next Push Gate: <local make all | closeout gate | light validation | None>
 Out-of-Band GitHub Write Audit: <not needed | pending | recorded in PR/issue comment stream>
 
+### Status Board
+
+- Current Phase: <document phase | implementing | in-flight risk gate | ready for push | checking | rework>
+- Completed Gates: <document phase | focused recheck | change review | next push gate | none>
+- Current Blocker / Next Gate: <None or exact blocker and next gate>
+- Current Reviewer Conclusion: <pass | revise | not required>
+- Rework Count: <0+>
+
+### Flow Metrics
+
+- timeUsedSeconds: <number or unknown>
+- tokensUsed: <number or unknown>
+- subagent_count: <number>
+- rework_count: <number>
+- first_risk_detected_stage: <document phase | implementing | review | checking | none>
+- full_gate_before_pr: <yes | no | not needed>
+
 ### Plan
 
 - [ ] 1. Parent task
@@ -670,6 +724,8 @@ Out-of-Band GitHub Write Audit: <not needed | pending | recorded in PR/issue com
 ### Notes
 
 - <recent compact progress note>
+- Focused Recheck: <unused | consumed | not needed>
+- Active Risk Gate: <None or exact trigger>
 
 ### Confusions
 
