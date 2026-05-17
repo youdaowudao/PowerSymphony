@@ -275,9 +275,6 @@ defmodule SymphonyElixir.RunStateStore do
 
       {:error, :invalid_cursor} ->
         {:error, :invalid_cursor}
-
-      {:error, _reason} ->
-        {:error, :timeline_unavailable}
     end
   rescue
     _error ->
