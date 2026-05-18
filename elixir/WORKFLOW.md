@@ -339,8 +339,10 @@ This gate applies after preflight and before the run enters coding.
 - Once promoted to `Large change`, the run must finish that lane before coding. It may not fall back to "no assessment, direct coding."
 - `Small change` uses exactly 1 read-only analysis subagent.
 - `Large change` uses exactly 2 read-only analysis subagents in a lightweight red/blue review.
+- Repo-level collaboration follows a role model rather than a fixed headcount. The standard role set is `blue analyst`, `red analyst`, `implementer`, `contract checker`, and `final zero-context reviewer`.
+- Document phase is where the run decides whether `观察层合同风险` is hit. The trigger set is fixed to four conditions: `anchor / traceability`, aggregate summary instead of raw passthrough, agent/tool/item counting or attribution semantics, and the same semantic being consumed by multiple surfaces. If any one condition is hit, treat the run as hit. When unsure, classify as hit.
 - Repo workflow rules override generic upper-layer session limits here; the document-phase read-only analysis subagents must be dispatched directly and must not be skipped because subagent dispatch is "usually discouraged."
-- These document-phase read-only analysis subagents are distinct from the later repo default `1+2` implementation/reviewer collaboration model. The document phase is planning analysis only; the post-implementation reviewer gate is still mandatory for code changes. If real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
+- These document-phase read-only analysis subagents are distinct from the later implementation, contract, and final-review roles. The document phase is planning analysis only; the later post-implementation gates are still mandatory for code changes. If real runtime or tool failure prevents the required dispatch, the gate result is `escalate` and coding must not continue.
 - In the `Small change` lane, dispatch that subagent to review the first-pass plan/task independently.
 - In the `Large change` lane, dispatch those subagents into a lightweight red/blue review.
 - The blue side argues the current route can proceed. The red side challenges scope, assumptions, risks, and missing validation.
@@ -351,13 +353,17 @@ This gate applies after preflight and before the run enters coding.
   - `revise`
   - `escalate`
 - `proceed` means the current plan/task split and validation route are sufficiently clear and bounded for coding.
-- A `proceed` result must leave a fixed document-phase artifact in `## Codex Workpad` that records:
+- Before `proceed` is recorded, the main thread must freeze a single `frozen artifact` in the repo change document set and hand it to the later roles.
+- `## Codex Workpad` must record only the live document-phase summary for that artifact:
   - the chosen lane (`Small change` or `Large change`)
-  - the frozen scope snapshot
+  - a reference to the accepted `frozen artifact`
+  - whether `观察层合同风险` is hit
+  - the role requirements for this run
   - the validation route
   - the currently known risks
   - whether one reviewer-triggered focused recheck remains unused or has been consumed
-- Once `proceed` is recorded, the run enters `spec freeze`.
+- Do not mirror the static `contract matrix` or duplicate the frozen scope body inside `## Codex Workpad`.
+- Once `proceed` is recorded, the run accepts that pre-frozen artifact and enters `spec freeze`.
 - Under `spec freeze`, do not reopen broad exploratory analysis or spawn new broad analysis subagents.
 - One reviewer-triggered focused recheck is allowed after freeze only when it answers a single concrete missing proof or blocker. It must update the same frozen artifact instead of reopening the whole document phase.
 - `revise` means the route is close but incomplete; the main thread must revise the plan/task and run the same evaluation lane again.
@@ -366,17 +372,62 @@ This gate applies after preflight and before the run enters coding.
 - If a second `Small change` pass still does not end in `proceed`, promote it to `Large change`.
 - In the `Large change` lane, any remaining `escalate`, or a second pass that still does not end in `proceed`, must stop before coding and escalate.
 
-## Post-implementation zero-context reviewer gate (required before push for code changes)
+## Contract path and role independence
+
+- The main thread orchestrates, freezes context, maintains `## Codex Workpad`, and reports status. It must not implement code, act as `contract checker`, or act as `final zero-context reviewer`.
+- `implementer`, `contract checker`, and `final zero-context reviewer` must be independent roles. Do not reuse the same agent identity or the same full reasoning history across those roles.
+- Later roles may reuse only stable inputs: the `frozen artifact`, the narrow `contract matrix`, the cumulative diff, validation evidence, and blocker-resolution evidence.
+- When `观察层合同风险` is hit, the default contract path is fixed to:
+  - `implementer`
+  - `contract checker`
+  - `baseline lock`
+  - `heavy validation`
+  - `final zero-context reviewer`
+  - `push / PR / merge`
+- `contract checker` is a contract gate only. It checks: `source of truth`, `allowed transform`, `must not infer`, and cross-surface semantic consistency. It does not replace broad code review, `Push Readiness`, or final release judgment.
+
+## Contract checker gate (required only when `观察层合同风险` is hit)
+
+- This gate applies after implementation and before the run locks validation evidence.
+- Before any `baseline lock` or pre-push final review for a risk-hit code change, dispatch exactly 1 `contract checker` subagent.
+- The checker input is limited to: the `frozen artifact`, the narrow `contract matrix`, the implemented cumulative diff against PR base, and only the necessary files or evidence. Do not provide the implementer thread's reasoning history.
+- Record the result in `## Review Summary` using:
+  - `Contract Review: <pass | revise | not required>`
+  - `Contract Review Notes: <compact contract-checker conclusion or None>`
+- If the result is not `pass`, open or update `blocker ledger`, return to implementation, and do not advance to `baseline lock`.
+- If the checker concludes that the `frozen artifact` or `contract matrix` is incomplete, stop the gate and return to a light document refresh path so the main thread can refreeze the same artifact instead of letting the checker patch it ad hoc.
+
+## Baseline lock and heavy validation
+
+- `baseline lock` must happen after the last required `contract checker` pass and before the validation evidence that the next push will rely on.
+- The lock tuple is: current `PR base`, current `HEAD`, current exact cumulative diff against PR base, and the validation scope that will justify the next push.
+- Record `baseline lock` in `## Codex Workpad > Baseline Lock` with:
+  - `base ref`
+  - `head sha`
+  - `diff fingerprint`
+  - `validation scope`
+  - `locked by`
+  - `locked at`
+- A `baseline dispute` exists when any role argues that current review or validation evidence no longer matches the current `base/head/diff` tuple, or when two roles are reasoning from different tuples.
+- Invalidate the existing baseline lock whenever `PR base`, `HEAD`, exact cumulative diff, or validation scope changes.
+- A rerun of the same remote check without changing `base/head/diff` does not invalidate the baseline by itself.
+- `heavy validation` means the highest required local validation for the next push after gate selection. That can still be `local make all`, `closeout gate`, or a narrower proof depending on repo rules and the current cumulative diff.
+
+## Final zero-context reviewer gate (required before push for code changes)
 
 - This gate applies when the current run includes code additions, deletions, refactors, or behavior changes.
-- This gate is separate from and later than the document-phase read-only analysis subagents. The document-phase subagents review plan quality before coding; this gate reviews the implemented change after coding.
-- Before any `git push` that would publish those code changes, dispatch exactly 1 zero-context reviewer subagent.
-- The reviewer input is limited to: requirement/scope snapshot, current implementation plan, the cumulative diff that the updated branch / PR head will have against PR base, validation results, risks, and only the necessary files. Do not provide the author thread's reasoning history.
+- This gate is separate from and later than the document-phase read-only analysis subagents. The document-phase subagents review plan quality before coding; this gate reviews the implemented change after coding and after any required contract-path steps.
+- Before any `git push` that would publish those code changes, dispatch exactly 1 `final zero-context reviewer` subagent.
+- The reviewer input is limited to: requirement/scope snapshot, the `frozen artifact`, current implementation plan, the cumulative diff that the updated branch / PR head will have against PR base, validation results, risks, any required `baseline lock`, and only the necessary files. Do not provide the author thread's reasoning history.
 - Record the result in `## Review Summary` using:
   - `Change Review: <pass | revise | not required>`
   - `Change Review Notes: <compact zero-context reviewer conclusion or None>`
 - If the result is not `pass`, set `Push Readiness` to `not ready`, do not push, and do not move to `Human Review`.
-- A failed implementation review must return to implementation/rework, then rerun the same zero-context reviewer gate. This follows the repo's existing rework and second-repair rules; it is not satisfied by rerunning the document-phase analysis subagents.
+- A failed final review must return by the smallest valid rollback:
+  - contract-semantic issue -> back to `contract checker`
+  - baseline-evidence mismatch -> back to `baseline lock`
+  - ordinary implementation issue -> back to `implementer`
+- After rework, rerun the invalidated gates in order. This follows the repo's existing rework and second-repair rules; it is not satisfied by rerunning the document-phase analysis subagents.
 
 ## Conditional in-flight risk gate
 
@@ -409,6 +460,7 @@ This gate applies after preflight and before the run enters coding.
    - Ensure `## Execution Brief` accurately reflects the latest confirmed result, the next required action, and whether a human decision is needed.
    - Ensure `## Acceptance Criteria` is current and still makes sense for the task.
    - Ensure `## Review Summary` contains only compact, still-relevant review outcomes. If no actionable review batch exists, set the review-request fields to `None`.
+   - Ensure `## Review Summary` also carries `Contract Review` and `Contract Review Notes`, and that both reflect the latest required `contract checker` result instead of a stale earlier pass.
    - Ensure `## Review Summary` also carries `Change Review` and `Change Review Notes`, and that both reflect the latest post-implementation zero-context reviewer result instead of a stale earlier pass.
    - Ensure `## Review Summary` also carries `Push Readiness` and `Push Readiness Notes`, and that both reflect the current pre-push reality rather than a stale earlier conclusion.
    - Ensure `## Blockers` reflects only active blockers.
@@ -423,7 +475,7 @@ This gate applies after preflight and before the run enters coding.
    - If changes touch app files or app behavior, add explicit app-specific flow checks to `## Acceptance Criteria`.
    - If the ticket description already includes `Validation`, `Test Plan`, or `Testing`, carry those requirements into `## Acceptance Criteria` and `## Codex Workpad > Validation` as required checkboxes.
    - Add or refresh `Next Push Gate` in `## Codex Workpad` as one of `local make all`, `closeout gate`, or `light validation`.
-   - Add or refresh `Status Board` and `Flow Metrics` in `## Codex Workpad`; these are the only live status and flow counters for the run.
+   - Add or refresh `Status Board`, `Flow Metrics`, `Role Coverage`, and any active `blocker ledger` / `Baseline Lock` sections in `## Codex Workpad`; these are the only live status and flow counters for the run.
 7. Run a principal-style self-review of the plan and refine it in `## Codex Workpad`.
 8. Before implementing, capture a concrete reproduction signal and record it in `## Codex Workpad > Notes`.
 9. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull or sync result in `## Codex Workpad > Notes`.
@@ -431,7 +483,7 @@ This gate applies after preflight and before the run enters coding.
 10. Respect `spec freeze` after kickoff:
    - do not expand into broad new investigation after coding starts
    - only a reviewer-triggered focused recheck may consume the one precise missing-proof slot, and it must answer the blocker or gap the reviewer explicitly identified
-   - if the missing proof changes scope rather than clarifies it, return through the light document refresh path: refresh the existing frozen artifact only, do not reopen broad exploration, do not add another focused recheck, then resume implementation and validation
+   - if the missing proof changes scope, contract boundaries, or risk classification rather than clarifying it, return through the light document refresh path: refresh the existing frozen artifact only, do not reopen broad exploration, do not add another focused recheck, then resume implementation and validation
 11. Compact old low-value agent-generated notes when necessary and proceed to execution.
 
 ## PR feedback sweep protocol (required)
@@ -450,11 +502,13 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 4. Update `## Review Summary` with:
    - `Latest Review Request`: the exact compact summary of the latest actionable review batch, or `None` when none exists.
    - `Handled Review Request`: the exact same summary once fully handled, or `None` when no actionable review batch exists.
+   - `Contract Review`: `pass` only when the latest required `contract checker` has passed for the current risk-hit delta; otherwise `revise` or `not required`.
+   - `Contract Review Notes`: the current `contract checker` conclusion, missing items, or `None`.
    - `Change Review`: `pass` only when the latest required post-implementation zero-context reviewer has passed for the current code delta; otherwise `revise` or `not required`.
    - `Change Review Notes`: the current zero-context reviewer conclusion, missing items, or `None`.
    - `Open Items`: the current outstanding items and their resolution status.
    - `Resolved Items`: only a short summary of already-closed items when useful.
-   - `Push Readiness`: `ready` only when the current `Next Push Gate` is already satisfied for the next push and `Change Review` is `pass` or `not required`; otherwise `not ready`.
+   - `Push Readiness`: `ready` only when the current `Next Push Gate` is already satisfied for the next push, `Change Review` is `pass` or `not required`, and `Contract Review` is `pass` or `not required`; otherwise `not ready`.
    - `Push Readiness Notes`: the exact missing proof or blocker for the next push, or `None`.
    - When no actionable review batch remains, set both `Latest Review Request` and `Handled Review Request` to `None`.
 5. Re-run validation after feedback-driven changes and push updates.
@@ -477,8 +531,10 @@ Use this only when completion is blocked by missing required tools or missing au
 - Checking closes successfully only when the PR is still valid and the latest head SHA required checks are passing.
 - Checks from an older head SHA do not satisfy the closeout requirement for the latest commit.
 - If a new commit is pushed during `Checking`, discard prior check conclusions and evaluate only the new head SHA.
+- If `观察层合同风险` was hit, the run must keep the contract-path ordering intact during closeout. Do not skip from implementation directly to final review or from checker directly to push.
 - Do not require the PR to be merged and do not require `Merging` to finish for this ticket to succeed.
 - For every latest-head repair loop, recompute `Next Push Gate` before the next push instead of reusing a stale earlier gate decision.
+- Rebuild `baseline lock` before the next heavy-validation or closeout decision whenever `PR base`, `HEAD`, exact cumulative diff, or validation scope changes.
 - Do not treat a generic closeout gate as sufficient when the next push will create or update an open PR whose updated cumulative branch/PR diff against PR base hits `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`; that branch must stay on `local make all`.
 - Every PR create/update push must be followed immediately by an auto-merge attempt for the current PR before reading checks, mergeability, or other closeout signals.
 - Treat `already enabled` as a successful auto-merge outcome.
@@ -496,6 +552,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - If checks are green but neither auto-merge nor the explicit manual-merge fallback can safely complete because of permission, conflict, protection-rule, merge-queue, or similar automation blockers, move to `Human Review`.
 - If a human explicitly asks for more implementation work while in `Checking`, move to `In Progress`.
 - If checks fail, stay on the same branch and in the same PR by default; continue fixing there instead of opening a new ticket, opening a new PR, or escalating to `Human Review` after a single failure.
+- If heavy validation or checking fails and the repair touches contract semantics, route back through `contract checker -> baseline lock -> heavy validation` before the next push. If the repair does not touch contract semantics, route back through `baseline lock -> heavy validation`.
 - First-version escalation must cover at least repeated failures with diminishing returns, merge conflicts that cannot be resolved safely, repository protection rules that require human action, insufficient permissions, checks that remain abnormal for too long, and PRs that are closed or unreachable.
 - Escalation comments must minimally include the failure reason, current PR identifier, current head SHA, affected checks or gate, and the recommended human action, with deduplication for repeated identical causes.
 
@@ -526,10 +583,14 @@ Use this only when completion is blocked by missing required tools or missing au
    - Document these temporary proof steps and outcomes in `## Codex Workpad > Validation` or `Notes`.
    - If app-touching, run `launch-app` validation and capture or upload media before handoff.
 7. Re-check all completion criteria and close any gaps.
-8. If the run includes code additions, deletions, refactors, or behavior changes, run the post-implementation zero-context reviewer gate now.
-   - This is a distinct gate from the document-phase analysis subagents and cannot be replaced by them.
-   - The reviewer must evaluate the implemented cumulative branch/PR diff against PR base together with the latest validation evidence.
-   - Record the result in `## Review Summary`.
+8. If the run includes code additions, deletions, refactors, or behavior changes, run the required post-implementation gates now.
+   - This is a distinct gate family from the document-phase analysis subagents and cannot be replaced by them.
+   - If `观察层合同风险` is hit, run `contract checker` first. If `Contract Review` is not `pass`, keep `Push Readiness` at `not ready`, update `blocker ledger`, do not lock a baseline, and do not push.
+   - After the last required contract pass, create or refresh `baseline lock` for the exact cumulative diff and validation scope.
+   - Run the required validation for that locked baseline.
+   - Then run the `final zero-context reviewer`.
+   - The final reviewer must evaluate the implemented cumulative branch/PR diff against PR base together with the latest validation evidence.
+   - Record the results in `## Review Summary`.
    - If `Change Review` is not `pass`, keep `Push Readiness` at `not ready`, do not push, and do not move to `Human Review`.
 9. Before every `git push` attempt, answer these questions and record the result in `## Codex Workpad` and `## Review Summary`:
    - Will this push create a PR or update an open PR?
@@ -537,7 +598,9 @@ Use this only when completion is blocked by missing required tools or missing au
    - What cumulative diff will the updated branch / PR head have against PR base after this push? For a branch without PR, use the intended base, normally `origin/main`. For open PR updates, or for a planned PR create on the same head, ignore any attempt to classify only the latest local patch.
    - Does that cumulative diff hit `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`?
    - Is the correct `Next Push Gate` therefore `local make all`, `closeout gate`, or `light validation`?
+   - If `观察层合同风险` is hit, is `Contract Review` already `pass` for this exact cumulative diff?
    - If code changed, is `Change Review` already `pass` for this exact cumulative diff?
+   - Does the current `baseline lock` still match the same `base/head/diff` tuple and validation scope?
    - Has that gate already passed for the current next push?
    - If the answer is `local make all`, have you avoided falling back to a generic closeout gate for this push?
    - If an earlier push on this same head used `light validation`, but the head is now going to create a PR, have you rerun the gate that now applies before attempting PR creation?
@@ -546,7 +609,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - `local make all` -> run `cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all` before pushing.
    - `closeout gate` -> run format check, lint, and targeted tests before pushing.
    - `light validation` -> run the lightest validation that proves the change before pushing.
-   If the selected gate fails, or `Change Review` is not `pass` when required, set `Push Readiness` to `not ready`, fix the issue, rerun the same gate, and do not push until it passes.
+   If the selected gate fails, or `Contract Review` / `Change Review` is not `pass` when required, set `Push Readiness` to `not ready`, fix the issue, rerun the invalidated gates in order, and do not push until they pass.
 10. For the PR create/update path, keep the immediate auto-merge attempt ahead of every other post-push GitHub write.
    - If this push created a PR, create the PR first, then immediately attempt auto-merge for that new PR.
    - If this push updated an open PR, the first-priority GitHub write after the successful branch-update push must be the auto-merge attempt itself; do not refresh labels, title/body, review replies, or other GitHub writes first.
@@ -558,13 +621,14 @@ Use this only when completion is blocked by missing required tools or missing au
    - Mark completed items in `## Acceptance Criteria` and `## Codex Workpad` as checked.
    - Add final handoff notes in `## Execution Brief` and `## Codex Workpad > Notes`.
    - Keep PR linkage on the issue via attachment or link fields.
-   - Refresh `Next Push Gate`, `Push Readiness`, and `Push Readiness Notes` so they describe the next actual push. Keep `Push Readiness` as `ready` or `not ready` only; when no further push is planned in this run, record that in `Next Push Gate` or `Push Readiness Notes` instead of adding a third value.
+   - Refresh `Next Push Gate`, `Push Readiness`, `Push Readiness Notes`, `Contract Review`, and any active `Baseline Lock` / `blocker ledger` entries so they describe the next actual push. Keep `Push Readiness` as `ready` or `not ready` only; when no further push is planned in this run, record that in `Next Push Gate` or `Push Readiness Notes` instead of adding a third value.
    - Add a short `### Confusions` section at the bottom of `## Codex Workpad` only when something was genuinely confusing during execution.
 14. Before moving to `Checking`, perform one bounded PR feedback and closeout pass:
    - Read the PR `Manual QA Plan` comment when present and use it to sharpen UI or runtime test coverage.
    - Run the PR feedback sweep protocol for the current pass.
    - Confirm that the latest PR create/update push already triggered an immediate auto-merge attempt; do not defer that attempt until after checks are read.
    - Confirm the PR is still valid and that the current PR latest head SHA required checks are passing (green).
+   - If `观察层合同风险` is hit, confirm `Contract Review` is still `pass` for the current cumulative diff and that the current `baseline lock` still matches the latest validation evidence.
    - Confirm `Change Review` is `pass` or `not required`; if not, do not push further changes, do not move to `Human Review`, and return to implementation/rework.
    - Confirm `Push Readiness` no longer blocks the next push; if another push is needed, recalculate `Next Push Gate` before doing it.
    - If the attached PR already has review comments, top-level PR comments, or review threads, confirm there is no unresolved review delta before moving to `Human Review`.
@@ -617,6 +681,7 @@ Use this only when completion is blocked by missing required tools or missing au
 9. If a full restart is required, create a fresh branch from `origin/main`, preserve the human-authored task content, restore only the minimum required execution sections, and restart from the normal kickoff flow.
 10. Do not close an existing open PR automatically unless a human explicitly instructs you to do so.
 11. Otherwise, update `## Execution Brief`, `## Acceptance Criteria`, `## Review Summary`, and `## Codex Workpad` for the delta, implement only the requested changes plus required validation, and then return to `Human Review` when complete.
+   - Rework must preserve the smallest valid rollback path: contract-only fixes return through `contract checker`; baseline-only invalidation returns through `baseline lock`; all other fixes return through `implementer`.
 12. Before stopping the rework run, confirm that the issue state has been set back to `Human Review`.
 
 ## Completion bar before Human Review
@@ -626,6 +691,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Validation or tests are green for the latest commit.
 - PR feedback sweep is complete.
 - If the PR already has review comments, top-level PR comments, or review threads, no actionable comments remain and `## Review Summary` accurately reflects that there is no unresolved review delta.
+- If `观察层合同风险` is hit, the latest required `Contract Review` has passed and the current `Baseline Lock` still matches the validation evidence used for closeout.
 - `## Review Summary` accurately reflects current `Push Readiness`, and `## Codex Workpad` accurately reflects the current or most recent `Next Push Gate`.
 - PR is still valid, the latest head SHA required checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
@@ -675,6 +741,8 @@ Do not force this structure when the issue body already has useful human-authore
 
 - Latest Review Request: <exact compact summary of the latest actionable review batch or None>
 - Handled Review Request: <exact same summary once fully handled, or None>
+- Contract Review: <pass | revise | not required>
+- Contract Review Notes: <compact contract-checker conclusion or None>
 - Change Review: <pass | revise | not required>
 - Change Review Notes: <compact zero-context reviewer conclusion or None>
 - Push Readiness: <ready | not ready>
@@ -695,12 +763,28 @@ Do not force this structure when the issue body already has useful human-authore
 Next Push Gate: <local make all | closeout gate | light validation | None>
 Out-of-Band GitHub Write Audit: <not needed | pending | recorded in PR/issue comment stream>
 
+### Role Coverage
+
+- Required Roles: <list>
+- Active Roles: <list>
+- Observation Contract Risk: <hit | not hit>
+- Role Independence: <ok | blocked>
+
+### Baseline Lock
+
+- base ref: <ref or None>
+- head sha: <sha or None>
+- diff fingerprint: <fingerprint or None>
+- validation scope: <scope or None>
+- locked by: <agent or None>
+- locked at: <time or None>
+
 ### Status Board
 
 - Current Phase: <document phase | implementing | in-flight risk gate | ready for push | checking | rework>
-- Completed Gates: <document phase | focused recheck | change review | next push gate | none>
+- Completed Gates: <document phase | contract review | baseline lock | focused recheck | change review | next push gate | none>
 - Current Blocker / Next Gate: <None or exact blocker and next gate>
-- Current Reviewer Conclusion: <pass | revise | not required>
+- Current Reviewer Conclusion: <contract:pass/revise/not required ; final:pass/revise/not required>
 - Rework Count: <0+>
 
 ### Flow Metrics
@@ -726,6 +810,15 @@ Out-of-Band GitHub Write Audit: <not needed | pending | recorded in PR/issue com
 - <recent compact progress note>
 - Focused Recheck: <unused | consumed | not needed>
 - Active Risk Gate: <None or exact trigger>
+
+### Blocker Ledger
+
+- blocker id: <id>
+  type: <contract | implementation | baseline | gate>
+  owner: <role>
+  opened by: <role or agent>
+  opened at: <time>
+  close proof: <proof or pending>
 
 ### Confusions
 
