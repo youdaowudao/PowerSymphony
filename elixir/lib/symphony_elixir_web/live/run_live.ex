@@ -289,14 +289,45 @@ defmodule SymphonyElixirWeb.RunLive do
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Dependencies & attention</h2>
-                <p class="section-copy">Reserved surface for downstream dependency and attention panels.</p>
+                <h2 class="section-title">Dependencies</h2>
+                <p class="section-copy">Read-only dependency relationships from the current run summary.</p>
               </div>
             </div>
 
             <div class="detail-stack">
-              <p class="mono">Dependencies</p>
-              <p class="mono">Attention</p>
+              <%= if dependency_items_present?(run) do %>
+                <p class="mono">Blocked by</p>
+                <p :for={dependency <- dependency_entries(run, :blocked_by)} class="mono">
+                  <a class="issue-link" href={dependency_href(dependency)}>
+                    <%= dependency_label(dependency) %>
+                  </a>
+                </p>
+                <p class="mono">Blocks</p>
+                <p :for={dependency <- dependency_entries(run, :blocks)} class="mono">
+                  <a class="issue-link" href={dependency_href(dependency)}>
+                    <%= dependency_label(dependency) %>
+                  </a>
+                </p>
+              <% else %>
+                <p class="mono">No dependencies.</p>
+              <% end %>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Attention</h2>
+                <p class="section-copy">Read-only follow-up signals derived from the current run summary.</p>
+              </div>
+            </div>
+
+            <div class="detail-stack">
+              <%= if attention_items(run) == [] do %>
+                <p class="mono">No attention items.</p>
+              <% else %>
+                <p :for={item <- attention_items(run)} class="mono"><%= item.message %></p>
+              <% end %>
             </div>
           </section>
         <% {:error, :project_not_found} -> %>
@@ -587,6 +618,62 @@ defmodule SymphonyElixirWeb.RunLive do
   defp maybe_add_label(labels, false, _label), do: labels
 
   defp summary_fields, do: @summary_fields
+
+  defp dependency_entries(run, key) do
+    run
+    |> Map.get(key, [])
+    |> List.wrap()
+    |> Enum.filter(fn dependency ->
+      is_map(dependency) and dependency_displayable?(dependency)
+    end)
+  end
+
+  defp dependency_items_present?(run) do
+    dependency_entries(run, :blocked_by) != [] or dependency_entries(run, :blocks) != []
+  end
+
+  defp dependency_label(dependency) when is_map(dependency) do
+    case [
+           Map.get(dependency, :issue_identifier),
+           Map.get(dependency, :title),
+           Map.get(dependency, :linear_state)
+         ]
+         |> Enum.filter(&(is_binary(&1) and &1 != ""))
+         |> Enum.join(" · ") do
+      "" -> "Related issue"
+      label -> label
+    end
+  end
+
+  defp dependency_href(dependency) when is_map(dependency) do
+    case Map.get(dependency, :url) do
+      url when is_binary(url) and url != "" -> url
+      _ -> "#"
+    end
+  end
+
+  defp dependency_displayable?(dependency) when is_map(dependency) do
+    Enum.any?([
+      present_string?(Map.get(dependency, :issue_identifier)),
+      present_string?(Map.get(dependency, :title)),
+      present_string?(Map.get(dependency, :linear_state)),
+      present_string?(Map.get(dependency, :url))
+    ])
+  end
+
+  defp dependency_displayable?(_dependency), do: false
+
+  defp present_string?(value) when is_binary(value), do: value != ""
+  defp present_string?(_value), do: false
+
+  defp attention_items(run) do
+    run
+    |> Map.get(:attention_items, [])
+    |> List.wrap()
+    |> Enum.filter(fn item ->
+      is_map(item) and is_binary(Map.get(item, :message)) and Map.get(item, :message) != ""
+    end)
+  end
 
   defp detail_summary_value(nil), do: "n/a"
   defp detail_summary_value(""), do: "n/a"

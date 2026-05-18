@@ -436,6 +436,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
             "issue" => %{
               "id" => "issue-2",
               "identifier" => "MT-2",
+              "title" => "Dependency issue",
+              "url" => "https://example.org/issues/MT-2",
               "state" => %{"name" => "In Progress"}
             }
           },
@@ -456,7 +458,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
 
     assert issue.blocked_by == [
-             %{id: "issue-2", identifier: "MT-2", state: "In Progress", project_id: nil, project_slug: nil}
+             %{
+               id: "issue-2",
+               identifier: "MT-2",
+               title: "Dependency issue",
+               url: "https://example.org/issues/MT-2",
+               state: "In Progress",
+               project_id: nil,
+               project_slug: nil
+             }
            ]
 
     assert issue.labels == ["backend"]
@@ -536,6 +546,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert_receive {:fetch_issue_states_page, query, %{ids: ^first_batch_ids, first: 50, relationFirst: 50}}
     assert query =~ "SymphonyLinearIssuesById"
+    assert query =~ "inverseRelations(first: $relationFirst)"
+    assert query =~ "issue {"
+    assert query =~ "identifier"
+    assert query =~ "title"
+    assert query =~ "url"
 
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end

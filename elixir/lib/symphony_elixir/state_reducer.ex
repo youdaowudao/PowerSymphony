@@ -80,8 +80,9 @@ defmodule SymphonyElixir.StateReducer do
     end
   end
 
-  @spec health_for_summary(summary(), keyword()) :: String.t()
+  @spec health_for_summary(map(), keyword()) :: String.t()
   def health_for_summary(summary, opts \\ []) when is_map(summary) and is_list(opts) do
+    summary = Map.merge(initial_summary(), summary)
     stall_timeout_ms = positive_integer(Keyword.get(opts, :stall_timeout_ms), 300_000)
     now = Keyword.get(opts, :now, DateTime.utc_now()) |> datetime_value() || DateTime.utc_now()
     checking_interval_ms = positive_integer(Keyword.get(opts, :checking_interval_ms), 600_000)

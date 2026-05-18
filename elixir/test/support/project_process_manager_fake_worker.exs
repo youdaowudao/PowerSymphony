@@ -293,6 +293,247 @@ case mode do
 
     accept_loop.(accept_loop)
 
+  "dependency_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-ROOT-1","title":"Root issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-ROOT-1","health":"normal","current_phase":"codex_reasoning","current_action":"reasoning summary streaming","turn_count":5,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"issue_identifier":"MT-BLOCKER-1","title":"Blocker issue","linear_state":"In Progress","url":"https://linear.app/acme/issue/MT-BLOCKER-1"}]},{"issue_identifier":"MT-CHILD-1","title":"Child issue","linear_state":"Todo","issue_url":"https://linear.app/acme/issue/MT-CHILD-1","health":"normal","current_phase":"codex_reasoning","current_action":"waiting on parent","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"issue_identifier":"MT-ROOT-1","title":"Root issue","linear_state":"In Progress","url":"https://linear.app/acme/issue/MT-ROOT-1"}]}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
+  "terminal_blocker_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-TERMINAL-1","title":"Terminal blocker root","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-TERMINAL-1","health":"normal","current_phase":"codex_reasoning","current_action":"reasoning summary streaming","turn_count":2,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"issue_identifier":"MT-DONE-1","title":"Done blocker","linear_state":"Done","url":"https://linear.app/acme/issue/MT-DONE-1"}]}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
+  "slow_health_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-SLOW-1","title":"Slow issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-SLOW-1","health":"slow","current_phase":"codex_reasoning","current_action":"reasoning summary streaming","turn_count":4,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[]}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
+  "fallback_health_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-TOOL-1","title":"Tool blocked issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-TOOL-1","current_phase":"codex_waiting_tool","current_action":"waiting on tool","turn_count":2,"last_event_at":"2026-05-12T00:08:00Z","approval_pending":false,"tool_failure":true,"run_status":"running","blocked_by":["skip-me",{"state":"Todo","url":"https://linear.app/acme/issue/UNLABELED"}]},{"issue_identifier":"MT-CODEX-1","title":"Codex failed issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-CODEX-1","current_phase":"failed","current_action":"run failed","turn_count":3,"last_event_at":"2026-05-12T00:08:00Z","approval_pending":false,"tool_failure":false,"run_status":"failed","blocked_by":[]},{"issue_identifier":"MT-STALL-1","title":"Stalled issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-STALL-1","current_phase":"codex_reasoning","current_action":"reasoning","turn_count":4,"last_event_at":"2026-05-12T00:00:00Z","approval_pending":false,"tool_failure":false,"run_status":"running","blocked_by":[]},{"issue_identifier":"MT-QUIET-1","title":"Quiet issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-QUIET-1","health":"quiet","current_phase":"codex_reasoning","current_action":"quiet run","turn_count":4,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"url":"https://linear.app/acme/issue/QUIET-UNKNOWN"}]},{"issue_identifier":"MT-BLOCKS-UNKNOWN-1","title":"Unknown child blocker issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-BLOCKS-UNKNOWN-1","health":"normal","current_phase":"codex_reasoning","current_action":"normal run","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"issue_identifier":"MT-PARENT-UNKNOWN-1","title":"Parent unknown","linear_state":"In Progress","url":"https://linear.app/acme/issue/MT-PARENT-UNKNOWN-1"}]},{"issue_identifier":"MT-PARENT-UNKNOWN-1","title":"Parent unknown","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-PARENT-UNKNOWN-1","health":"normal","current_phase":"codex_reasoning","current_action":"normal run","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[]}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
+  "edge_case_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                possible_last_event_at =
+                  DateTime.utc_now()
+                  |> DateTime.add(-9_500, :millisecond)
+                  |> DateTime.to_iso8601()
+
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-APPROVAL-1","title":"Approval issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-APPROVAL-1","current_phase":"codex_waiting_user_input_policy","current_action":"waiting on approval","turn_count":2,"last_event_at":"2026-05-12T00:08:00Z","approval_pending":true,"blocked_by":[]},{"issue_identifier":"MT-POSSIBLE-1","title":"Possibly stalled issue","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-POSSIBLE-1","current_phase":"codex_reasoning","current_action":"reasoning summary streaming","turn_count":4,"last_event_at":") <>
+                    possible_last_event_at <>
+                    ~s(","blocked_by":[]},{"title":"Child without identifier","linear_state":"Todo","issue_url":"https://linear.app/acme/issue/UNLABELED-CHILD","health":"normal","current_phase":"codex_reasoning","current_action":"waiting on parent","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[{"issue_identifier":"MT-PARENT-GENERIC-1","title":"Parent generic","linear_state":"In Progress","url":"https://linear.app/acme/issue/MT-PARENT-GENERIC-1"}]},{"issue_identifier":"MT-PARENT-GENERIC-1","title":"Parent generic","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-PARENT-GENERIC-1","health":"normal","current_phase":"codex_reasoning","current_action":"normal run","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","blocked_by":[]},{"approval_pending":true},{"turn_count":7,"approval_pending":false,"metadata":{"source":"synthetic"}}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
+  "nonbinary_blocker_attention" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body =
+                  ~s({"running":[{"issue_identifier":"MT-NONBINARY-BLOCKER-1","title":"Non-binary blocker root","linear_state":"In Progress","issue_url":"https://linear.app/acme/issue/MT-NONBINARY-BLOCKER-1","health":"quiet","current_phase":"codex_reasoning","current_action":"waiting","turn_count":1,"last_event_at":"2026-05-12T00:08:00Z","metadata":{"source":"synthetic"},"blocked_by":[{"issue_identifier":"MT-ACTIVE-1","linear_state":"In Progress","url":"https://linear.app/acme/issue/MT-ACTIVE-1"},{"issue_identifier":"MT-DONE-NONBINARY","linear_state":123,"url":"https://linear.app/acme/issue/MT-DONE-NONBINARY"}]}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
   _other ->
     IO.puts(:stderr, "unsupported fake worker mode")
     System.halt(2)

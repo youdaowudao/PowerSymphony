@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   use GenServer
 
-  alias SymphonyElixir.{Config, ProjectRegistry, ProjectRegistryLoader}
+  alias SymphonyElixir.{Config, ProjectRegistry, ProjectRegistryLoader, StateReducer}
   alias SymphonyElixir.ProjectRegistry.Entry
 
   @startup_grace_ms 1_000
@@ -622,16 +622,11 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   defp projected_status(%Entry{validation_result: :invalid}, _runtime_state), do: :config_invalid
 
-  defp projected_status(%Entry{normalized_config: nil}, _runtime_state), do: :config_invalid
-
   defp projected_status(%Entry{normalized_config: %{enabled: false}}, _runtime_state), do: :disabled
 
-  defp projected_status(%Entry{normalized_config: %{workflow_generated: workflow_generated}}, runtime_state)
-       when is_binary(workflow_generated) do
+  defp projected_status(%Entry{normalized_config: %{workflow_generated: workflow_generated}}, runtime_state) do
     if File.regular?(workflow_generated), do: runtime_state.status, else: :config_invalid
   end
-
-  defp projected_status(_entry, runtime_state), do: runtime_state.status
 
   defp project_health_status(%{status: :running, health_status: :unreachable} = runtime_state),
     do: %{runtime_state | status: :unreachable}
@@ -659,11 +654,16 @@ defmodule SymphonyElixir.ProjectProcessManager do
   defp refresh_run_summaries(runtime_state), do: Map.put(runtime_state, :run_summaries, [])
 
   defp project_run_summaries_from_state(body) when is_map(body) do
-    body
-    |> loaded_runtime_value(:running)
-    |> List.wrap()
+    running_entries =
+      body
+      |> loaded_runtime_value(:running)
+      |> List.wrap()
+      |> Enum.filter(&is_map/1)
+
+    running_entries
     |> Enum.map(&project_run_summary_from_running_entry/1)
     |> Enum.filter(&summary_present?/1)
+    |> attach_run_summary_relationships()
   end
 
   defp project_run_summary_from_running_entry(entry) when is_map(entry) do
@@ -671,24 +671,220 @@ defmodule SymphonyElixir.ProjectProcessManager do
       issue_identifier: loaded_runtime_value(entry, :issue_identifier),
       title: loaded_runtime_value(entry, :title),
       linear_state: loaded_runtime_value(entry, :linear_state),
+      issue_url: loaded_runtime_value(entry, :issue_url),
       current_phase: loaded_runtime_value(entry, :current_phase),
       current_action: loaded_runtime_value(entry, :current_action),
       health: loaded_runtime_value(entry, :health),
+      run_status: loaded_runtime_value(entry, :run_status),
       session_id: loaded_runtime_value(entry, :session_id),
       thread_id: loaded_runtime_value(entry, :thread_id),
       turn_id: loaded_runtime_value(entry, :turn_id),
       turn_count: loaded_runtime_value(entry, :turn_count),
       last_event_at: loaded_runtime_value(entry, :last_event_at) |> parse_datetime(),
       run_duration_seconds: loaded_runtime_value(entry, :run_duration_seconds),
-      last_error: loaded_runtime_value(entry, :last_error)
+      last_error: loaded_runtime_value(entry, :last_error),
+      approval_pending: loaded_runtime_value(entry, :approval_pending) == true,
+      tool_failure: loaded_runtime_value(entry, :tool_failure) == true,
+      blocked_by: summary_dependency_list(loaded_runtime_value(entry, :blocked_by))
     }
   end
 
-  defp project_run_summary_from_running_entry(_entry), do: %{}
+  defp attach_run_summary_relationships(summaries) when is_list(summaries) do
+    Enum.map(summaries, fn summary ->
+      summary_with_blocks =
+        Map.put(summary, :blocks, reverse_blocks_for_summary(summary, summaries))
+
+      Map.put(summary_with_blocks, :attention_items, attention_items_for_summary(summary_with_blocks))
+    end)
+  end
+
+  defp summary_dependency_list(value) do
+    value
+    |> List.wrap()
+    |> Enum.map(&summary_dependency/1)
+    |> Enum.filter(&summary_present?/1)
+  end
+
+  defp summary_dependency(item) when is_map(item) do
+    %{
+      issue_identifier: loaded_runtime_value(item, :issue_identifier) || loaded_runtime_value(item, :identifier),
+      title: loaded_runtime_value(item, :title),
+      linear_state: loaded_runtime_value(item, :linear_state) || loaded_runtime_value(item, :state),
+      url: loaded_runtime_value(item, :url)
+    }
+  end
+
+  defp summary_dependency(_item), do: %{}
+
+  defp reverse_blocks_for_summary(summary, summaries) when is_map(summary) and is_list(summaries) do
+    target_identifier = Map.get(summary, :issue_identifier)
+
+    summaries
+    |> Enum.filter(fn other_summary ->
+      other_summary != summary and
+        Enum.any?(Map.get(other_summary, :blocked_by, []), fn blocker ->
+          Map.get(blocker, :issue_identifier) == target_identifier
+        end)
+    end)
+    |> Enum.map(fn other_summary ->
+      %{
+        issue_identifier: Map.get(other_summary, :issue_identifier),
+        title: Map.get(other_summary, :title),
+        linear_state: Map.get(other_summary, :linear_state),
+        url: Map.get(other_summary, :issue_url)
+      }
+    end)
+    |> Enum.filter(&summary_present?/1)
+  end
+
+  defp attention_items_for_summary(summary) when is_map(summary) do
+    health = attention_health(summary)
+    blockers = Map.get(summary, :blocked_by, [])
+    blocks = Map.get(summary, :blocks, [])
+
+    []
+    |> maybe_add_attention(blocking_attention_item(blockers))
+    |> maybe_add_attention(blocked_children_attention_item(blocks))
+    |> maybe_add_attention(health_attention_item(summary, health))
+  end
+
+  defp maybe_add_attention(items, nil), do: items
+
+  defp maybe_add_attention(items, %{} = item), do: items ++ [item]
+
+  defp blocking_attention_item([]), do: nil
+
+  defp blocking_attention_item(blockers) when is_list(blockers) do
+    active_blockers = non_terminal_blockers(blockers)
+
+    identifiers =
+      active_blockers
+      |> Enum.map(&Map.get(&1, :issue_identifier))
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+
+    cond do
+      active_blockers == [] ->
+        nil
+
+      identifiers == [] ->
+        %{kind: "blocked_by", message: "Current blockers are still unresolved."}
+
+      true ->
+        %{kind: "blocked_by", message: "Current blockers are still unresolved: #{Enum.join(identifiers, ", ")}."}
+    end
+  end
+
+  defp blocked_children_attention_item([]), do: nil
+
+  defp blocked_children_attention_item(blocks) when is_list(blocks) do
+    identifiers =
+      blocks
+      |> Enum.map(&Map.get(&1, :issue_identifier))
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+
+    if identifiers == [] do
+      %{kind: "blocks", message: "Related blocked issues are still waiting."}
+    else
+      %{kind: "blocks", message: "Related blocked issues are still waiting: #{Enum.join(identifiers, ", ")}."}
+    end
+  end
+
+  defp health_attention_item(_summary, "slow"), do: nil
+  defp health_attention_item(_summary, "normal"), do: nil
+  defp health_attention_item(_summary, "quiet"), do: nil
+
+  defp health_attention_item(_summary, health) do
+    message =
+      case health do
+        "needs_attention" -> "Run requires manual follow-up."
+        "possibly_stalled" -> "Run may be stalled and needs a closer look."
+        "stalled" -> "Run appears stalled and needs a closer look."
+        "tool_blocked" -> "Run is blocked on a tool failure and needs manual follow-up."
+        "codex_error" -> "Run ended with an error and needs manual follow-up."
+        _ -> nil
+      end
+
+    if is_binary(message) do
+      %{kind: health, message: message}
+    else
+      nil
+    end
+  end
+
+  defp non_terminal_blockers(blockers) when is_list(blockers) do
+    terminal_states =
+      Config.settings!().tracker.terminal_states
+      |> Enum.map(&normalize_issue_state/1)
+      |> MapSet.new()
+
+    Enum.reject(blockers, fn blocker ->
+      blocker
+      |> Map.get(:linear_state, Map.get(blocker, :state))
+      |> terminal_issue_state?(terminal_states)
+    end)
+  end
+
+  defp normalize_issue_state(state_name) when is_binary(state_name) do
+    state_name
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_issue_state(_state_name), do: nil
+
+  defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
+    MapSet.member?(terminal_states, normalize_issue_state(state_name))
+  end
+
+  defp terminal_issue_state?(_state_name, _terminal_states), do: false
+
+  defp attention_health(summary) when is_map(summary) do
+    case Map.get(summary, :health) do
+      value when is_binary(value) and value != "" ->
+        value
+
+      _ ->
+        if summary_health_fallback_safe?(summary) do
+          config = Config.settings!()
+
+          StateReducer.health_for_summary(
+            summary,
+            stall_timeout_ms: config.codex.stall_timeout_ms,
+            checking_interval_ms: config.polling.checking_interval_ms
+          )
+        else
+          nil
+        end
+    end
+  end
 
   defp summary_present?(summary) when is_map(summary) do
-    Enum.any?(summary, fn {_key, value} -> not is_nil(value) end)
+    Enum.any?(summary, fn
+      {_key, true} -> true
+      {_key, value} when is_binary(value) -> value != ""
+      {_key, value} when is_integer(value) -> true
+      {_key, %DateTime{}} -> true
+      {_key, value} when is_list(value) -> value != []
+      _other -> false
+    end)
   end
+
+  defp summary_health_fallback_safe?(summary) when is_map(summary) do
+    Map.get(summary, :approval_pending) == true or
+      Map.get(summary, :tool_failure) == true or
+      present_string?(Map.get(summary, :run_status)) or
+      complete_summary_activity_context?(summary)
+  end
+
+  defp complete_summary_activity_context?(summary) when is_map(summary) do
+    present_string?(Map.get(summary, :linear_state)) and
+      present_string?(Map.get(summary, :current_phase)) and
+      present_string?(Map.get(summary, :current_action)) and
+      match?(%DateTime{}, Map.get(summary, :last_event_at))
+  end
+
+  defp present_string?(value) when is_binary(value), do: value != ""
+  defp present_string?(_value), do: false
 
   defp refresh_runtime_truth(runtime_map, %ProjectRegistry{entries: entries}) do
     Enum.reduce(entries, runtime_map, fn
@@ -908,8 +1104,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
     end
   end
 
-  defp parse_datetime(%DateTime{} = value), do: value
-
   defp await_startup_outcome(port, os_pid, timeout_ms, started_ms \\ System.monotonic_time(:millisecond))
 
   defp await_startup_outcome(port, os_pid, timeout_ms, started_ms) do
@@ -964,8 +1158,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   defp format_datetime(nil), do: nil
   defp format_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
-
-  defp normalize_status(value) when is_atom(value), do: value
 
   defp normalize_status("not_started"), do: :not_started
   defp normalize_status("starting"), do: :starting

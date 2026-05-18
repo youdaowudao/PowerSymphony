@@ -315,13 +315,17 @@ defmodule SymphonyElixirWeb.Presenter do
       current_phase: map_value(summary, :current_phase),
       current_action: map_value(summary, :current_action),
       health: map_value(summary, :health),
+      issue_url: map_value(summary, :issue_url),
       session_id: map_value(summary, :session_id),
       thread_id: map_value(summary, :thread_id),
       turn_id: map_value(summary, :turn_id),
       turn_count: map_integer_value(summary, :turn_count),
       last_event_at: iso8601(map_value(summary, :last_event_at)),
       run_duration_seconds: map_integer_value(summary, :run_duration_seconds),
-      last_error: map_value(summary, :last_error)
+      last_error: map_value(summary, :last_error),
+      blocked_by: dependency_list_payload(map_value(summary, :blocked_by)),
+      blocks: dependency_list_payload(map_value(summary, :blocks)),
+      attention_items: attention_items_payload(map_value(summary, :attention_items))
     }
   end
 
@@ -532,6 +536,7 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_id: Map.get(entry, :turn_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
+      issue_url: Map.get(entry, :issue_url),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
@@ -540,6 +545,10 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       run_duration_seconds: Map.get(entry, :runtime_seconds, 0),
       last_error: Map.get(entry, :last_error),
+      run_status: Map.get(entry, :run_status),
+      approval_pending: Map.get(entry, :approval_pending),
+      tool_failure: Map.get(entry, :tool_failure),
+      blocked_by: dependency_list_payload(Map.get(entry, :blocked_by)),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
@@ -570,6 +579,7 @@ defmodule SymphonyElixirWeb.Presenter do
       linear_state: Map.get(running, :linear_state),
       current_phase: Map.get(running, :current_phase),
       current_action: Map.get(running, :current_action),
+      run_status: Map.get(running, :run_status),
       health: Map.get(running, :health),
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
@@ -616,6 +626,64 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp project_validation_error_summary(_errors), do: nil
+
+  defp dependency_list_payload(value) do
+    value
+    |> List.wrap()
+    |> Enum.map(&dependency_payload/1)
+    |> Enum.filter(&dependency_present?/1)
+  end
+
+  defp dependency_payload(item) when is_map(item) do
+    %{}
+    |> maybe_put_payload_value(:issue_identifier, map_value(item, :issue_identifier) || map_value(item, :identifier))
+    |> maybe_put_payload_value(:title, map_value(item, :title))
+    |> maybe_put_payload_value(:linear_state, map_value(item, :linear_state) || map_value(item, :state))
+    |> maybe_put_payload_value(:url, map_value(item, :url))
+  end
+
+  defp dependency_payload(_item), do: %{}
+
+  defp dependency_present?(dependency) when is_map(dependency) do
+    Enum.any?(dependency, fn {_key, value} -> is_binary(value) and value != "" end)
+  end
+
+  defp dependency_present?(_dependency), do: false
+
+  defp attention_items_payload(value) do
+    value
+    |> List.wrap()
+    |> Enum.map(&attention_item_payload/1)
+    |> Enum.filter(&attention_item_present?/1)
+  end
+
+  defp attention_item_payload(item) when is_map(item) do
+    %{}
+    |> maybe_put_payload_value(:kind, map_value(item, :kind))
+    |> maybe_put_payload_value(:message, map_value(item, :message))
+  end
+
+  defp attention_item_payload(item) when is_binary(item) do
+    %{kind: attention_kind_for_message(item), message: item}
+  end
+
+  defp attention_item_payload(_item), do: %{}
+
+  defp attention_item_present?(item) when is_map(item) do
+    is_binary(Map.get(item, :message)) and Map.get(item, :message) != ""
+  end
+
+  defp attention_item_present?(_item), do: false
+
+  defp attention_kind_for_message(message) when is_binary(message) do
+    lower = String.downcase(message)
+
+    cond do
+      String.contains?(lower, "attention") -> "needs_attention"
+      String.contains?(lower, "stalled") -> "possibly_stalled"
+      true -> "attention"
+    end
+  end
 
   defp m3_generated_at(payload) do
     case m3_payload_value(payload, :generated_at) do
