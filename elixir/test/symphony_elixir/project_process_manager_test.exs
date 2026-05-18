@@ -296,6 +296,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert entry.runtime_state.status == :start_failed
     assert entry.runtime_state.exit_code == 2
     assert entry.runtime_state.exit_reason == "worker exited with status 2"
+    assert File.read!(entry.runtime_state.stderr_path) =~ "syntax error"
   end
 
   test "startup data message before grace timeout recurses and can still reach running" do
@@ -2299,7 +2300,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     port = reserve_tcp_port!()
 
     ignored_term_command =
-      "bash -lc " <> shell_escape("trap '' TERM; while true; do sleep 1; done")
+      "bash -c " <> shell_escape("trap '' TERM; while true; do sleep 1; done")
 
     command_builder = raw_command_builder(ignored_term_command)
 
@@ -2625,7 +2626,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
           :binary,
           :exit_status,
           args: [
-            ~c"-lc",
+            ~c"-c",
             String.to_charlist("exec nohup elixir #{shell_escape(script_path)} --mode normal --port #{port} < /dev/null >> #{shell_escape(stdout_path)} 2>> #{shell_escape(stderr_path)} & echo $!")
           ]
         ]
@@ -2666,7 +2667,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       [
         :binary,
         :exit_status,
-        args: [~c"-lc", String.to_charlist("sleep #{seconds}")]
+        args: [~c"-c", String.to_charlist("sleep #{seconds}")]
       ]
     )
   end
