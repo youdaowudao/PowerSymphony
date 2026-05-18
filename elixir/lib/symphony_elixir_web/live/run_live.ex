@@ -32,6 +32,8 @@ defmodule SymphonyElixirWeb.RunLive do
       |> assign(:page_title, "Run detail")
       |> assign(:surface_names, @surface_names)
       |> assign(:selected_event_id, nil)
+      |> assign(:section_state, initial_section_state())
+      |> assign(:timeline_filter, "all")
       |> assign(:timeline_state, initial_timeline_state())
       |> assign(:context_state, initial_context_state())
       |> assign(:detail_state, initial_detail_state())
@@ -75,10 +77,19 @@ defmodule SymphonyElixirWeb.RunLive do
     {:noreply, load_more_timeline(socket)}
   end
 
+  def handle_event("toggle_section", %{"section" => section}, socket) do
+    {:noreply, toggle_section(socket, section)}
+  end
+
+  def handle_event("set_timeline_filter", %{"filter" => filter}, socket) do
+    {:noreply, assign(socket, :timeline_filter, normalize_timeline_filter(filter))}
+  end
+
   def handle_event("show_event_detail", %{"event_id" => event_id}, socket) do
     socket =
       socket
       |> assign(:selected_event_id, event_id)
+      |> expand_section(:event_detail)
       |> assign(:detail_state, %{initial_detail_state() | status: :loading, event_id: event_id})
 
     send(self(), {:load_event_detail, event_id})
@@ -132,280 +143,371 @@ defmodule SymphonyElixirWeb.RunLive do
             </div>
           </header>
 
-          <section class="section-card">
+          <section class="metric-grid">
+            <article class="metric-card">
+              <p class="metric-label">Attention</p>
+              <p class="metric-value"><%= attention_count(run) %></p>
+              <p class="metric-detail">from attention items</p>
+            </article>
+            <article class="metric-card">
+              <p class="metric-label">Blocked by</p>
+              <p class="metric-value"><%= blocked_by_count(run) %></p>
+              <p class="metric-detail">current blockers</p>
+            </article>
+            <article class="metric-card">
+              <p class="metric-label">Blocks</p>
+              <p class="metric-value"><%= blocks_count(run) %></p>
+              <p class="metric-detail">downstream items</p>
+            </article>
+          </section>
+
+          <section class="section-card run-section" data-section="overview">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Summary</h2>
-                <p class="section-copy">Top-level run status only. Timeline loads independently.</p>
+                <h2 class="section-title">Overview</h2>
+                <p class="section-copy">Top-level run status only. Timeline, context, and detail load independently.</p>
               </div>
+              <button
+                type="button"
+                class="subtle-button section-toggle"
+                aria-expanded={section_expanded?(@section_state, :overview)}
+                phx-click="toggle_section"
+                phx-value-section="overview"
+              >
+                <%= section_toggle_label(@section_state, :overview) %>
+              </button>
             </div>
 
-            <div class="session-stack">
+            <div class="session-stack run-section-body" hidden={!section_expanded?(@section_state, :overview)}>
               <p :for={{label, key} <- summary_fields()} class="mono">
                 <strong><%= label %></strong>: <%= summary_value(run, key) %>
               </p>
             </div>
           </section>
 
-          <section class="section-card">
+          <section class="section-card run-section" data-section="action-needed">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Action Needed</h2>
+                <p class="section-copy">Priority follow-up stays anchored to summary attention and dependencies only.</p>
+              </div>
+              <button
+                type="button"
+                class="subtle-button section-toggle"
+                aria-expanded={section_expanded?(@section_state, :action_needed)}
+                phx-click="toggle_section"
+                phx-value-section="action_needed"
+              >
+                <%= section_toggle_label(@section_state, :action_needed) %>
+              </button>
+            </div>
+
+            <div class="detail-stack run-section-body" hidden={!section_expanded?(@section_state, :action_needed)}>
+              <div class="info-panel info-panel-primary">
+                <p class="metric-label">Primary signal</p>
+                <p class="info-panel-copy mono" data-role="action-needed-primary"><%= primary_attention_message(run) %></p>
+              </div>
+
+              <div class="info-panel">
+                <p class="metric-label">Attention items</p>
+                <%= if attention_items(run) == [] do %>
+                  <p class="mono">No attention items.</p>
+                <% else %>
+                  <p :for={item <- attention_items(run)} class="mono"><%= item.message %></p>
+                <% end %>
+              </div>
+
+              <div class="info-panel">
+                <p class="metric-label">Blocked by</p>
+                <%= if dependency_entries(run, :blocked_by) == [] do %>
+                  <p class="mono">No dependencies.</p>
+                <% else %>
+                  <p :for={dependency <- dependency_entries(run, :blocked_by)} class="mono">
+                    <a class="issue-link" href={dependency_href(dependency)}>
+                      <%= dependency_label(dependency) %>
+                    </a>
+                  </p>
+                <% end %>
+              </div>
+
+              <div class="info-panel">
+                <p class="metric-label">Blocks</p>
+                <%= if dependency_entries(run, :blocks) == [] do %>
+                  <p class="mono">No dependencies.</p>
+                <% else %>
+                  <p :for={dependency <- dependency_entries(run, :blocks)} class="mono">
+                    <a class="issue-link" href={dependency_href(dependency)}>
+                      <%= dependency_label(dependency) %>
+                    </a>
+                  </p>
+                <% end %>
+              </div>
+            </div>
+          </section>
+
+          <section class="section-card run-section" data-section="timeline">
             <div class="section-header">
               <div>
                 <h2 class="section-title">Timeline</h2>
-                <p class="section-copy">Default recent window with incremental history loading.</p>
+                <p class="section-copy">Filters only affect the currently loaded items.</p>
               </div>
+              <button
+                type="button"
+                class="subtle-button section-toggle"
+                aria-expanded={section_expanded?(@section_state, :timeline)}
+                phx-click="toggle_section"
+                phx-value-section="timeline"
+              >
+                <%= section_toggle_label(@section_state, :timeline) %>
+              </button>
             </div>
 
-            <p :if={quiet_attention?(run)} class="mono">quiet attention</p>
+            <div class="detail-stack run-section-body" hidden={!section_expanded?(@section_state, :timeline)}>
+              <p :if={quiet_attention?(run)} class="mono">quiet attention</p>
 
-            <%= case @timeline_state.status do %>
-              <% :loading -> %>
-                <p class="empty-state">Loading timeline…</p>
-              <% :error -> %>
-                <p class="empty-state"><%= timeline_error_text(@timeline_state.error) %></p>
-              <% :ready -> %>
-                <div class="session-stack">
-                  <article :for={item <- @timeline_state.items} class="section-card">
-                    <div class="section-header">
-                      <div>
-                        <h3 class="section-title"><%= item.summary || item.event_id || "timeline event" %></h3>
-                        <p class="section-copy">
-                          <%= [item.timestamp, item.source, item.event_type] |> Enum.reject(&is_nil/1) |> Enum.join(" · ") %>
-                        </p>
+              <div class="filter-chip-row">
+                <button
+                  :for={{filter, label} <- timeline_filter_options()}
+                  type="button"
+                  class={timeline_filter_button_class(@timeline_filter, filter)}
+                  phx-click="set_timeline_filter"
+                  phx-value-filter={filter}
+                >
+                  <%= label %>
+                </button>
+              </div>
+
+              <%= case @timeline_state.status do %>
+                <% :loading -> %>
+                  <p class="empty-state">Loading timeline…</p>
+                <% :error -> %>
+                  <p class="empty-state"><%= timeline_error_text(@timeline_state.error) %></p>
+                <% :ready -> %>
+                  <div class="session-stack">
+                    <article :for={item <- filtered_timeline_items(@timeline_state.items, @timeline_filter)} class="section-card timeline-item-card">
+                      <div class="section-header">
+                        <div>
+                          <h3 class="section-title"><%= item.summary || item.event_id || "timeline event" %></h3>
+                          <p class="section-copy">
+                            <%= [item.timestamp, item.source, item.event_type] |> Enum.reject(&is_nil/1) |> Enum.join(" · ") %>
+                          </p>
+                        </div>
+
+                        <button
+                          type="button"
+                          class="issue-link"
+                          phx-click="show_event_detail"
+                          phx-value-event_id={item.event_id}
+                        >
+                          Open detail
+                        </button>
                       </div>
 
+                      <div class="detail-stack">
+                        <p :for={marker <- timeline_labels(item)} class="mono"><%= marker %></p>
+                      </div>
+                    </article>
+                  </div>
+
+                  <p :if={filtered_timeline_items(@timeline_state.items, @timeline_filter) == []} class="empty-state">
+                    No timeline items match this filter.
+                  </p>
+
+                  <p :if={is_binary(@timeline_state.load_more_error)} class="mono">
+                    <%= @timeline_state.load_more_error %>
+                  </p>
+
+                  <button
+                    :if={is_binary(@timeline_state.next_cursor)}
+                    type="button"
+                    class="issue-link"
+                    phx-click="load_more_timeline"
+                  >
+                    Load more
+                  </button>
+                <% _ -> %>
+                  <p class="empty-state">Timeline unavailable</p>
+              <% end %>
+            </div>
+          </section>
+
+          <section class="section-card run-section" data-section="context">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Context</h2>
+                <p class="section-copy">Independent, lightweight context summary for the current run generation.</p>
+              </div>
+              <button
+                type="button"
+                class="subtle-button section-toggle"
+                aria-expanded={section_expanded?(@section_state, :context)}
+                phx-click="toggle_section"
+                phx-value-section="context"
+              >
+                <%= section_toggle_label(@section_state, :context) %>
+              </button>
+            </div>
+
+            <div class="detail-stack run-section-body" hidden={!section_expanded?(@section_state, :context)}>
+              <%= case @context_state.status do %>
+                <% :loading -> %>
+                  <p class="empty-state">Loading context…</p>
+                <% :error -> %>
+                  <p class="empty-state"><%= context_error_text(@context_state.error) %></p>
+                <% :ready -> %>
+                  <div class="detail-stack">
+                    <h3 class="section-title">Thread &amp; Turn</h3>
+                    <p class="mono">session: <%= @context_state.context.anchor.session_id || "n/a" %></p>
+                    <p class="mono">thread: <%= @context_state.context.anchor.thread_id || "n/a" %></p>
+                    <p class="mono">turn: <%= @context_state.context.anchor.turn_id || "n/a" %></p>
+                    <p class="mono">turn_count: <%= summary_value(@context_state.context.anchor, :turn_count) %></p>
+                  </div>
+
+                  <div class="detail-stack">
+                    <h3 class="section-title">Recent interaction signals</h3>
+                    <div :for={item <- @context_state.context.conversation.items} class="detail-stack">
+                      <p class="mono"><%= item.label %>: <%= item.text %></p>
                       <button
                         type="button"
                         class="issue-link"
                         phx-click="show_event_detail"
                         phx-value-event_id={item.event_id}
                       >
-                        Open detail
+                        Open detail: <%= item.event_id %>
                       </button>
                     </div>
+                    <p :if={@context_state.context.conversation.items == []} class="mono">none observed</p>
+                  </div>
 
-                    <div class="detail-stack">
-                      <p :for={marker <- timeline_labels(item)} class="mono"><%= marker %></p>
+                  <div class="detail-stack">
+                    <h3 class="section-title">Continuation &amp; Retry</h3>
+                    <p class="mono"><%= @context_state.context.continuation.label || "none observed" %></p>
+                    <p class="mono">event_id: <%= @context_state.context.continuation.event_id || "n/a" %></p>
+                    <button
+                      :if={is_binary(@context_state.context.continuation.event_id)}
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={@context_state.context.continuation.event_id}
+                    >
+                      Open detail: <%= @context_state.context.continuation.event_id %>
+                    </button>
+                  </div>
+
+                  <div class="detail-stack">
+                    <h3 class="section-title">Tools &amp; Shell</h3>
+                    <div :for={item <- @context_state.context.tools.items} class="detail-stack">
+                      <p class="mono"><%= item.summary %></p>
+                      <button
+                        type="button"
+                        class="issue-link"
+                        phx-click="show_event_detail"
+                        phx-value-event_id={item.event_id}
+                      >
+                        Open detail: <%= item.event_id %>
+                      </button>
                     </div>
-                  </article>
-                </div>
-
-                <p :if={is_binary(@timeline_state.load_more_error)} class="mono">
-                  <%= @timeline_state.load_more_error %>
-                </p>
-
-                <button
-                  :if={is_binary(@timeline_state.next_cursor)}
-                  type="button"
-                  class="issue-link"
-                  phx-click="load_more_timeline"
-                >
-                  Load more
-                </button>
-              <% _ -> %>
-                <p class="empty-state">Timeline unavailable</p>
-            <% end %>
-          </section>
-
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Event detail</h2>
-                <p class="section-copy">Single-event metadata first. Heavy surfaces stay lazy.</p>
-              </div>
-            </div>
-
-            <%= case @detail_state.status do %>
-              <% :idle -> %>
-                <p class="empty-state">Entry point only. Event body stays unloaded by default.</p>
-              <% :loading -> %>
-                <p class="empty-state">Loading event detail…</p>
-              <% :error -> %>
-                <p class="empty-state"><%= detail_error_text(@detail_state.error) %></p>
-              <% :ready -> %>
-                <div class="detail-stack">
-                  <p class="mono">event_id: <%= @detail_state.detail.event.event_id || "n/a" %></p>
-                  <p class="mono">timestamp: <%= @detail_state.detail.event.timestamp || "n/a" %></p>
-                  <p class="mono">source: <%= @detail_state.detail.event.source || "n/a" %></p>
-                  <p class="mono">event_type: <%= @detail_state.detail.event.event_type || "n/a" %></p>
-                  <p class="mono">event_group: <%= @detail_state.detail.event.event_group || "n/a" %></p>
-                  <p class="mono">summary: <%= @detail_state.detail.event.summary || "n/a" %></p>
-                  <p class="mono">session: <%= @detail_state.detail.context.session_id || "n/a" %></p>
-                  <p class="mono">thread: <%= @detail_state.detail.context.thread_id || "n/a" %></p>
-                  <p class="mono">turn: <%= @detail_state.detail.context.turn_id || "n/a" %></p>
-                </div>
-
-                <div class="detail-stack">
-                  <p class="mono">tool summary: <%= detail_summary_value(@detail_state.detail.summaries.tool_call) %></p>
-                  <p class="mono">payload summary: <%= detail_summary_value(@detail_state.detail.summaries.payload) %></p>
-                  <p class="mono">prompt summary: <%= detail_summary_value(@detail_state.detail.summaries.prompt) %></p>
-                  <p class="mono">shell summary: <%= detail_summary_value(@detail_state.detail.summaries.shell) %></p>
-                </div>
-
-                <div class="detail-stack">
-                  <button :for={surface <- @surface_names} type="button" class="issue-link" phx-click="load_event_surface" phx-value-surface={surface}>
-                    Load <%= surface %>
-                  </button>
-                </div>
-
-                <%= for surface <- @surface_names do %>
-                  <% preview = Map.fetch!(@detail_state.detail.surfaces, String.to_atom(surface)) %>
-                  <% surface_state = Map.fetch!(@detail_state.surfaces, surface) %>
-                  <article class="section-card">
-                    <div class="section-header">
-                      <div>
-                        <h3 class="section-title"><%= surface %></h3>
-                        <p class="section-copy">
-                          <%= surface_preview_text(preview) %>
-                        </p>
-                      </div>
+                    <div :for={item <- @context_state.context.shell.items} class="detail-stack">
+                      <p class="mono"><%= item.text %></p>
+                      <button
+                        type="button"
+                        class="issue-link"
+                        phx-click="show_event_detail"
+                        phx-value-event_id={item.event_id}
+                      >
+                        Open detail: <%= item.event_id %>
+                      </button>
                     </div>
-
-                    <%= case surface_state.status do %>
-                      <% :idle -> %>
-                        <p class="empty-state">Surface body stays unloaded.</p>
-                      <% :loading -> %>
-                        <p class="empty-state">Loading <%= surface %>…</p>
-                      <% :error -> %>
-                        <p class="empty-state"><%= surface_error_text(surface_state.error) %></p>
-                      <% :ready -> %>
-                        <pre class="mono"><%= surface_state.content %></pre>
-                    <% end %>
-                  </article>
-                <% end %>
-            <% end %>
-          </section>
-
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Run context</h2>
-                <p class="section-copy">Independent, lightweight context summary for the current run generation.</p>
-              </div>
-            </div>
-
-            <%= case @context_state.status do %>
-              <% :loading -> %>
-                <p class="empty-state">Loading context…</p>
-              <% :error -> %>
-                <p class="empty-state"><%= context_error_text(@context_state.error) %></p>
-              <% :ready -> %>
-                <div class="detail-stack">
-                  <h3 class="section-title">Thread &amp; Turn</h3>
-                  <p class="mono">session: <%= @context_state.context.anchor.session_id || "n/a" %></p>
-                  <p class="mono">thread: <%= @context_state.context.anchor.thread_id || "n/a" %></p>
-                  <p class="mono">turn: <%= @context_state.context.anchor.turn_id || "n/a" %></p>
-                  <p class="mono">turn_count: <%= summary_value(@context_state.context.anchor, :turn_count) %></p>
-                </div>
-
-                <div class="detail-stack">
-                  <h3 class="section-title">Recent interaction signals</h3>
-                  <div :for={item <- @context_state.context.conversation.items} class="detail-stack">
-                    <p class="mono"><%= item.label %>: <%= item.text %></p>
-                    <button
-                      type="button"
-                      class="issue-link"
-                      phx-click="show_event_detail"
-                      phx-value-event_id={item.event_id}
-                    >
-                      Open detail: <%= item.event_id %>
-                    </button>
+                    <p :if={@context_state.context.tools.items == [] and @context_state.context.shell.items == []} class="mono">none observed</p>
                   </div>
-                  <p :if={@context_state.context.conversation.items == []} class="mono">none observed</p>
-                </div>
 
-                <div class="detail-stack">
-                  <h3 class="section-title">Continuation &amp; Retry</h3>
-                  <p class="mono"><%= @context_state.context.continuation.label || "none observed" %></p>
-                  <p class="mono">event_id: <%= @context_state.context.continuation.event_id || "n/a" %></p>
-                  <button
-                    :if={is_binary(@context_state.context.continuation.event_id)}
-                    type="button"
-                    class="issue-link"
-                    phx-click="show_event_detail"
-                    phx-value-event_id={@context_state.context.continuation.event_id}
-                  >
-                    Open detail: <%= @context_state.context.continuation.event_id %>
-                  </button>
-                </div>
-
-                <div class="detail-stack">
-                  <h3 class="section-title">Tools &amp; Shell</h3>
-                  <div :for={item <- @context_state.context.tools.items} class="detail-stack">
-                    <p class="mono"><%= item.summary %></p>
-                    <button
-                      type="button"
-                      class="issue-link"
-                      phx-click="show_event_detail"
-                      phx-value-event_id={item.event_id}
-                    >
-                      Open detail: <%= item.event_id %>
-                    </button>
+                  <div class="detail-stack">
+                    <h3 class="section-title">Sub-agent</h3>
+                    <p :for={item <- @context_state.context.subagents.items} class="mono"><%= item.text %></p>
+                    <p :if={@context_state.context.subagents.items == []} class="mono"><%= humanize_context_status(@context_state.context.subagents.status) %></p>
                   </div>
-                  <div :for={item <- @context_state.context.shell.items} class="detail-stack">
-                    <p class="mono"><%= item.text %></p>
-                    <button
-                      type="button"
-                      class="issue-link"
-                      phx-click="show_event_detail"
-                      phx-value-event_id={item.event_id}
-                    >
-                      Open detail: <%= item.event_id %>
-                    </button>
-                  </div>
-                  <p :if={@context_state.context.tools.items == [] and @context_state.context.shell.items == []} class="mono">none observed</p>
-                </div>
-
-                <div class="detail-stack">
-                  <h3 class="section-title">Sub-agent</h3>
-                  <p :for={item <- @context_state.context.subagents.items} class="mono"><%= item.text %></p>
-                  <p :if={@context_state.context.subagents.items == []} class="mono"><%= humanize_context_status(@context_state.context.subagents.status) %></p>
-                </div>
-              <% _ -> %>
-                <p class="empty-state">Context unavailable</p>
-            <% end %>
-          </section>
-
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Dependencies</h2>
-                <p class="section-copy">Read-only dependency relationships from the current run summary.</p>
-              </div>
-            </div>
-
-            <div class="detail-stack">
-              <%= if dependency_items_present?(run) do %>
-                <p class="mono">Blocked by</p>
-                <p :for={dependency <- dependency_entries(run, :blocked_by)} class="mono">
-                  <a class="issue-link" href={dependency_href(dependency)}>
-                    <%= dependency_label(dependency) %>
-                  </a>
-                </p>
-                <p class="mono">Blocks</p>
-                <p :for={dependency <- dependency_entries(run, :blocks)} class="mono">
-                  <a class="issue-link" href={dependency_href(dependency)}>
-                    <%= dependency_label(dependency) %>
-                  </a>
-                </p>
-              <% else %>
-                <p class="mono">No dependencies.</p>
+                <% _ -> %>
+                  <p class="empty-state">Context unavailable</p>
               <% end %>
             </div>
           </section>
 
-          <section class="section-card">
+          <section class="section-card run-section" data-section="event-detail">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Attention</h2>
-                <p class="section-copy">Read-only follow-up signals derived from the current run summary.</p>
+                <h2 class="section-title">Event Detail</h2>
+                <p class="section-copy">Single-event metadata first. Heavy surfaces stay lazy.</p>
               </div>
+              <button
+                type="button"
+                class="subtle-button section-toggle"
+                aria-expanded={section_expanded?(@section_state, :event_detail)}
+                phx-click="toggle_section"
+                phx-value-section="event_detail"
+              >
+                <%= section_toggle_label(@section_state, :event_detail) %>
+              </button>
             </div>
 
-            <div class="detail-stack">
-              <%= if attention_items(run) == [] do %>
-                <p class="mono">No attention items.</p>
-              <% else %>
-                <p :for={item <- attention_items(run)} class="mono"><%= item.message %></p>
+            <div class="detail-stack run-section-body" hidden={!section_expanded?(@section_state, :event_detail)}>
+              <%= case @detail_state.status do %>
+                <% :idle -> %>
+                  <p class="empty-state">Choose an event to inspect details.</p>
+                <% :loading -> %>
+                  <p class="empty-state">Loading event detail…</p>
+                <% :error -> %>
+                  <p class="empty-state"><%= detail_error_text(@detail_state.error) %></p>
+                <% :ready -> %>
+                  <div class="detail-stack">
+                    <p class="mono">event_id: <%= @detail_state.detail.event.event_id || "n/a" %></p>
+                    <p class="mono">timestamp: <%= @detail_state.detail.event.timestamp || "n/a" %></p>
+                    <p class="mono">source: <%= @detail_state.detail.event.source || "n/a" %></p>
+                    <p class="mono">event_type: <%= @detail_state.detail.event.event_type || "n/a" %></p>
+                    <p class="mono">event_group: <%= @detail_state.detail.event.event_group || "n/a" %></p>
+                    <p class="mono">summary: <%= @detail_state.detail.event.summary || "n/a" %></p>
+                    <p class="mono">session: <%= @detail_state.detail.context.session_id || "n/a" %></p>
+                    <p class="mono">thread: <%= @detail_state.detail.context.thread_id || "n/a" %></p>
+                    <p class="mono">turn: <%= @detail_state.detail.context.turn_id || "n/a" %></p>
+                  </div>
+
+                  <div class="detail-stack">
+                    <p class="mono">tool summary: <%= detail_summary_value(@detail_state.detail.summaries.tool_call) %></p>
+                    <p class="mono">payload summary: <%= detail_summary_value(@detail_state.detail.summaries.payload) %></p>
+                    <p class="mono">prompt summary: <%= detail_summary_value(@detail_state.detail.summaries.prompt) %></p>
+                    <p class="mono">shell summary: <%= detail_summary_value(@detail_state.detail.summaries.shell) %></p>
+                  </div>
+
+                  <div class="detail-stack">
+                    <button :for={surface <- @surface_names} type="button" class="issue-link" phx-click="load_event_surface" phx-value-surface={surface}>
+                      Load <%= surface %>
+                    </button>
+                  </div>
+
+                  <%= for surface <- @surface_names do %>
+                    <% preview = Map.fetch!(@detail_state.detail.surfaces, String.to_atom(surface)) %>
+                    <% surface_state = Map.fetch!(@detail_state.surfaces, surface) %>
+                    <article class="section-card">
+                      <div class="section-header">
+                        <div>
+                          <h3 class="section-title"><%= surface %></h3>
+                          <p class="section-copy">
+                            <%= surface_preview_text(preview) %>
+                          </p>
+                        </div>
+                      </div>
+
+                      <%= case surface_state.status do %>
+                        <% :idle -> %>
+                          <p class="empty-state">Surface body stays unloaded.</p>
+                        <% :loading -> %>
+                          <p class="empty-state">Loading <%= surface %>…</p>
+                        <% :error -> %>
+                          <p class="empty-state"><%= surface_error_text(surface_state.error) %></p>
+                        <% :ready -> %>
+                          <pre class="mono"><%= surface_state.content %></pre>
+                      <% end %>
+                    </article>
+                  <% end %>
               <% end %>
             </div>
           </section>
@@ -515,6 +617,19 @@ defmodule SymphonyElixirWeb.RunLive do
   end
 
   defp load_more_timeline(socket), do: socket
+
+  defp toggle_section(socket, section) when is_binary(section) do
+    key = normalize_section_key(section)
+
+    case Map.fetch(socket.assigns.section_state, key) do
+      {:ok, expanded?} -> assign(socket, :section_state, Map.put(socket.assigns.section_state, key, !expanded?))
+      :error -> socket
+    end
+  end
+
+  defp expand_section(socket, key) when is_atom(key) do
+    assign(socket, :section_state, Map.put(socket.assigns.section_state, key, true))
+  end
 
   defp start_event_detail_task(socket, event_id) when is_binary(event_id) do
     parent = self()
@@ -702,6 +817,16 @@ defmodule SymphonyElixirWeb.RunLive do
     end)
   end
 
+  defp initial_section_state do
+    %{
+      overview: true,
+      action_needed: true,
+      timeline: true,
+      context: false,
+      event_detail: false
+    }
+  end
+
   defp summary_loaded?(socket) do
     match?({:ok, _payload}, socket.assigns.run_state)
   end
@@ -741,17 +866,67 @@ defmodule SymphonyElixirWeb.RunLive do
 
   defp summary_fields, do: @summary_fields
 
+  defp timeline_filter_options do
+    [
+      {"all", "All"},
+      {"attention", "Attention"},
+      {"retry", "Retry"},
+      {"session", "Session"},
+      {"turn_completed", "Turn completed"},
+      {"run_result", "Run result"}
+    ]
+  end
+
+  defp normalize_timeline_filter(filter) when filter in ~w(all attention retry session turn_completed run_result),
+    do: filter
+
+  defp normalize_timeline_filter(_filter), do: "all"
+
+  defp filtered_timeline_items(items, filter) do
+    normalized_filter = normalize_timeline_filter(filter)
+    Enum.filter(List.wrap(items), &timeline_item_matches_filter?(&1, normalized_filter))
+  end
+
+  defp timeline_item_matches_filter?(_item, "all"), do: true
+
+  defp timeline_item_matches_filter?(item, "attention") do
+    "attention" in List.wrap(item.status_markers)
+  end
+
+  defp timeline_item_matches_filter?(item, "retry") do
+    item.source == "orchestrator" and item.event_type == "retry_scheduled"
+  end
+
+  defp timeline_item_matches_filter?(item, "session"), do: item.event_type == "session_started"
+  defp timeline_item_matches_filter?(item, "turn_completed"), do: item.event_type == "turn_completed"
+  defp timeline_item_matches_filter?(item, "run_result"), do: item.event_type == "run_result"
+
+  defp timeline_filter_button_class(active_filter, filter) do
+    base = "subtle-button filter-chip"
+    if active_filter == filter, do: base <> " filter-chip-active", else: base
+  end
+
+  defp normalize_section_key(section) do
+    section
+    |> String.replace("-", "_")
+    |> String.to_existing_atom()
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  defp section_expanded?(section_state, key) do
+    Map.get(section_state, key, false)
+  end
+
+  defp section_toggle_label(section_state, key) do
+    if section_expanded?(section_state, key), do: "Collapse", else: "Expand"
+  end
+
   defp dependency_entries(run, key) do
     run
     |> Map.get(key, [])
     |> List.wrap()
-    |> Enum.filter(fn dependency ->
-      is_map(dependency) and dependency_displayable?(dependency)
-    end)
-  end
-
-  defp dependency_items_present?(run) do
-    dependency_entries(run, :blocked_by) != [] or dependency_entries(run, :blocks) != []
+    |> Enum.filter(&dependency_displayable?/1)
   end
 
   defp dependency_label(dependency) when is_map(dependency) do
@@ -796,6 +971,17 @@ defmodule SymphonyElixirWeb.RunLive do
       is_map(item) and is_binary(Map.get(item, :message)) and Map.get(item, :message) != ""
     end)
   end
+
+  defp primary_attention_message(run) do
+    case attention_items(run) do
+      [%{message: message} | _rest] -> message
+      _ -> "No action needed."
+    end
+  end
+
+  defp attention_count(run), do: length(attention_items(run))
+  defp blocked_by_count(run), do: length(dependency_entries(run, :blocked_by))
+  defp blocks_count(run), do: length(dependency_entries(run, :blocks))
 
   defp detail_summary_value(nil), do: "n/a"
   defp detail_summary_value(""), do: "n/a"

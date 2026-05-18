@@ -3422,11 +3422,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "2026-05-14T02:00:00Z"
     assert html =~ "960s"
     assert html =~ "Timeline"
-    assert html =~ "Event detail"
-    assert html =~ "Run context"
+    assert html =~ "Event Detail"
+    assert html =~ "Context"
     assert html =~ "Context unavailable"
-    assert html =~ "Dependencies"
-    assert html =~ "Attention"
+    assert html =~ "Overview"
+    assert html =~ "Action Needed"
     assert html =~ "Timeline unavailable"
     refute html =~ "Raw event"
     refute html =~ "Prompt"
@@ -3497,6 +3497,489 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert summary_row_text(document, "turn_id") == "turn_id: 7"
     assert summary_row_text(document, "last_event_at") == "last_event_at: n/a"
     assert summary_row_text(document, "run_duration_seconds") == "run_duration_seconds: 960s"
+  end
+
+  @tag :run_live_product
+  test "run deep view renders product sections, fixed counts, and static default expansion" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-PRODUCT-1",
+                  title: "Product task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "waiting for a follow-up",
+                  health: "needs_attention",
+                  blocked_by: [
+                    %{
+                      issue_identifier: "MT-BLOCKER-1",
+                      title: "Blocker one",
+                      linear_state: "In Progress",
+                      url: "https://linear.app/example/issue/MT-BLOCKER-1"
+                    }
+                  ],
+                  blocks: [
+                    %{
+                      issue_identifier: "MT-BLOCKED-1",
+                      title: "Blocked child",
+                      linear_state: "Todo",
+                      url: "https://linear.app/example/issue/MT-BLOCKED-1"
+                    }
+                  ],
+                  attention_items: [
+                    %{kind: "needs_attention", message: "Primary follow-up required."},
+                    %{kind: "blocked", message: "Secondary queue signal."}
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-PRODUCT-1")
+    document = Floki.parse_document!(html)
+
+    assert find_section_by_title(document, "Overview")
+    assert find_section_by_title(document, "Action Needed")
+    assert find_section_by_title(document, "Timeline")
+    assert find_section_by_title(document, "Context")
+    assert find_section_by_title(document, "Event Detail")
+
+    assert metric_value(document, "Attention") == "2"
+    assert metric_value(document, "Blocked by") == "1"
+    assert metric_value(document, "Blocks") == "1"
+    assert action_needed_primary_text(document) == "Primary follow-up required."
+    assert section_expanded?(document, "Overview")
+    assert section_expanded?(document, "Action Needed")
+    assert section_expanded?(document, "Timeline")
+    refute section_expanded?(document, "Context")
+    refute section_expanded?(document, "Event Detail")
+    assert html =~ "Choose an event to inspect details."
+  end
+
+  @tag :run_live_product
+  test "run deep view keeps checking action-needed empty state and placeholder blockers visible" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-CHECKING-PRODUCT",
+                  title: "Checking task",
+                  linear_state: "Checking",
+                  current_phase: "checking_tracker_state",
+                  current_action: "bounded recheck queued",
+                  health: "normal",
+                  blocked_by: [
+                    %{
+                      title: "External blocker",
+                      linear_state: "Todo",
+                      url: "https://linear.app/example/issue/EXT-BLOCKER"
+                    }
+                  ],
+                  attention_items: []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-CHECKING-PRODUCT")
+    document = Floki.parse_document!(html)
+
+    assert action_needed_primary_text(document) == "No action needed."
+    refute Floki.text(find_section_by_title(document, "Action Needed")) =~ "bounded recheck queued"
+    assert Floki.text(find_section_by_title(document, "Action Needed")) =~ "External blocker"
+    assert Floki.text(find_section_by_title(document, "Action Needed")) =~ "Todo"
+  end
+
+  @tag :run_live_product
+  test "run deep view keeps event detail in entry state until an event is selected" do
+    manager_name = Module.concat(__MODULE__, RunLiveProductEntryManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-DETAIL-ENTRY/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-entry",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "entry event",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-DETAIL-ENTRY", "Entry detail")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-DETAIL-ENTRY")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "entry event" and rendered =~ "Choose an event to inspect details."
+    end)
+
+    refute render(view) =~ "event_id: evt-entry"
+  end
+
+  @tag :run_live_product
+  test "run deep view reapplies the active timeline filter after load more" do
+    manager_name = Module.concat(__MODULE__, RunLiveProductTimelineFilterManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-FILTER/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-attention-1",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "attention event 1",
+                 event_type: "turn_completed",
+                 status_markers: ["attention"]
+               },
+               %{
+                 event_id: "evt-session",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "session",
+                 summary: "session event",
+                 event_type: "session_started",
+                 status_markers: []
+               }
+             ],
+             next_cursor: "older"
+           }}
+
+        "GET", "/api/v1/runs/MT-FILTER/timeline?cursor=older" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-attention-2",
+                 timestamp: "2026-05-14T01:59:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "attention event 2",
+                 event_type: "run_result",
+                 status_markers: ["attention"]
+               },
+               %{
+                 event_id: "evt-run-result",
+                 timestamp: "2026-05-14T01:58:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "run result event",
+                 event_type: "run_result",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-FILTER", "Filter run")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-FILTER")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "attention event 1" and rendered =~ "session event" and
+        rendered =~ "All" and rendered =~ "Attention" and rendered =~ "Retry" and
+        rendered =~ "Session" and rendered =~ "Turn completed" and rendered =~ "Run result"
+    end)
+
+    render_click(element(view, "button[phx-click='set_timeline_filter'][phx-value-filter='attention']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "attention event 1" and
+        not String.contains?(rendered, "session event") and
+        not String.contains?(rendered, "run result event")
+    end)
+
+    render_click(view, "load_more_timeline")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "attention event 1" and rendered =~ "attention event 2" and
+        not String.contains?(rendered, "session event") and
+        not String.contains?(rendered, "run result event")
+    end)
+  end
+
+  @tag :run_live_product
+  test "run deep view ignores unknown section toggles and falls back invalid timeline filters to all" do
+    manager_name = Module.concat(__MODULE__, RunLiveProductInvalidFilterManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-INVALID-FILTER/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-invalid-filter",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "baseline event",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: run_live_project_registry("MT-INVALID-FILTER", "Invalid filter run")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-INVALID-FILTER")
+
+    assert_eventually(fn ->
+      render(view) =~ "baseline event"
+    end)
+
+    render_click(view, "toggle_section", %{"section" => "unknown_section"})
+    assert render(view) =~ "baseline event"
+
+    render_click(view, "set_timeline_filter", %{"filter" => "invalid-filter"})
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "baseline event" and rendered =~ "Turn completed"
+    end)
+  end
+
+  @tag :run_live_product
+  test "run deep view covers remaining timeline filters and dependency display fallbacks" do
+    manager_name = Module.concat(__MODULE__, RunLiveProductCoverageManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-COVERAGE/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-retry",
+                 timestamp: "2026-05-14T02:00:00Z",
+                 source: "orchestrator",
+                 event_group: "retry",
+                 summary: "retry event",
+                 event_type: "retry_scheduled",
+                 status_markers: []
+               },
+               %{
+                 event_id: "evt-session-filter",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "session",
+                 summary: "session filter event",
+                 event_type: "session_started",
+                 status_markers: []
+               },
+               %{
+                 event_id: "evt-turn-filter",
+                 timestamp: "2026-05-14T02:02:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "turn filter event",
+                 event_type: "turn_completed",
+                 status_markers: []
+               },
+               %{
+                 event_id: "evt-run-result-filter",
+                 timestamp: "2026-05-14T02:03:00Z",
+                 source: "codex",
+                 event_group: "result",
+                 summary: "run result filter event",
+                 event_type: "run_result",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-COVERAGE",
+                  title: "Coverage run",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "coverage sweep",
+                  health: "normal",
+                  blocked_by: [
+                    %{url: "https://linear.app/example/issue/URL-ONLY"},
+                    %{title: "Title only blocker", linear_state: "Todo"},
+                    "ignore me"
+                  ],
+                  blocks: [],
+                  attention_items: []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-COVERAGE")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "retry event" and rendered =~ "session filter event" and rendered =~ "turn filter event" and
+        rendered =~ "run result filter event"
+    end)
+
+    render_click(element(view, "button[phx-click='set_timeline_filter'][phx-value-filter='retry']"))
+    assert_eventually(fn -> render(view) =~ "retry event" end)
+    refute render(view) =~ "session filter event"
+
+    render_click(element(view, "button[phx-click='set_timeline_filter'][phx-value-filter='session']"))
+    assert_eventually(fn -> render(view) =~ "session filter event" end)
+    refute render(view) =~ "retry event"
+
+    render_click(element(view, "button[phx-click='set_timeline_filter'][phx-value-filter='turn_completed']"))
+    assert_eventually(fn -> render(view) =~ "turn filter event" end)
+    refute render(view) =~ "run result filter event"
+
+    render_click(element(view, "button[phx-click='set_timeline_filter'][phx-value-filter='run_result']"))
+    assert_eventually(fn -> render(view) =~ "run result filter event" end)
+    refute render(view) =~ "turn filter event"
+
+    document = Floki.parse_document!(render(view))
+    action_needed_text = Floki.text(find_section_by_title(document, "Action Needed"))
+
+    assert action_needed_text =~ "Related issue"
+    assert action_needed_text =~ "Title only blocker"
+    assert action_needed_text =~ "Todo"
+    refute action_needed_text =~ "ignore me"
+
+    links =
+      document
+      |> find_section_by_title("Action Needed")
+      |> Floki.find("a.issue-link")
+      |> Enum.map(&Floki.attribute(&1, "href"))
+      |> List.flatten()
+
+    assert "https://linear.app/example/issue/URL-ONLY" in links
+    assert "#" in links
+  end
+
+  test "run deep view render filters non-map dependencies before action-needed rendering" do
+    run = %{
+      issue_identifier: "MT-RENDER-COVERAGE",
+      title: "Render coverage run",
+      linear_state: "In Progress",
+      current_phase: "codex_waiting_next_event",
+      current_action: "render coverage",
+      health: "normal",
+      blocked_by: [
+        "ignore me",
+        %{title: "Visible blocker", linear_state: "Todo"}
+      ],
+      blocks: [],
+      attention_items: []
+    }
+
+    html =
+      rendered_to_string(
+        SymphonyElixirWeb.RunLive.render(%{
+          run_state: {:ok, %{project: %{project_id: "alpha", project_name: "Alpha"}, run: run}},
+          issue_identifier: "MT-RENDER-COVERAGE",
+          project_id: "alpha",
+          section_state: %{
+            overview: true,
+            action_needed: true,
+            timeline: true,
+            context: false,
+            event_detail: false
+          },
+          timeline_filter: "all",
+          timeline_state: %{status: :ready, items: [], next_cursor: nil, error: nil, load_more_error: nil},
+          context_state: %{status: :idle, context: nil, error: nil},
+          detail_state: %{status: :idle, event_id: nil, detail: nil, error: nil, surfaces: %{}}
+        })
+      )
+
+    assert html =~ "Visible blocker"
+    refute html =~ "ignore me"
   end
 
   test "control-plane timeline proxy degrades when project manager is unavailable" do
@@ -3610,15 +4093,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
     document = Floki.parse_document!(html)
 
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Blocked by"))
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "MT-BLOCKER-1"))
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Blocks"))
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "MT-BLOCKED-1"))
-    assert project_section_texts(document, "Attention") == ["Run requires manual follow-up."]
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "Blocked by"))
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "MT-BLOCKER-1"))
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "Blocks"))
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "MT-BLOCKED-1"))
+    assert project_section_texts(document, "Action Needed") |> Enum.member?("Run requires manual follow-up.")
 
     links =
       document
-      |> find_section_by_title("Dependencies")
+      |> find_section_by_title("Action Needed")
       |> Floki.find("a.issue-link")
       |> Enum.map(&Floki.attribute(&1, "href"))
       |> List.flatten()
@@ -3670,12 +4153,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-2")
     document = Floki.parse_document!(html)
 
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "External blocker"))
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Todo"))
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "External blocker"))
+    assert project_section_texts(document, "Action Needed") |> Enum.any?(&String.contains?(&1, "Todo"))
 
     links =
       document
-      |> find_section_by_title("Dependencies")
+      |> find_section_by_title("Action Needed")
       |> Floki.find("a.issue-link")
       |> Enum.map(&Floki.attribute(&1, "href"))
       |> List.flatten()
@@ -3715,7 +4198,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-CHECKING-1")
     document = Floki.parse_document!(html)
-    assert project_section_texts(document, "Attention") == ["No attention items."]
+    assert project_section_texts(document, "Action Needed") |> Enum.member?("No attention items.")
   end
 
   test "run deep view renders empty dependency and attention states" do
@@ -3753,8 +4236,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-CLEAR-1")
     document = Floki.parse_document!(html)
 
-    assert project_section_texts(document, "Dependencies") |> Enum.any?(&(&1 == "No dependencies."))
-    assert project_section_texts(document, "Attention") == ["No attention items."]
+    assert project_section_texts(document, "Action Needed") |> Enum.count(&(&1 == "No dependencies.")) == 2
+    assert project_section_texts(document, "Action Needed") |> Enum.member?("No attention items.")
   end
 
   test "run deep view ignores timeline load messages when summary is unavailable" do
@@ -3870,13 +4353,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-CONTEXT")
+    render_click(element(view, "button[phx-click='toggle_section'][phx-value-section='context']"))
 
     assert_eventually(fn ->
       rendered = render(view)
 
       rendered =~ "Workflow context" and
         rendered =~ "workflow timeline with context" and
-        rendered =~ "Run context" and
+        rendered =~ "Context" and
         rendered =~ "session: workflow-session" and
         rendered =~ "turn_count: 6" and
         rendered =~ "ready"
@@ -4071,7 +4555,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-NO-SUMMARY-CONTEXT")
     assert html =~ "Run unavailable"
-    refute html =~ "Run context"
+    refute html =~ "Context"
   end
 
   test "run deep view ignores context load messages when summary is unavailable" do
@@ -4098,7 +4582,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       rendered = render(view)
 
       rendered =~ "Run unavailable" and rendered =~ "MT-NO-SUMMARY-CONTEXT-MESSAGE" and
-        not String.contains?(rendered, "Run context")
+        not String.contains?(rendered, "Context")
     end)
   end
 
@@ -4378,7 +4862,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_eventually(fn ->
       rendered = render(view)
-      rendered =~ "broken detail" and rendered =~ "Entry point only. Event body stays unloaded by default."
+      rendered =~ "broken detail" and rendered =~ "Choose an event to inspect details."
     end)
 
     render_click(view, "load_event_surface", %{"surface" => "prompt"})
@@ -4447,7 +4931,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute_receive {:stub_request, "detail", _}
 
     send(view.pid, {:event_detail_loaded, 403, {:error, :event_detail_unavailable}})
-    assert render(view) =~ "Entry point only. Event body stays unloaded by default."
+    assert render(view) =~ "Choose an event to inspect details."
 
     render_click(element(view, "button[phx-value-event_id='evt-stale']"))
     assert_receive {:stub_request, "detail", "evt-stale"}
@@ -6175,7 +6659,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp summary_row_text(document, label) do
     document
-    |> find_section_by_title("Summary")
+    |> find_section_by_title("Overview")
     |> then(fn
       nil -> []
       section -> Floki.find(section, "p.mono")
@@ -6192,7 +6676,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> find_section_by_title(title)
     |> then(fn
       nil -> []
-      section -> Floki.find(section, "p.mono")
+      section -> Floki.find(section, "p.mono, p.metric-label")
     end)
     |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
     |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
@@ -6208,6 +6692,59 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
     |> Floki.text()
     |> String.trim()
+  end
+
+  defp metric_value(document, label) do
+    document
+    |> Floki.find("article.metric-card")
+    |> Enum.find(fn metric ->
+      metric
+      |> Floki.find("p.metric-label")
+      |> Floki.text()
+      |> String.trim() == label
+    end)
+    |> then(fn
+      nil ->
+        nil
+
+      metric ->
+        metric
+        |> Floki.find("p.metric-value")
+        |> Floki.text()
+        |> String.trim()
+    end)
+  end
+
+  defp action_needed_primary_text(document) do
+    document
+    |> find_section_by_title("Action Needed")
+    |> then(fn
+      nil -> []
+      section -> Floki.find(section, "[data-role='action-needed-primary']")
+    end)
+    |> Floki.text()
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp section_expanded?(document, title) do
+    section_name =
+      case title do
+        "Overview" -> "overview"
+        "Action Needed" -> "action-needed"
+        "Timeline" -> "timeline"
+        "Context" -> "context"
+        "Event Detail" -> "event-detail"
+        _ -> nil
+      end
+
+    document
+    |> Floki.find(~s(section[data-section="#{section_name}"] .run-section-body))
+    |> List.first()
+    |> case do
+      {_tag, attributes, _children} -> not Map.has_key?(Enum.into(attributes, %{}), "hidden")
+      _ -> false
+    end
   end
 
   defp run_live_project_registry(issue_identifier, title) do
