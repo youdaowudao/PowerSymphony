@@ -75,7 +75,15 @@ defmodule SymphonyElixir.M3Precheck do
 
     analysis =
       Enum.map(todo_issues, fn issue ->
-        analyze_issue(issue, todo_issues, current_project_slug, current_project_id, terminal_states, m3_enabled)
+        analyze_issue(
+          issue,
+          todo_issues,
+          current_project_slug,
+          current_project_id,
+          terminal_states,
+          m3_enabled,
+          current_work
+        )
       end)
 
     eligible =
@@ -138,7 +146,15 @@ defmodule SymphonyElixir.M3Precheck do
     }
   end
 
-  defp analyze_issue(%Issue{} = issue, todo_issues, current_project_slug, current_project_id, terminal_states, m3_enabled) do
+  defp analyze_issue(
+         %Issue{} = issue,
+         todo_issues,
+         current_project_slug,
+         current_project_id,
+         terminal_states,
+         m3_enabled,
+         current_work
+       ) do
     structural_errors =
       issue_structural_errors(issue, todo_issues, current_project_slug, current_project_id)
 
@@ -150,6 +166,7 @@ defmodule SymphonyElixir.M3Precheck do
     reasons =
       []
       |> maybe_add_reason(!m3_enabled, "m3 disabled for project")
+      |> maybe_add_reason(issue_in_current_work?(issue, current_work), "already present in current work: #{issue.identifier || issue.id}")
       |> maybe_add_reason(structural_errors != [], "structural errors: " <> Enum.map_join(structural_errors, ", ", &Atom.to_string(&1.type)))
       |> maybe_add_reason(
         blocker_analysis.non_terminal != [],
@@ -323,6 +340,24 @@ defmodule SymphonyElixir.M3Precheck do
   end
 
   defp blocked_but_in_progress?(_issue, _terminal_states), do: false
+
+  defp issue_in_current_work?(%Issue{} = issue, %{entries: entries}) when is_list(entries) do
+    Enum.any?(entries, fn entry ->
+      current_work_matches_issue?(entry, issue)
+    end)
+  end
+
+  defp issue_in_current_work?(_issue, _current_work), do: false
+
+  defp current_work_matches_issue?(entry, %Issue{} = issue) when is_map(entry) do
+    entry_issue_id = Map.get(entry, :issue_id)
+    entry_issue_identifier = Map.get(entry, :issue_identifier)
+
+    (is_binary(issue.id) and is_binary(entry_issue_id) and entry_issue_id == issue.id) or
+      (is_binary(issue.identifier) and is_binary(entry_issue_identifier) and entry_issue_identifier == issue.identifier)
+  end
+
+  defp current_work_matches_issue?(_entry, _issue), do: false
 
   defp sort_todo_issues(issues) do
     Enum.sort_by(issues, &issue_sort_key/1)

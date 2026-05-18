@@ -151,6 +151,28 @@ defmodule SymphonyElixir.RunStateStoreTest do
     end)
   end
 
+  test "timeline_for_running_entries keeps items when running entry lacks binary run_instance_id" do
+    with_logs_root("timeline-run-instance-fallback", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-TL-FALLBACK"), logs_root: logs_root)
+
+      RunTrace.record(trace, :orchestrator, %{
+        event: :retry_scheduled,
+        summary: "kept item",
+        run_instance_id: "run-current",
+        timestamp: ~U[2026-05-16 03:05:00Z]
+      })
+
+      assert {:ok, %{items: [item], next_cursor: nil}} =
+               RunStateStore.timeline_for_running_entries(
+                 [timeline_entry("MT-TL-FALLBACK", trace, %{run_instance_id: nil})],
+                 "MT-TL-FALLBACK"
+               )
+
+      assert item.summary == "kept item"
+      assert item.event_type == "retry_scheduled"
+    end)
+  end
+
   test "timeline_for_running_entries returns run_not_found when the current running entry has no run trace" do
     assert {:error, :run_not_found} =
              RunStateStore.timeline_for_running_entries(
@@ -387,6 +409,58 @@ defmodule SymphonyElixir.RunStateStoreTest do
                RunStateStore.event_detail_for_running_entries([entry], "MT-EVT-STATE-3", "evt-current")
 
       assert detail.event.event_id == "evt-current"
+    end)
+  end
+
+  test "summary and timeline stay aligned with the current run generation after retry" do
+    with_logs_root("timeline-generation-filter", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-TL-GEN"), logs_root: logs_root)
+
+      File.write!(
+        trace.trace_file,
+        Enum.map_join(
+          [
+            %{
+              "event_id" => "evt-current-start",
+              "run_instance_id" => "run-current",
+              "source" => "orchestrator",
+              "event_type" => "dispatch_started",
+              "summary" => "dispatch current",
+              "timestamp" => "2026-05-17T01:00:00Z"
+            },
+            %{
+              "event_id" => "evt-old-late",
+              "run_instance_id" => "run-old",
+              "source" => "codex",
+              "event_type" => "turn_completed",
+              "summary" => "old late completion",
+              "timestamp" => "2026-05-17T01:01:00Z"
+            },
+            %{
+              "event_id" => "evt-current-retry",
+              "run_instance_id" => "run-current",
+              "source" => "orchestrator",
+              "event_type" => "retry_scheduled",
+              "summary" => "retry current",
+              "timestamp" => "2026-05-17T01:02:00Z"
+            }
+          ],
+          "\n",
+          &Jason.encode!/1
+        ) <> "\n"
+      )
+
+      entry = timeline_entry("MT-TL-GEN", trace, %{run_instance_id: "run-current"})
+
+      summary = RunStateStore.summary_for_running_entry(entry)
+      assert summary.current_phase == "retry_scheduled"
+      assert summary.current_action == "retry scheduled"
+
+      assert {:ok, %{items: items, next_cursor: nil}} =
+               RunStateStore.timeline_for_running_entries([entry], "MT-TL-GEN")
+
+      assert Enum.map(items, & &1.event_id) == ["evt-current-start", "evt-current-retry"]
+      assert Enum.map(items, & &1.summary) == ["dispatch current", "retry current"]
     end)
   end
 

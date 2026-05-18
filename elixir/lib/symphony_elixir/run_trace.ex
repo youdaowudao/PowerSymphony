@@ -306,6 +306,7 @@ defmodule SymphonyElixir.RunTrace do
       summary: Map.get(event, "summary") || fallback_timeline_summary(event),
       event_type: Map.get(event, "event_type"),
       event_id: Map.get(event, "event_id"),
+      run_instance_id: Map.get(event, "run_instance_id"),
       status_markers: timeline_status_markers(event)
     }
   end
