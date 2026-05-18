@@ -436,6 +436,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
             "issue" => %{
               "id" => "issue-2",
               "identifier" => "MT-2",
+              "title" => "Dependency issue",
+              "url" => "https://example.org/issues/MT-2",
               "state" => %{"name" => "In Progress"}
             }
           },
@@ -456,7 +458,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
 
     assert issue.blocked_by == [
-             %{id: "issue-2", identifier: "MT-2", state: "In Progress", project_id: nil, project_slug: nil}
+             %{
+               id: "issue-2",
+               identifier: "MT-2",
+               title: "Dependency issue",
+               url: "https://example.org/issues/MT-2",
+               state: "In Progress",
+               project_id: nil,
+               project_slug: nil
+             }
            ]
 
     assert issue.labels == ["backend"]
@@ -536,6 +546,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert_receive {:fetch_issue_states_page, query, %{ids: ^first_batch_ids, first: 50, relationFirst: 50}}
     assert query =~ "SymphonyLinearIssuesById"
+    assert query =~ "inverseRelations(first: $relationFirst)"
+    assert query =~ "issue {"
+    assert query =~ "identifier"
+    assert query =~ "title"
+    assert query =~ "url"
 
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
@@ -996,6 +1011,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, binding} = Workspace.read_resource_binding(workspace)
       assert binding["state"] == "closing"
       assert binding["closing_reason"] == "terminal_cleanup_pending"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "cleanup_issue_workspace is the lifecycle cleanup entrypoint while remove is only physical delete" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-cleanup-entrypoint-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %{id: "issue-cleanup-entrypoint", identifier: "MT-CLEANUP-ENTRY", run_instance_id: "run-cleanup-entrypoint"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace(issue.identifier,
+                 mode: :terminal_cleanup,
+                 run_instance_id: issue.run_instance_id,
+                 closing_reason: "terminal_cleanup_pending"
+               )
+
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "terminal_cleanup_pending"
+
+      assert {:ok, _removed_paths} = Workspace.remove(workspace)
+      refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end

@@ -90,6 +90,7 @@ owner 真相源继续由 orchestrator 控制面承担：
 
 - resource binding 是 workspace 资源层的主事实
 - invalidation record 是辅助语义与诊断证据
+- binding 还承载资源层局部 fencing policy，但不是 owner 真相源
 
 binding 至少持续回答四件事：
 
@@ -183,7 +184,7 @@ startup sweep 保守跳过不等于“永远不管”。
 - 后续再次判定仍使用同一 contract，而不是旁路
 - 若长期无法达成 delete evidence，需要有告警/人工介入口径，而不是逼出新的盲删逻辑
 
-本轮不要求一次性做完整的后台回收系统，但必须把“跳过之后怎么继续”写清楚。
+本轮不要求一次性做完整的后台回收系统，但必须把“跳过之后怎么继续”写清楚。也就是说，当前只承诺“保守停住并留痕”，不宣称自动治理闭环已经完成。
 
 #### A4. local 与 remote worker 必须同构
 
@@ -214,9 +215,16 @@ remote SSH 路径如果只是“有差不多的行为”而不是“同一合同
 
 这个 `turn finalized` 可以是内部派生语义，不要求底层协议先显式提供新字段。
 
+当前最小实现边界再收紧一层：
+
+- 先把 raw codex `turn_completed` 从观察层口径改成 `pending finalization`
+- 先让 resume / continuation gate 不再把它当 finalized success
+- 不要求本轮先把完整 settle 状态机一次性落完
+- `agent_runner run_result(status=completed)` 仍保留为已收敛成功路径，不跟 raw codex provisional 口径混用
+
 #### B1.1 `turn finalized` 的最小状态机
 
-本轮先把内部判定规则固定为：
+目标语义仍然是：
 
 - `completed` 后进入 `settling`
 - `settling` 期间若晚到：
@@ -227,11 +235,11 @@ remote SSH 路径如果只是“有差不多的行为”而不是“同一合同
 - `settling` 期间若没有再收到冲突 terminal，且达到 settle 结束条件，则归并为 `finalized success`
 - transport/stream 中断本身不自动等于 `conflict terminal`；需要单独走错误分类优先级
 
-这里先固定语义，不在文档里预设具体毫秒数实现。
+这里先固定目标语义，不在文档里预设具体毫秒数实现。但当前代码收口允许只先落 `resume-barrier based finalization gate`，把完整 settle 状态机保留为后续增量实现。
 
 #### B2. `AppServer` 负责收敛终态冲突，不负责 owner 裁决
 
-`AppServer` 的职责边界是：
+目标职责边界是：
 
 - 继续负责 turn 流式协议消费
 - 在看到 `turn/completed` 后，不立即把 turn 当作 finalized 成功返回
@@ -253,7 +261,7 @@ remote SSH 路径如果只是“有差不多的行为”而不是“同一合同
 
 #### B2.1 settle 裁决规则
 
-本轮需要提前固定四个验收语义：
+完整 settle 方案最终仍需要固定四个验收语义：
 
 1. 什么事件组合算 `finalized success`
 2. 什么事件组合算 `conflict terminal`

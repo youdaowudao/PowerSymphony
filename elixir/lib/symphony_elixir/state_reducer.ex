@@ -27,6 +27,7 @@ defmodule SymphonyElixir.StateReducer do
   @fallback_phase "unknown"
   @fallback_action "unknown event"
   @fallback_health "unknown"
+  @provisional_turn_completed_phase "turn_completed_pending_finalization"
 
   @spec initial_summary(map()) :: summary()
   def initial_summary(attrs \\ %{}) when is_map(attrs) do
@@ -80,8 +81,9 @@ defmodule SymphonyElixir.StateReducer do
     end
   end
 
-  @spec health_for_summary(summary(), keyword()) :: String.t()
+  @spec health_for_summary(map(), keyword()) :: String.t()
   def health_for_summary(summary, opts \\ []) when is_map(summary) and is_list(opts) do
+    summary = Map.merge(initial_summary(), summary)
     stall_timeout_ms = positive_integer(Keyword.get(opts, :stall_timeout_ms), 300_000)
     now = Keyword.get(opts, :now, DateTime.utc_now()) |> datetime_value() || DateTime.utc_now()
     checking_interval_ms = positive_integer(Keyword.get(opts, :checking_interval_ms), 600_000)
@@ -158,7 +160,7 @@ defmodule SymphonyElixir.StateReducer do
   defp phase_for_event("agent_runner", "run_result", payload), do: run_result_phase(payload)
   defp phase_for_event("orchestrator", "retry_scheduled", payload), do: retry_phase(payload)
   defp phase_for_event("codex", "session_started", _payload), do: "starting_codex_thread"
-  defp phase_for_event("codex", "turn_completed", _payload), do: "turn_completed"
+  defp phase_for_event("codex", "turn_completed", _payload), do: @provisional_turn_completed_phase
   defp phase_for_event("codex", "tool_call_completed", payload), do: tool_phase(payload, "codex_waiting_tool")
   defp phase_for_event("codex", "tool_call_failed", payload), do: tool_phase(payload, "codex_waiting_tool")
   defp phase_for_event("codex", "unsupported_tool_call", payload), do: tool_phase(payload, "codex_waiting_tool")
@@ -250,7 +252,7 @@ defmodule SymphonyElixir.StateReducer do
 
   defp notification_phase_for_method("item/tool/call", payload), do: tool_phase(payload, "codex_waiting_tool")
   defp notification_phase_for_method("item/tool/requestUserInput", _payload), do: "codex_waiting_user_input_policy"
-  defp notification_phase_for_method("turn/completed", _payload), do: "turn_completed"
+  defp notification_phase_for_method("turn/completed", _payload), do: @provisional_turn_completed_phase
   defp notification_phase_for_method("turn/started", _payload), do: "starting_codex_turn"
   defp notification_phase_for_method(_method, _payload), do: @fallback_phase
 

@@ -33,11 +33,13 @@ defmodule SymphonyElixirWeb.RunLive do
       |> assign(:surface_names, @surface_names)
       |> assign(:selected_event_id, nil)
       |> assign(:timeline_state, initial_timeline_state())
+      |> assign(:context_state, initial_context_state())
       |> assign(:detail_state, initial_detail_state())
       |> load_run()
 
     if connected?(socket) and summary_loaded?(socket) do
       send(self(), :load_timeline)
+      send(self(), :load_context)
     end
 
     {:ok, socket}
@@ -46,6 +48,10 @@ defmodule SymphonyElixirWeb.RunLive do
   @impl true
   def handle_info(:load_timeline, socket) do
     {:noreply, load_recent_timeline(socket)}
+  end
+
+  def handle_info(:load_context, socket) do
+    {:noreply, load_context_summary(socket)}
   end
 
   def handle_info({:load_event_detail, event_id}, socket) do
@@ -272,31 +278,135 @@ defmodule SymphonyElixirWeb.RunLive do
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Context surfaces</h2>
-                <p class="section-copy">Thread, turn, conversation, tools, and sub-agent context placeholders.</p>
+                <h2 class="section-title">Run context</h2>
+                <p class="section-copy">Independent, lightweight context summary for the current run generation.</p>
+              </div>
+            </div>
+
+            <%= case @context_state.status do %>
+              <% :loading -> %>
+                <p class="empty-state">Loading context…</p>
+              <% :error -> %>
+                <p class="empty-state"><%= context_error_text(@context_state.error) %></p>
+              <% :ready -> %>
+                <div class="detail-stack">
+                  <h3 class="section-title">Thread &amp; Turn</h3>
+                  <p class="mono">session: <%= @context_state.context.anchor.session_id || "n/a" %></p>
+                  <p class="mono">thread: <%= @context_state.context.anchor.thread_id || "n/a" %></p>
+                  <p class="mono">turn: <%= @context_state.context.anchor.turn_id || "n/a" %></p>
+                  <p class="mono">turn_count: <%= summary_value(@context_state.context.anchor, :turn_count) %></p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Recent interaction signals</h3>
+                  <div :for={item <- @context_state.context.conversation.items} class="detail-stack">
+                    <p class="mono"><%= item.label %>: <%= item.text %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <p :if={@context_state.context.conversation.items == []} class="mono">none observed</p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Continuation &amp; Retry</h3>
+                  <p class="mono"><%= @context_state.context.continuation.label || "none observed" %></p>
+                  <p class="mono">event_id: <%= @context_state.context.continuation.event_id || "n/a" %></p>
+                  <button
+                    :if={is_binary(@context_state.context.continuation.event_id)}
+                    type="button"
+                    class="issue-link"
+                    phx-click="show_event_detail"
+                    phx-value-event_id={@context_state.context.continuation.event_id}
+                  >
+                    Open detail: <%= @context_state.context.continuation.event_id %>
+                  </button>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Tools &amp; Shell</h3>
+                  <div :for={item <- @context_state.context.tools.items} class="detail-stack">
+                    <p class="mono"><%= item.summary %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <div :for={item <- @context_state.context.shell.items} class="detail-stack">
+                    <p class="mono"><%= item.text %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <p :if={@context_state.context.tools.items == [] and @context_state.context.shell.items == []} class="mono">none observed</p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Sub-agent</h3>
+                  <p :for={item <- @context_state.context.subagents.items} class="mono"><%= item.text %></p>
+                  <p :if={@context_state.context.subagents.items == []} class="mono"><%= humanize_context_status(@context_state.context.subagents.status) %></p>
+                </div>
+              <% _ -> %>
+                <p class="empty-state">Context unavailable</p>
+            <% end %>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Dependencies</h2>
+                <p class="section-copy">Read-only dependency relationships from the current run summary.</p>
               </div>
             </div>
 
             <div class="detail-stack">
-              <p class="mono">Thread</p>
-              <p class="mono">Turn</p>
-              <p class="mono">Conversation</p>
-              <p class="mono">Tools</p>
-              <p class="mono">Sub-agent context</p>
+              <%= if dependency_items_present?(run) do %>
+                <p class="mono">Blocked by</p>
+                <p :for={dependency <- dependency_entries(run, :blocked_by)} class="mono">
+                  <a class="issue-link" href={dependency_href(dependency)}>
+                    <%= dependency_label(dependency) %>
+                  </a>
+                </p>
+                <p class="mono">Blocks</p>
+                <p :for={dependency <- dependency_entries(run, :blocks)} class="mono">
+                  <a class="issue-link" href={dependency_href(dependency)}>
+                    <%= dependency_label(dependency) %>
+                  </a>
+                </p>
+              <% else %>
+                <p class="mono">No dependencies.</p>
+              <% end %>
             </div>
           </section>
 
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Dependencies & attention</h2>
-                <p class="section-copy">Reserved surface for downstream dependency and attention panels.</p>
+                <h2 class="section-title">Attention</h2>
+                <p class="section-copy">Read-only follow-up signals derived from the current run summary.</p>
               </div>
             </div>
 
             <div class="detail-stack">
-              <p class="mono">Dependencies</p>
-              <p class="mono">Attention</p>
+              <%= if attention_items(run) == [] do %>
+                <p class="mono">No attention items.</p>
+              <% else %>
+                <p :for={item <- attention_items(run)} class="mono"><%= item.message %></p>
+              <% end %>
             </div>
           </section>
         <% {:error, :project_not_found} -> %>
@@ -352,6 +462,24 @@ defmodule SymphonyElixirWeb.RunLive do
               error: reason,
               load_more_error: nil
             })
+        end
+
+      other_socket ->
+        other_socket
+    end
+  end
+
+  defp load_context_summary(socket) do
+    socket
+    |> assign(:context_state, %{initial_context_state() | status: :loading})
+    |> case do
+      %{assigns: %{run_state: {:ok, _payload}}} = ready_socket ->
+        case fetch_context_summary(ready_socket.assigns.project_id, ready_socket.assigns.issue_identifier) do
+          {:ok, context} ->
+            assign(ready_socket, :context_state, %{status: :ready, context: context, error: nil})
+
+          {:error, reason} ->
+            assign(ready_socket, :context_state, %{status: :error, context: nil, error: reason})
         end
 
       other_socket ->
@@ -524,6 +652,22 @@ defmodule SymphonyElixirWeb.RunLive do
     end
   end
 
+  defp fetch_context_summary(project_id, issue_identifier) do
+    if Endpoint.config(:runtime_mode) == :control_plane do
+      ObservabilityApiController.project_run_context_payload(project_id, issue_identifier)
+    else
+      orchestrator = Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
+      timeout = Endpoint.config(:snapshot_timeout_ms) || 15_000
+
+      case Orchestrator.run_context_summary(orchestrator, issue_identifier, timeout: timeout) do
+        {:ok, payload} -> {:ok, Presenter.run_context_payload(payload)}
+        {:error, reason} -> {:error, reason}
+        :timeout -> {:error, :context_unavailable}
+        :unavailable -> {:error, :context_unavailable}
+      end
+    end
+  end
+
   defp initial_timeline_state do
     %{
       status: :idle,
@@ -531,6 +675,14 @@ defmodule SymphonyElixirWeb.RunLive do
       next_cursor: nil,
       error: nil,
       load_more_error: nil
+    }
+  end
+
+  defp initial_context_state do
+    %{
+      status: :idle,
+      context: nil,
+      error: nil
     }
   end
 
@@ -562,6 +714,7 @@ defmodule SymphonyElixirWeb.RunLive do
   end
 
   defp timeline_error_text(_reason), do: "Timeline unavailable"
+  defp context_error_text(_reason), do: "Context unavailable"
   defp detail_error_text(_reason), do: "Event detail unavailable"
   defp surface_error_text(:surface_not_available), do: "Surface unavailable for this event"
   defp surface_error_text(:invalid_surface), do: "Surface unavailable for this event"
@@ -587,6 +740,62 @@ defmodule SymphonyElixirWeb.RunLive do
   defp maybe_add_label(labels, false, _label), do: labels
 
   defp summary_fields, do: @summary_fields
+
+  defp dependency_entries(run, key) do
+    run
+    |> Map.get(key, [])
+    |> List.wrap()
+    |> Enum.filter(fn dependency ->
+      is_map(dependency) and dependency_displayable?(dependency)
+    end)
+  end
+
+  defp dependency_items_present?(run) do
+    dependency_entries(run, :blocked_by) != [] or dependency_entries(run, :blocks) != []
+  end
+
+  defp dependency_label(dependency) when is_map(dependency) do
+    case [
+           Map.get(dependency, :issue_identifier),
+           Map.get(dependency, :title),
+           Map.get(dependency, :linear_state)
+         ]
+         |> Enum.filter(&(is_binary(&1) and &1 != ""))
+         |> Enum.join(" · ") do
+      "" -> "Related issue"
+      label -> label
+    end
+  end
+
+  defp dependency_href(dependency) when is_map(dependency) do
+    case Map.get(dependency, :url) do
+      url when is_binary(url) and url != "" -> url
+      _ -> "#"
+    end
+  end
+
+  defp dependency_displayable?(dependency) when is_map(dependency) do
+    Enum.any?([
+      present_string?(Map.get(dependency, :issue_identifier)),
+      present_string?(Map.get(dependency, :title)),
+      present_string?(Map.get(dependency, :linear_state)),
+      present_string?(Map.get(dependency, :url))
+    ])
+  end
+
+  defp dependency_displayable?(_dependency), do: false
+
+  defp present_string?(value) when is_binary(value), do: value != ""
+  defp present_string?(_value), do: false
+
+  defp attention_items(run) do
+    run
+    |> Map.get(:attention_items, [])
+    |> List.wrap()
+    |> Enum.filter(fn item ->
+      is_map(item) and is_binary(Map.get(item, :message)) and Map.get(item, :message) != ""
+    end)
+  end
 
   defp detail_summary_value(nil), do: "n/a"
   defp detail_summary_value(""), do: "n/a"
@@ -622,4 +831,9 @@ defmodule SymphonyElixirWeb.RunLive do
       true -> base
     end
   end
+
+  defp humanize_context_status("none_observed"), do: "none observed"
+  defp humanize_context_status("unavailable"), do: "unavailable"
+  defp humanize_context_status("ready"), do: "ready"
+  defp humanize_context_status(_status), do: "unavailable"
 end

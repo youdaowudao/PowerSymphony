@@ -56,12 +56,18 @@
 ## 多 Agent 协作规则
 
 - 是否要求 reviewer
-- 是否采用固定协作模式，例如默认 `1+2`、例外 `1+1`
+- 顶级主轴是否采用“阶段角色制 + 角色独立性”，以及标准角色集合是什么
+- 哪些任务必须具备哪些角色
+- 哪些角色之间必须保持独立
+- 是否定义 `观察层合同风险` 作为显式流程开关，以及命中条件是什么
+- 命中 `观察层合同风险` 时，是否要求 `contract checker`、`contract matrix`、`baseline lock`
 - reviewer 固定输出是否包含 `Change Review` 与 `Push Readiness`
 - 什么时候必须停止当前线程并请求帮助
 - `Push Readiness` 是否只回答“能否 push / 最小缺口”
 - 文档阶段是否有 `spec freeze` 与一次 reviewer 触发的定点补查
 - 活状态板与流程指标是否只允许写在 issue body / `## Codex Workpad`
+- `blocker ledger`、`baseline lock` 等活字段是否只允许写在 Workpad
+- closeout 是否要求同时定义主顺序、失效条件与最小回退规则
 
 ## 填充完成检查
 
@@ -72,3 +78,4 @@
 - 新开发者知道什么时候能更新 tracker 吗
 - 新开发者知道哪些路径最危险吗
 - 新开发者知道什么时候必须停下来求助吗
+- 新开发者知道最终汇报应该按角色到位性、独立性、返工、争议、验证和放行性来写吗

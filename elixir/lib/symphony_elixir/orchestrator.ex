@@ -2246,6 +2246,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec run_context_summary(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:error, :run_not_found | :duplicate_run | :context_unavailable}
+          | :timeout
+          | :unavailable
+  def run_context_summary(server, issue_identifier, opts \\ [])
+      when is_binary(issue_identifier) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:run_context_summary, issue_identifier}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2264,11 +2285,16 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           identifier: metadata.identifier,
           title: metadata.issue.title,
+          issue_url: metadata.issue.url,
           state: metadata.issue.state,
           linear_state: summary.linear_state,
           current_phase: summary.current_phase,
           current_action: summary.current_action,
           health: summary.health,
+          run_status: summary.run_status,
+          approval_pending: summary.approval_pending,
+          tool_failure: summary.tool_failure,
+          blocked_by: metadata.issue.blocked_by || [],
           thread_id: summary.thread_id,
           turn_id: summary.turn_id,
           worker_host: Map.get(metadata, :worker_host),
@@ -2365,6 +2391,13 @@ defmodule SymphonyElixir.Orchestrator do
         surface
       )
 
+    {:reply, reply, state}
+  end
+
+  def handle_call({:run_context_summary, issue_identifier}, _from, state)
+      when is_binary(issue_identifier) do
+    running_entries = Map.values(state.running)
+    reply = RunStateStore.context_summary_for_running_entries(running_entries, issue_identifier)
     {:reply, reply, state}
   end
 
