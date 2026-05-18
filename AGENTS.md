@@ -55,6 +55,18 @@
   - 存在 agent / tool / item 的计数、分类或归因口径
   - 同一语义被多个消费面读取
 - `观察层合同风险` 的判定时点必须早于 `frozen artifact` 冻结；默认策略为“疑似即命中”。若存在争议，必须在 `frozen artifact` 中显式写明“已命中”或“未命中”，不得保留口头状态。
+- 在记录 `proceed` 前，必须先完成一次 `任务类型识别 + source-of-truth chain`。命中以下任一可识别特征时，视为必须列链路：
+  - 跨边界字段 / 状态 / 归因的 `source` 与 `consumer` 位于不同层
+  - 存在 `query` / `projection` / `passthrough` / `summary` / `presenter` / `adapter` 等中间投影
+  - 同一语义被多个 `consumer surface` 读取
+  - 既有状态 / 字段 / 枚举 / 归因被复用到新的 `consumer`
+- `source-of-truth chain` 最小字段固定为：
+  - `关键字段 / 语义`
+  - `实际 source`
+  - `中间 projection`
+  - `最终 consumer`
+- `source-of-truth chain` 默认记录在当前 run 已要求维护的载体中；只有当前 run 本来就需要 `frozen artifact` 时，才在该 artifact 中引用或概述；它本身不得单独触发新的 repo 文档门禁。
+- 若在当前边界下列不出可工作的 `source-of-truth chain`，则不得记录 `proceed`，也不得进入实现。
 - 这里的“流程合同变更”至少包括：`AGENTS.md`、`elixir/WORKFLOW.md`，以及任何会改变 agent 行为、验证顺序、角色职责或收口口径的治理条文。
 - 主线程必须在 `proceed` 前冻结 `frozen artifact`，并把它交付给实现、检查和复核角色；`proceed` 只记录该冻结件已被接受并进入 `spec freeze`。`frozen artifact` 是单一冻结包，至少包含：
   - 目标 / 需求快照
@@ -62,6 +74,7 @@
   - 固定约束
   - 风险判定结论
   - 若命中 `观察层合同风险`，附窄版 `contract matrix`
+- 上述 `frozen artifact` 仅在当前 run 本来就需要进入该冻结路径时，才落到 repo 文档集；`source-of-truth chain` 本身不得把原本可留在既有载体里的小修小改升级为 repo change doc。
 - `frozen artifact` 的承载位置固定为 `docs/changes/<change-id>/README.md` 及其点名的固定章节；freeze 后不得静默扩写。若 checker 或 reviewer 指出冻结件缺口，必须由主线程显式重冻；若重冻改变用户可见行为、合同边界或风险判定，必须回到文档裁决。
 - `contract matrix` 只能作为 `frozen artifact` 的组成部分存在，不能另起平行文档。最小字段固定为：
   - `field / view`
@@ -87,6 +100,9 @@
   - `heavy validation`
   - `final zero-context reviewer`
   - `push / PR / merge`
+- 仅当任务同时命中多层 `consumer` / contract 风险，且已触发 `任务类型识别 + source-of-truth chain` 时，`closeout` 内必须补一次有界 `closure check`。
+- `closure check` 只检查四项是否对齐：`source`、`projection`、`consumer`、`verification`。
+- `closure check` 不是新 reviewer 角色，不是新的 `Next Push Gate`，不是新的 review state，也不替代 `contract checker`、`final zero-context reviewer` 或 full gate。
 - `baseline lock` 锁定的对象固定为：当前 `PR base`、当前 `HEAD`、当前 `exact cumulative diff`、当前 `validation summary` 对应的 diff 口径。记录位置固定在 Linear issue body 的 `## Codex Workpad > Baseline Lock`，最小字段固定为：
   - `base ref`
   - `head sha`
@@ -104,7 +120,7 @@
   - `final zero-context reviewer` 发现非合同实现问题时，按最小回退原则回 `implementer`
   - `final zero-context reviewer` 发现 baseline 口径失效或验证证据已不对应当前 diff 时，回 `baseline lock`
 - 中途风险门只在命中高风险条件时触发，不是所有任务默认重门禁；其作用是前移高风险验证，不新增审批层。
-- Linear issue body 的 `## Codex Workpad` 是唯一活真相源；活状态板、流程指标、下一 gate、`baseline lock`、`blocker ledger` 与返工计数只留在这里，repo 文档不复制实时值。
+- Linear issue body 的 `## Codex Workpad` 是唯一活真相源；活状态板、下一 gate、`baseline lock`、`blocker ledger` 与当前 review / blocker 结论只留在这里，repo 文档不复制实时值。流程指标、返工计数等派生审计数据仅在用户明确要求时才维护。
 - `blocker ledger` 不默认常开；命中以下任一条件时必须在 `## Codex Workpad` 内开启并持续维护：
   - 风险判定争议
   - `contract matrix` 覆盖争议
@@ -124,10 +140,14 @@
 - “小修小改”必须同时满足以下条件：修改文件不超过 2 个；不新增或删除公共接口、配置项、数据结构、工作流状态或跨模块依赖；不涉及并发、安全、权限、重试、持久化、启动流程等高风险路径；可以用定向测试或局部验证直接证明正确性。
 - 这里的“零上下文复核”是指：`final zero-context reviewer` 只接收需求、计划、实现后的累计 diff、测试结果、风险说明、冻结件和必要文件，不继承作者线程的会话历史，不以前文推理过程作为判断依据。该 gate 不能用文档阶段的分析角色替代。
 - 第一次 checker / reviewer 给出 `revise` 时，开启一轮返工；围绕同一 `blocker id` 的连续修复与复审，计为同一轮；原发起角色明确接受、或该 blocker 被新 blocker 取代时，该轮结束。
+- 首次 `Contract Review = revise` 或 `Change Review = revise` 后，默认锁定给出该结论的原 reviewer 角色继续复审同一 `blocker id`；`contract checker` 与 `final zero-context reviewer` 的 ownership 必须分别记录，不得共用一个模糊 owner。
+- 更换 reviewer 只允许在以下例外下发生：原 reviewer 不可用、审查范围或 baseline 已实质变化、需要不同专长、原 reviewer 明确放弃 ownership、或已触发二次维修停线。
+- 更换 reviewer 时，必须随同该 `blocker id + reviewer 角色类型` 提供最小 handoff：上一轮 findings、已修项、待核项、当前 diff baseline；该 ownership 只绑定该 `blocker id` 下的对应 reviewer 角色，不自动扩展到整个 closeout。
 - 第一次复核未通过时，只允许实现线程返工，原 checker / reviewer 负责复审。
-- 若第一次返工后仍未通过，允许再进行一次返工与复审，并在最终汇报中明确标记为“二次维修”。
+- 若第一次返工后仍未通过，允许再进行一次返工与复审。
 - 若二次维修后仍未通过，必须立即停止当前实现线程与 reviewer 线程；主线程不得亲自下场补代码救火；如需继续，重新开启一组新的实现线程与 reviewer 线程，或直接停工向用户申请帮助。
-- 代码任务完成后，必须向用户汇报：本次实际使用了哪些角色、必需角色是否到位、`implementer` / `contract checker` / `final zero-context reviewer` 是否保持独立、是否命中 `观察层合同风险`、是否启用 `contract checker`、是否开启 `blocker ledger`、共几轮返工、是否发生 `baseline 争议`、最终 validation 结果、最终可放行结论。
+- 代码任务完成后，默认只向用户汇报原始索引与当前结论：`main session id`、角色线程 / 会话索引、`frozen artifact`、`branch` / `commit` / `PR`、`validation evidence`、review 结论、`baseline lock` / `blocker` 位置、当前状态 / 最终可放行结论。
+- 除非用户明确要求，不默认汇报 agent 数、返工轮次、二次维修统计、耗时估算等派生审计数据。
 - 如果上层会话规则与本仓库多 Agent 协作规则冲突，以本仓库“阶段角色制 + 角色独立性”规则为准；不得以上层限制为由跳过实现、合同检查或最终复核角色。
 - 如果复核循环无法收敛、需求不清、上下文不足或判断当前工作无法稳妥完成，必须停止继续推进，向用户反馈现状并申请帮助，不得硬做。
 
