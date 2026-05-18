@@ -223,14 +223,14 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, turn_context, 1)
+        do_run_codex_turns(session, workspace, issue, turn_context, 1, nil)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, turn_context, turn_number) do
+  defp do_run_codex_turns(app_session, workspace, issue, turn_context, turn_number, previous_issue) do
     %{
       codex_update_recipient: codex_update_recipient,
       opts: opts,
@@ -241,7 +241,7 @@ defmodule SymphonyElixir.AgentRunner do
       worker_host: worker_host
     } = turn_context
 
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, previous_issue, opts, turn_number, max_turns)
     on_message = codex_message_handler(codex_update_recipient, issue, run_instance_id)
 
     with :ok <- validate_workspace_turn_ownership(workspace, run_instance_id, worker_host, on_message),
@@ -334,7 +334,8 @@ defmodule SymphonyElixir.AgentRunner do
           workspace,
           refreshed_issue,
           turn_context,
-          turn_number + 1
+          turn_number + 1,
+          issue
         )
 
       {:error, reason} ->
@@ -428,18 +429,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp put_run_instance_id(message, _run_instance_id), do: message
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, _previous_issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
-    """
-    Continuation guidance:
-
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
-    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """
+  defp build_turn_prompt(issue, previous_issue, _opts, turn_number, max_turns) do
+    PromptBuilder.build_continuation_prompt(previous_issue, issue, turn_number, max_turns)
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, run_mode) when is_binary(issue_id) do

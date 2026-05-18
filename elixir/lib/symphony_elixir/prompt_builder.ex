@@ -4,6 +4,7 @@ defmodule SymphonyElixir.PromptBuilder do
   """
 
   alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.Linear.IssueDiff
 
   @render_opts [strict_variables: true, strict_filters: true]
   @checking_recheck_prompt """
@@ -41,6 +42,27 @@ defmodule SymphonyElixir.PromptBuilder do
       )
       |> IO.iodata_to_binary()
     end
+  end
+
+  @spec build_continuation_prompt(
+          SymphonyElixir.Linear.Issue.t(),
+          SymphonyElixir.Linear.Issue.t(),
+          pos_integer(),
+          pos_integer()
+        ) :: String.t()
+  def build_continuation_prompt(previous_issue, current_issue, turn_number, max_turns) do
+    """
+    Continuation guidance:
+
+    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
+    - Resume from the current workspace and workpad state instead of restarting from scratch.
+    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+
+    Issue snapshot diff since last turn:
+    #{IssueDiff.summary(previous_issue, current_issue)}
+    """
   end
 
   defp build_checking_recheck_prompt(issue) do
