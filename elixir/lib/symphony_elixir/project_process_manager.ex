@@ -496,7 +496,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
         [
           "mkdir -p #{shell_escape(runtime_dir)}",
           "touch #{shell_escape(stdout_path)} #{shell_escape(stderr_path)}",
-          "exec #{command} >> #{shell_escape(stdout_path)} 2>> #{shell_escape(stderr_path)}"
+          "exec bash -lc #{shell_escape(command)} >> #{shell_escape(stdout_path)} 2>> #{shell_escape(stderr_path)}"
         ]
         |> Enum.join(" && ")
 
@@ -506,7 +506,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
           [
             :binary,
             :exit_status,
-            args: [~c"-lc", String.to_charlist(wrapped_command)]
+            args: [~c"-c", String.to_charlist(wrapped_command)]
           ]
         )
 
