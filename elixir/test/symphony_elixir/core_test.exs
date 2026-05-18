@@ -2123,6 +2123,77 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
+  test "prompt builder continuation prompt marks snapshot diff as partial observation" do
+    previous_issue = %Issue{
+      id: "issue-248",
+      identifier: "MT-248",
+      title: "Same title",
+      description: "Same description",
+      state: "In Progress",
+      updated_at: DateTime.from_naive!(~N[2026-05-18 09:00:00], "Etc/UTC")
+    }
+
+    current_issue = %Issue{
+      previous_issue
+      | updated_at: DateTime.from_naive!(~N[2026-05-18 10:00:00], "Etc/UTC")
+    }
+
+    prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
+
+    assert prompt =~ "Issue snapshot diff since last turn:"
+    assert prompt =~ "Result: issue_snapshot_unchanged"
+    assert prompt =~ "Partial observation only"
+    assert prompt =~ "Not covered in v1: comments, threads, description/body revision history"
+    assert prompt =~ "updated_at changed"
+    assert prompt =~ "not treated as a semantic field change"
+    assert prompt =~ "v1-unobserved changes"
+  end
+
+  test "prompt builder continuation prompt summarizes long description changes without leaking full text" do
+    previous_description = String.duplicate("old-body-", 40)
+    current_description = String.duplicate("new-body-", 40)
+
+    previous_issue = %Issue{
+      id: "issue-249",
+      identifier: "MT-249",
+      title: "Long body diff",
+      description: previous_description,
+      state: "In Progress"
+    }
+
+    current_issue = %Issue{previous_issue | description: current_description}
+
+    prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
+
+    assert prompt =~ "Result: issue_snapshot_changed"
+    assert prompt =~ "description"
+    assert prompt =~ "text summary"
+    refute prompt =~ previous_description
+    refute prompt =~ current_description
+  end
+
+  test "prompt builder continuation prompt surfaces unavailable snapshot comparison explicitly" do
+    previous_issue = %Issue{
+      id: "issue-250",
+      identifier: "MT-250",
+      blocked_by: [%{id: "b-1", state: "Todo"}],
+      state: "In Progress"
+    }
+
+    current_issue = %Issue{
+      id: "issue-250",
+      identifier: "MT-250",
+      blocked_by: [%{state: "Todo"}],
+      state: "In Progress"
+    }
+
+    prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
+
+    assert prompt =~ "Result: issue_snapshot_unavailable"
+    assert prompt =~ "not a normal changed/unchanged conclusion"
+    assert prompt =~ "blocked_by was not safely compared"
+  end
+
   test "agent runner keeps workspace after successful codex run" do
     test_root =
       Path.join(
@@ -2427,11 +2498,11 @@ defmodule SymphonyElixir.CoreTest do
         Process.put(:agent_turn_fetch_count, attempt)
         send(parent, {:issue_state_fetch, attempt})
 
-        state =
+        {state, title} =
           if attempt == 1 do
-            "In Progress"
+            {"In Progress", "Continue until done (updated)"}
           else
-            "Done"
+            {"Done", "Continue until done (updated)"}
           end
 
         {:ok,
@@ -2439,9 +2510,11 @@ defmodule SymphonyElixir.CoreTest do
            %Issue{
              id: "issue-continue",
              identifier: "MT-247",
-             title: "Continue until done",
+             title: title,
              description: "Still active after first turn",
-             state: state
+             state: state,
+             url: "https://example.org/issues/MT-247",
+             labels: []
            }
          ]}
       end
@@ -2481,6 +2554,11 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "Issue snapshot diff since last turn:"
+      assert Enum.at(turn_texts, 1) =~ "Result: issue_snapshot_changed"
+      assert Enum.at(turn_texts, 1) =~ "Partial observation only"
+      assert Enum.at(turn_texts, 1) =~ "Not covered in v1: comments, threads, description/body revision history"
+      assert Enum.at(turn_texts, 1) =~ ~s|- title: "Continue until done" -> "Continue until done (updated)"|
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

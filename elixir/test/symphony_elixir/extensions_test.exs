@@ -1300,41 +1300,45 @@ defmodule SymphonyElixir.ExtensionsTest do
         payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
         [project] = payload["projects"]
 
-        assert_project_summary_shape(project,
-          project_id: "alpha",
-          project_name: "Alpha",
-          enabled: true,
-          validation_result: "valid",
-          validation_errors: [],
-          worker_status: "running",
-          worker_port: port,
-          last_seen_at: nil,
-          last_health_check_at: nil,
-          last_error: nil,
-          run_summaries: [
-            %{
-              "issue_identifier" => "MT-CP-RUN-1",
-              "title" => "Fake worker summary",
-              "linear_state" => "In Progress",
-              "issue_url" => nil,
-              "current_phase" => "codex_reasoning",
-              "current_action" => "reasoning summary streaming",
-              "health" => "normal",
-              "session_id" => "thread-cp-turn-7",
-              "thread_id" => "thread-cp",
-              "turn_id" => "turn-7",
-              "turn_count" => 7,
-              "last_event_at" => "2026-05-12T00:08:00Z",
-              "run_duration_seconds" => 480,
-              "last_error" => nil,
-              "blocked_by" => [],
-              "blocks" => [],
-              "attention_items" => []
-            }
-          ]
-        )
+        if project["run_summaries"] == [] do
+          false
+        else
+          assert_project_summary_shape(project,
+            project_id: "alpha",
+            project_name: "Alpha",
+            enabled: true,
+            validation_result: "valid",
+            validation_errors: [],
+            worker_status: "running",
+            worker_port: port,
+            last_seen_at: nil,
+            last_health_check_at: nil,
+            last_error: nil,
+            run_summaries: [
+              %{
+                "issue_identifier" => "MT-CP-RUN-1",
+                "title" => "Fake worker summary",
+                "linear_state" => "In Progress",
+                "issue_url" => nil,
+                "current_phase" => "codex_reasoning",
+                "current_action" => "reasoning summary streaming",
+                "health" => "normal",
+                "session_id" => "thread-cp-turn-7",
+                "thread_id" => "thread-cp",
+                "turn_id" => "turn-7",
+                "turn_count" => 7,
+                "last_event_at" => "2026-05-12T00:08:00Z",
+                "run_duration_seconds" => 480,
+                "last_error" => nil,
+                "blocked_by" => [],
+                "blocks" => [],
+                "attention_items" => []
+              }
+            ]
+          )
 
-        true
+          true
+        end
       end,
       160
     )
