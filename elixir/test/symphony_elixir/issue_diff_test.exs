@@ -291,4 +291,47 @@ defmodule SymphonyElixir.IssueDiffTest do
     assert summary.status == :issue_snapshot_changed
     assert ~s(- created_at: "2026-05-18T08:00:00Z" -> "2026-05-19T09:00:00Z") in summary.observed_changes
   end
+
+  test "summary renders changed snapshots with observed change lines and no notes block" do
+    previous = %Issue{
+      id: "issue-12",
+      identifier: "MT-12",
+      title: "Old title",
+      state: "Todo"
+    }
+
+    current = %Issue{
+      previous
+      | title: "New title",
+        state: "In Progress"
+    }
+
+    summary = IssueDiff.summary(previous, current)
+
+    assert summary =~ "Result: issue_snapshot_changed"
+    assert summary =~ "Observation scope:"
+    assert summary =~ "Observed field changes:"
+    assert summary =~ ~s(- title: "Old title" -> "New title")
+    assert summary =~ ~s(- state: "Todo" -> "In Progress")
+    refute summary =~ "Notes:"
+    refute summary =~ "- none"
+  end
+
+  test "summary renders unchanged snapshots with none marker and notes block" do
+    issue = %Issue{
+      id: "issue-13",
+      identifier: "MT-13",
+      title: "Stable title",
+      description: "Stable description",
+      state: "In Progress"
+    }
+
+    summary = IssueDiff.summary(issue, issue)
+
+    assert summary =~ "Result: issue_snapshot_unchanged"
+    assert summary =~ "Observed field changes:"
+    assert summary =~ "- none"
+    assert summary =~ "Notes:"
+    assert summary =~ "No observed %SymphonyElixir.Linear.Issue{} snapshot field changes."
+  end
 end

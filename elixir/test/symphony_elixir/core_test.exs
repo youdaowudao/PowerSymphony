@@ -2140,13 +2140,13 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
 
-    assert prompt =~ "Issue snapshot diff since last turn:"
-    assert prompt =~ "Result: issue_snapshot_unchanged"
-    assert prompt =~ "Partial observation only"
-    assert prompt =~ "Not covered in v1: comments, threads, description/body revision history"
+    assert prompt =~ "Issue refresh since last turn:"
+    assert prompt =~ "Observed issue snapshot fields were unchanged."
+    assert prompt =~ "Only compares the current %SymphonyElixir.Linear.Issue{} snapshot fields."
+    assert prompt =~ "Does not cover comments, threads, or description/body revision history."
     assert prompt =~ "updated_at changed"
     assert prompt =~ "not treated as a semantic field change"
-    assert prompt =~ "v1-unobserved changes"
+    assert prompt =~ "This does not rule out comment/thread/body changes outside the observed snapshot fields."
   end
 
   test "prompt builder continuation prompt summarizes long description changes without leaking full text" do
@@ -2165,8 +2165,8 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
 
-    assert prompt =~ "Result: issue_snapshot_changed"
-    assert prompt =~ "description"
+    assert prompt =~ "Observed issue snapshot fields changed:"
+    assert prompt =~ "- description"
     assert prompt =~ "text summary"
     refute prompt =~ previous_description
     refute prompt =~ current_description
@@ -2189,9 +2189,28 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
 
-    assert prompt =~ "Result: issue_snapshot_unavailable"
-    assert prompt =~ "not a normal changed/unchanged conclusion"
+    assert prompt =~ "Issue refresh is unavailable for this turn."
+    assert prompt =~ "This is not a normal changed/unchanged conclusion."
     assert prompt =~ "blocked_by was not safely compared"
+  end
+
+  test "agent runner continuation prompt compresses unchanged issue refresh while preserving scope limits" do
+    previous_issue = %Issue{
+      id: "issue-251",
+      identifier: "MT-251",
+      title: "Same title",
+      description: "Same description",
+      state: "In Progress"
+    }
+
+    current_issue = %Issue{previous_issue | updated_at: DateTime.from_naive!(~N[2026-05-18 11:00:00], "Etc/UTC")}
+
+    prompt = PromptBuilder.build_continuation_prompt(previous_issue, current_issue, 2, 3)
+
+    refute prompt =~ "Observed field changes:"
+    refute prompt =~ "Result: issue_snapshot_unchanged"
+    assert prompt =~ "Observed issue snapshot fields were unchanged."
+    assert prompt =~ "Does not cover comments, threads, or description/body revision history."
   end
 
   test "agent runner keeps workspace after successful codex run" do
@@ -2554,10 +2573,10 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
-      assert Enum.at(turn_texts, 1) =~ "Issue snapshot diff since last turn:"
-      assert Enum.at(turn_texts, 1) =~ "Result: issue_snapshot_changed"
-      assert Enum.at(turn_texts, 1) =~ "Partial observation only"
-      assert Enum.at(turn_texts, 1) =~ "Not covered in v1: comments, threads, description/body revision history"
+      assert Enum.at(turn_texts, 1) =~ "Issue refresh since last turn:"
+      assert Enum.at(turn_texts, 1) =~ "Observed issue snapshot fields changed:"
+      assert Enum.at(turn_texts, 1) =~ "Only compares the current %SymphonyElixir.Linear.Issue{} snapshot fields."
+      assert Enum.at(turn_texts, 1) =~ "Does not cover comments, threads, or description/body revision history."
       assert Enum.at(turn_texts, 1) =~ ~s|- title: "Continue until done" -> "Continue until done (updated)"|
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")

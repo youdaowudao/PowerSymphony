@@ -330,6 +330,7 @@ defmodule SymphonyElixir.RunTrace do
       anchor: build_context_anchor(events, anchor),
       conversation: build_conversation_summary(events),
       continuation: build_continuation_summary(events),
+      issue_refresh: build_issue_refresh_summary(events),
       tools: %{items: build_tool_items(events)},
       shell: %{items: build_shell_items(events)},
       subagents: build_subagent_summary(events)
@@ -482,6 +483,32 @@ defmodule SymphonyElixir.RunTrace do
     end
   end
 
+  defp build_issue_refresh_summary(events) do
+    case Enum.find(Enum.reverse(events), &(Map.get(&1, "event_type") == "issue_refresh")) do
+      %{} = event ->
+        payload = event_payload(event)
+
+        %{
+          status: map_path(payload, ["status"]) || "none_observed",
+          status_text: map_path(payload, ["status_text"]) || "none observed",
+          observed_changes: list_of_strings(map_path(payload, ["observed_changes"])),
+          updated_at_changed?: map_path(payload, ["updated_at_changed?"]) == true,
+          notes: list_of_strings(map_path(payload, ["notes"])),
+          event_id: Map.get(event, "event_id")
+        }
+
+      nil ->
+        %{
+          status: "none_observed",
+          status_text: "none observed",
+          observed_changes: [],
+          updated_at_changed?: false,
+          notes: [],
+          event_id: nil
+        }
+    end
+  end
+
   defp build_tool_items(events) do
     events
     |> Enum.flat_map(&tool_item/1)
@@ -623,6 +650,12 @@ defmodule SymphonyElixir.RunTrace do
   defp payload_from_bundle(%{payload: payload}), do: payload
   defp payload_from_bundle(%{} = payload), do: payload
   defp payload_from_bundle(_payload), do: %{}
+
+  defp list_of_strings(values) when is_list(values) do
+    Enum.filter(values, &is_binary/1)
+  end
+
+  defp list_of_strings(_values), do: []
 
   defp dynamic_tool_name(payload) do
     map_path(payload, ["params", "tool"]) ||

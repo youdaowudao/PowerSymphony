@@ -395,6 +395,14 @@ defmodule SymphonyElixirWeb.RunLive do
                   </div>
 
                   <div class="detail-stack">
+                    <h3 class="section-title">Issue Refresh</h3>
+                    <p class="mono"><%= @context_state.context.issue_refresh.status_text || "none observed" %></p>
+                    <p :for={change <- @context_state.context.issue_refresh.observed_changes} class="mono"><%= change %></p>
+                    <p :for={note <- @context_state.context.issue_refresh.notes} class="mono"><%= note %></p>
+                    <p :if={@context_state.context.issue_refresh.observed_changes == [] and @context_state.context.issue_refresh.notes == []} class="mono">none observed</p>
+                  </div>
+
+                  <div class="detail-stack">
                     <h3 class="section-title">Tools &amp; Shell</h3>
                     <div :for={item <- @context_state.context.tools.items} class="detail-stack">
                       <p class="mono"><%= item.summary %></p>
