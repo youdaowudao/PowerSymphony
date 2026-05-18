@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, RunTrace, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, Linear.IssueDiff, PromptBuilder, RunTrace, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
   @type run_result_status :: :completed | :continuation_required | :failed
@@ -321,6 +321,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     case validate_workspace_turn_ownership(workspace, run_instance_id, worker_host, on_message) do
       :ok ->
+        record_issue_refresh(run_instance_id, issue, refreshed_issue)
+
         send_run_result(codex_update_recipient, issue, run_instance_id, %{
           status: :continuation_required,
           reason: :issue_still_active,
@@ -357,6 +359,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     case validate_workspace_turn_ownership(workspace, run_instance_id, worker_host, on_message) do
       :ok ->
+        record_issue_refresh(run_instance_id, issue, refreshed_issue)
+
         send_run_result(codex_update_recipient, issue, run_instance_id, %{
           status: :continuation_required,
           reason: :max_turns_reached,
@@ -433,6 +437,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, previous_issue, _opts, turn_number, max_turns) do
     PromptBuilder.build_continuation_prompt(previous_issue, issue, turn_number, max_turns)
+  end
+
+  defp record_issue_refresh(run_instance_id, %Issue{} = previous_issue, %Issue{} = current_issue) do
+    issue_refresh =
+      previous_issue
+      |> IssueDiff.describe(current_issue)
+      |> Map.update!(:status, &Atom.to_string/1)
+
+    RunTrace.record(:agent_runner, %{
+      event: :issue_refresh,
+      summary: "agent_runner:issue_refresh",
+      run_instance_id: run_instance_id,
+      payload: issue_refresh
+    })
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, run_mode) when is_binary(issue_id) do

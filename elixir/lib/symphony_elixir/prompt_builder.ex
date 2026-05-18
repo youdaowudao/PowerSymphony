@@ -51,6 +51,8 @@ defmodule SymphonyElixir.PromptBuilder do
           pos_integer()
         ) :: String.t()
   def build_continuation_prompt(previous_issue, current_issue, turn_number, max_turns) do
+    issue_refresh = IssueDiff.describe(previous_issue, current_issue)
+
     """
     Continuation guidance:
 
@@ -60,8 +62,8 @@ defmodule SymphonyElixir.PromptBuilder do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
 
-    Issue snapshot diff since last turn:
-    #{IssueDiff.summary(previous_issue, current_issue)}
+    Issue refresh since last turn:
+    #{render_issue_refresh(issue_refresh)}
     """
   end
 
@@ -75,6 +77,41 @@ defmodule SymphonyElixir.PromptBuilder do
     Current status: #{issue.state}
     URL: #{issue.url}
     """
+  end
+
+  defp render_issue_refresh(%{status: :issue_snapshot_changed} = issue_refresh) do
+    [
+      "Observed issue snapshot fields changed:",
+      "Scope limits:",
+      "- Only compares the current %SymphonyElixir.Linear.Issue{} snapshot fields.",
+      "- Does not cover comments, threads, or description/body revision history.",
+      issue_refresh.observed_changes
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
+  end
+
+  defp render_issue_refresh(%{status: :issue_snapshot_unchanged} = issue_refresh) do
+    [
+      "Observed issue snapshot fields were unchanged.",
+      "Scope limits:",
+      "- Only compares the current %SymphonyElixir.Linear.Issue{} snapshot fields.",
+      "- Does not cover comments, threads, or description/body revision history.",
+      Enum.map(issue_refresh.notes, &"- #{&1}"),
+      "- This does not rule out comment/thread/body changes outside the observed snapshot fields."
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
+  end
+
+  defp render_issue_refresh(%{status: :issue_snapshot_unavailable} = issue_refresh) do
+    [
+      "Issue refresh is unavailable for this turn.",
+      "This is not a normal changed/unchanged conclusion.",
+      Enum.map(issue_refresh.notes, &"- #{&1}")
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)

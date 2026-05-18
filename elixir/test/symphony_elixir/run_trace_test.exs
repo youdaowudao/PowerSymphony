@@ -594,6 +594,83 @@ defmodule SymphonyElixir.RunTraceTest do
       assert empty_summary.tools.items == []
       assert empty_summary.shell.items == []
       assert empty_summary.subagents == %{items: [], status: "unavailable"}
+
+      assert empty_summary.issue_refresh == %{
+               status: "none_observed",
+               status_text: "none observed",
+               observed_changes: [],
+               updated_at_changed?: false,
+               notes: [],
+               event_id: nil
+             }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "context summary includes structured issue refresh payload from the current generation only" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-trace-context-issue-refresh-#{System.unique_integer([:positive])}")
+    logs_root = set_logs_root!(Path.join(test_root, "logs"))
+
+    try do
+      issue = %Issue{id: "issue-context-issue-refresh", identifier: "MT-CONTEXT-ISSUE-REFRESH", title: "Issue refresh", state: "In Progress"}
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+
+      RunTrace.record(trace, :agent_runner, %{
+        event: :issue_refresh,
+        run_instance_id: "run-older",
+        timestamp: ~U[2026-05-17 05:00:00Z],
+        payload: %{
+          "status" => "issue_snapshot_changed",
+          "status_text" => "issue_snapshot_changed",
+          "observed_changes" => ["- title: \"Old\" -> \"Older\""],
+          "updated_at_changed?" => false,
+          "notes" => []
+        }
+      })
+
+      RunTrace.record(trace, :agent_runner, %{
+        event: :issue_refresh,
+        run_instance_id: "run-current",
+        timestamp: ~U[2026-05-17 05:00:30Z],
+        payload: %{
+          "status" => "issue_snapshot_changed",
+          "status_text" => "issue_snapshot_changed",
+          "observed_changes" => ["- title: \"Current\" -> \"Stale current\""],
+          "updated_at_changed?" => false,
+          "notes" => ["stale event should not win"]
+        }
+      })
+
+      RunTrace.record(trace, :agent_runner, %{
+        event: :issue_refresh,
+        run_instance_id: "run-current",
+        timestamp: ~U[2026-05-17 05:01:00Z],
+        payload: %{
+          "status" => "issue_snapshot_unavailable",
+          "status_text" => "issue_snapshot_unavailable",
+          "observed_changes" => [],
+          "updated_at_changed?" => true,
+          "notes" => [
+            "Observed snapshot comparison degraded: at least one field was not safely compared, so this is not a normal changed/unchanged conclusion."
+          ]
+        }
+      })
+
+      assert {:ok, summary} = RunTrace.context_summary(trace, run_instance_id: "run-current")
+
+      assert summary.issue_refresh == %{
+               status: "issue_snapshot_unavailable",
+               status_text: "issue_snapshot_unavailable",
+               observed_changes: [],
+               updated_at_changed?: true,
+               notes: [
+                 "Observed snapshot comparison degraded: at least one field was not safely compared, so this is not a normal changed/unchanged conclusion."
+               ],
+               event_id: summary.issue_refresh.event_id
+             }
+
+      assert is_binary(summary.issue_refresh.event_id)
     after
       File.rm_rf(test_root)
     end

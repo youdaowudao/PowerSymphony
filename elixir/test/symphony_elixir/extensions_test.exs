@@ -2305,6 +2305,13 @@ defmodule SymphonyElixir.ExtensionsTest do
              anchor: %{session_id: "thread-1-turn-2", thread_id: "thread-1", turn_id: "turn-2", turn_count: 2},
              conversation: %{items: [%{event_id: "evt-ctx-1", kind: "reasoning_summary", label: "reasoning", text: "compare options"}], truncated: false},
              continuation: %{status: "continuation_required", label: "continuation required", event_id: "evt-ctx-2"},
+             issue_refresh: %{
+               status: "issue_snapshot_changed",
+               status_text: "issue_snapshot_changed",
+               observed_changes: ["- title: \"Before\" -> \"After\""],
+               updated_at_changed?: false,
+               notes: []
+             },
              tools: %{items: [%{event_id: "evt-ctx-3", tool: "shell", status: "completed", summary: "dynamic tool call completed (shell)"}]},
              shell: %{items: [%{event_id: "evt-ctx-4", kind: "exec_command", text: "git status --short"}]},
              subagents: %{items: [], status: "none_observed"}
@@ -2348,6 +2355,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert payload.anchor.turn_id == "turn-2"
     assert hd(payload.conversation.items).text == "compare options"
     assert payload.continuation.status == "continuation_required"
+    assert payload.issue_refresh.status == "issue_snapshot_changed"
+    assert payload.issue_refresh.status_text == "issue_snapshot_changed"
+    assert payload.issue_refresh.observed_changes == ["- title: \"Before\" -> \"After\""]
+    assert payload.issue_refresh.updated_at_changed? == false
+    assert payload.issue_refresh.notes == []
 
     assert {:error, :duplicate_run} =
              SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
@@ -4344,6 +4356,18 @@ defmodule SymphonyElixir.ExtensionsTest do
                anchor: %{session_id: "workflow-session", thread_id: "workflow-thread", turn_id: "workflow-turn", turn_count: 6},
                conversation: %{items: [], truncated: false},
                continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               issue_refresh: %{
+                 status: "issue_snapshot_unchanged",
+                 status_text: "issue_snapshot_unchanged",
+                 observed_changes: [],
+                 updated_at_changed?: true,
+                 event_id: "evt-issue-refresh-1",
+                 notes: [
+                   "No observed %SymphonyElixir.Linear.Issue{} snapshot field changes.",
+                   "updated_at changed from ~U[2026-05-16 01:00:00Z] to ~U[2026-05-16 01:05:00Z], but that alone is not treated as a semantic field change.",
+                   "This may still reflect v1-unobserved changes such as comments, threads, or body revisions."
+                 ]
+               },
                tools: %{items: []},
                shell: %{items: []},
                subagents: %{items: [], status: "ready"}
@@ -4365,6 +4389,9 @@ defmodule SymphonyElixir.ExtensionsTest do
       rendered =~ "Workflow context" and
         rendered =~ "workflow timeline with context" and
         rendered =~ "Context" and
+        rendered =~ "Issue Refresh" and
+        rendered =~ "issue_snapshot_unchanged" and
+        rendered =~ "updated_at changed from ~U[2026-05-16 01:00:00Z] to ~U[2026-05-16 01:05:00Z]" and
         rendered =~ "session: workflow-session" and
         rendered =~ "turn_count: 6" and
         rendered =~ "ready"
@@ -4402,6 +4429,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                anchor: %{session_id: "workflow-session-2", thread_id: "workflow-thread-2", turn_id: "workflow-turn-2", turn_count: 2},
                conversation: %{items: [], truncated: false},
                continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               issue_refresh: %{
+                 status: "none_observed",
+                 status_text: "none observed",
+                 observed_changes: [],
+                 updated_at_changed?: false,
+                 event_id: nil,
+                 notes: []
+               },
                tools: %{items: []},
                shell: %{items: []},
                subagents: %{items: [], status: "mystery_status"}
@@ -4456,6 +4491,17 @@ defmodule SymphonyElixir.ExtensionsTest do
                anchor: %{session_id: "workflow-session-3", thread_id: "workflow-thread-3", turn_id: "workflow-turn-3", turn_count: 3},
                conversation: %{items: [], truncated: false},
                continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               issue_refresh: %{
+                 status: "issue_snapshot_unavailable",
+                 status_text: "issue_snapshot_unavailable",
+                 observed_changes: [],
+                 updated_at_changed?: false,
+                 event_id: "evt-issue-refresh-2",
+                 notes: [
+                   "Observed snapshot comparison degraded: at least one field was not safely compared, so this is not a normal changed/unchanged conclusion.",
+                   "blocked_by was not safely compared because blocked_by contains an entry without stable id/state keys: %{state: \"Todo\"}; treat this as unavailable/not_yet_observed for the current snapshot conclusion."
+                 ]
+               },
                tools: %{items: []},
                shell: %{items: []},
                subagents: %{items: [], status: "unavailable"}
@@ -4475,6 +4521,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       rendered =~ "Workflow context unavailable status" and
         rendered =~ "workflow timeline with unavailable context status" and
+        rendered =~ "Issue Refresh" and
+        rendered =~ "issue_snapshot_unavailable" and
+        rendered =~ "blocked_by was not safely compared" and
         rendered =~ "unavailable"
     end)
   end

@@ -181,6 +181,7 @@ defmodule SymphonyElixirWeb.Presenter do
     anchor = map_value(payload, :anchor) || %{}
     conversation = map_value(payload, :conversation) || %{}
     continuation = map_value(payload, :continuation) || %{}
+    issue_refresh = map_value(payload, :issue_refresh) || %{}
     tools = map_value(payload, :tools) || %{}
     shell = map_value(payload, :shell) || %{}
     subagents = map_value(payload, :subagents) || %{}
@@ -204,6 +205,14 @@ defmodule SymphonyElixirWeb.Presenter do
         status: map_value(continuation, :status),
         label: map_value(continuation, :label),
         event_id: map_value(continuation, :event_id)
+      },
+      issue_refresh: %{
+        status: map_value(issue_refresh, :status),
+        status_text: map_value(issue_refresh, :status_text),
+        observed_changes: list_value(issue_refresh, :observed_changes),
+        updated_at_changed?: map_value(issue_refresh, :updated_at_changed?) == true,
+        notes: list_value(issue_refresh, :notes),
+        event_id: map_value(issue_refresh, :event_id)
       },
       tools: %{
         items:
@@ -558,6 +567,13 @@ defmodule SymphonyElixirWeb.Presenter do
     case map_value(map, key) do
       value when is_integer(value) and value >= 0 -> value
       _ -> nil
+    end
+  end
+
+  defp list_value(map, key) when is_map(map) do
+    case map_value(map, key) do
+      values when is_list(values) -> Enum.filter(values, &is_binary/1)
+      _ -> []
     end
   end
 
