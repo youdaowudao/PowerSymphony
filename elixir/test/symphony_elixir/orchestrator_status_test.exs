@@ -2766,8 +2766,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     plain = Regex.replace(~r/\e\[[\\d;]*m/, row, "")
 
-    assert plain =~ "turn completed (completed)"
-    assert (String.split(plain, "turn completed (completed)") |> length()) - 1 == 1
+    assert plain =~ "turn completed"
+    assert plain =~ "pending finali"
+    assert (String.split(plain, "turn completed") |> length()) - 1 == 1
     refute plain =~ " notification "
   end
 
@@ -2827,7 +2828,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plain = Regex.replace(~r/\e\[[\d;]*m/, row, "")
 
     assert String.length(plain) == terminal_columns
-    assert plain =~ "turn completed (completed)"
+    assert plain =~ "turn completed (completed, pending finalization)"
   end
 
   test "status dashboard test helper uses stable default width when terminal width is omitted" do
@@ -2863,13 +2864,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plain = Regex.replace(~r/\e\[[\d;]*m/, row, "")
 
     assert String.length(plain) > 80
-    assert plain =~ "turn completed (completed)"
+    assert plain =~ "turn completed"
+    assert plain =~ "pending finali"
   end
 
   test "status dashboard humanizes full codex app-server event set" do
     event_cases = [
       {"turn/started", %{"params" => %{"turn" => %{"id" => "turn-1"}}}, "turn started"},
-      {"turn/completed", %{"params" => %{"turn" => %{"status" => "completed"}}}, "turn completed"},
+      {"turn/completed", %{"params" => %{"turn" => %{"status" => "completed"}}}, "turn completed (completed, pending finalization)"},
       {"turn/diff/updated", %{"params" => %{"diff" => "line1\nline2"}}, "turn diff updated"},
       {"turn/plan/updated", %{"params" => %{"plan" => [%{"step" => "a"}, %{"step" => "b"}]}}, "plan updated"},
       {"thread/tokenUsage/updated",

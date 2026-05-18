@@ -33,11 +33,13 @@ defmodule SymphonyElixirWeb.RunLive do
       |> assign(:surface_names, @surface_names)
       |> assign(:selected_event_id, nil)
       |> assign(:timeline_state, initial_timeline_state())
+      |> assign(:context_state, initial_context_state())
       |> assign(:detail_state, initial_detail_state())
       |> load_run()
 
     if connected?(socket) and summary_loaded?(socket) do
       send(self(), :load_timeline)
+      send(self(), :load_context)
     end
 
     {:ok, socket}
@@ -46,6 +48,10 @@ defmodule SymphonyElixirWeb.RunLive do
   @impl true
   def handle_info(:load_timeline, socket) do
     {:noreply, load_recent_timeline(socket)}
+  end
+
+  def handle_info(:load_context, socket) do
+    {:noreply, load_context_summary(socket)}
   end
 
   def handle_info({:load_event_detail, event_id}, socket) do
@@ -272,18 +278,91 @@ defmodule SymphonyElixirWeb.RunLive do
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Context surfaces</h2>
-                <p class="section-copy">Thread, turn, conversation, tools, and sub-agent context placeholders.</p>
+                <h2 class="section-title">Run context</h2>
+                <p class="section-copy">Independent, lightweight context summary for the current run generation.</p>
               </div>
             </div>
 
-            <div class="detail-stack">
-              <p class="mono">Thread</p>
-              <p class="mono">Turn</p>
-              <p class="mono">Conversation</p>
-              <p class="mono">Tools</p>
-              <p class="mono">Sub-agent context</p>
-            </div>
+            <%= case @context_state.status do %>
+              <% :loading -> %>
+                <p class="empty-state">Loading context…</p>
+              <% :error -> %>
+                <p class="empty-state"><%= context_error_text(@context_state.error) %></p>
+              <% :ready -> %>
+                <div class="detail-stack">
+                  <h3 class="section-title">Thread &amp; Turn</h3>
+                  <p class="mono">session: <%= @context_state.context.anchor.session_id || "n/a" %></p>
+                  <p class="mono">thread: <%= @context_state.context.anchor.thread_id || "n/a" %></p>
+                  <p class="mono">turn: <%= @context_state.context.anchor.turn_id || "n/a" %></p>
+                  <p class="mono">turn_count: <%= summary_value(@context_state.context.anchor, :turn_count) %></p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Recent interaction signals</h3>
+                  <div :for={item <- @context_state.context.conversation.items} class="detail-stack">
+                    <p class="mono"><%= item.label %>: <%= item.text %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <p :if={@context_state.context.conversation.items == []} class="mono">none observed</p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Continuation &amp; Retry</h3>
+                  <p class="mono"><%= @context_state.context.continuation.label || "none observed" %></p>
+                  <p class="mono">event_id: <%= @context_state.context.continuation.event_id || "n/a" %></p>
+                  <button
+                    :if={is_binary(@context_state.context.continuation.event_id)}
+                    type="button"
+                    class="issue-link"
+                    phx-click="show_event_detail"
+                    phx-value-event_id={@context_state.context.continuation.event_id}
+                  >
+                    Open detail: <%= @context_state.context.continuation.event_id %>
+                  </button>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Tools &amp; Shell</h3>
+                  <div :for={item <- @context_state.context.tools.items} class="detail-stack">
+                    <p class="mono"><%= item.summary %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <div :for={item <- @context_state.context.shell.items} class="detail-stack">
+                    <p class="mono"><%= item.text %></p>
+                    <button
+                      type="button"
+                      class="issue-link"
+                      phx-click="show_event_detail"
+                      phx-value-event_id={item.event_id}
+                    >
+                      Open detail: <%= item.event_id %>
+                    </button>
+                  </div>
+                  <p :if={@context_state.context.tools.items == [] and @context_state.context.shell.items == []} class="mono">none observed</p>
+                </div>
+
+                <div class="detail-stack">
+                  <h3 class="section-title">Sub-agent</h3>
+                  <p :for={item <- @context_state.context.subagents.items} class="mono"><%= item.text %></p>
+                  <p :if={@context_state.context.subagents.items == []} class="mono"><%= humanize_context_status(@context_state.context.subagents.status) %></p>
+                </div>
+              <% _ -> %>
+                <p class="empty-state">Context unavailable</p>
+            <% end %>
           </section>
 
           <section class="section-card">
@@ -383,6 +462,24 @@ defmodule SymphonyElixirWeb.RunLive do
               error: reason,
               load_more_error: nil
             })
+        end
+
+      other_socket ->
+        other_socket
+    end
+  end
+
+  defp load_context_summary(socket) do
+    socket
+    |> assign(:context_state, %{initial_context_state() | status: :loading})
+    |> case do
+      %{assigns: %{run_state: {:ok, _payload}}} = ready_socket ->
+        case fetch_context_summary(ready_socket.assigns.project_id, ready_socket.assigns.issue_identifier) do
+          {:ok, context} ->
+            assign(ready_socket, :context_state, %{status: :ready, context: context, error: nil})
+
+          {:error, reason} ->
+            assign(ready_socket, :context_state, %{status: :error, context: nil, error: reason})
         end
 
       other_socket ->
@@ -555,6 +652,22 @@ defmodule SymphonyElixirWeb.RunLive do
     end
   end
 
+  defp fetch_context_summary(project_id, issue_identifier) do
+    if Endpoint.config(:runtime_mode) == :control_plane do
+      ObservabilityApiController.project_run_context_payload(project_id, issue_identifier)
+    else
+      orchestrator = Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
+      timeout = Endpoint.config(:snapshot_timeout_ms) || 15_000
+
+      case Orchestrator.run_context_summary(orchestrator, issue_identifier, timeout: timeout) do
+        {:ok, payload} -> {:ok, Presenter.run_context_payload(payload)}
+        {:error, reason} -> {:error, reason}
+        :timeout -> {:error, :context_unavailable}
+        :unavailable -> {:error, :context_unavailable}
+      end
+    end
+  end
+
   defp initial_timeline_state do
     %{
       status: :idle,
@@ -562,6 +675,14 @@ defmodule SymphonyElixirWeb.RunLive do
       next_cursor: nil,
       error: nil,
       load_more_error: nil
+    }
+  end
+
+  defp initial_context_state do
+    %{
+      status: :idle,
+      context: nil,
+      error: nil
     }
   end
 
@@ -593,6 +714,7 @@ defmodule SymphonyElixirWeb.RunLive do
   end
 
   defp timeline_error_text(_reason), do: "Timeline unavailable"
+  defp context_error_text(_reason), do: "Context unavailable"
   defp detail_error_text(_reason), do: "Event detail unavailable"
   defp surface_error_text(:surface_not_available), do: "Surface unavailable for this event"
   defp surface_error_text(:invalid_surface), do: "Surface unavailable for this event"
@@ -709,4 +831,9 @@ defmodule SymphonyElixirWeb.RunLive do
       true -> base
     end
   end
+
+  defp humanize_context_status("none_observed"), do: "none observed"
+  defp humanize_context_status("unavailable"), do: "unavailable"
+  defp humanize_context_status("ready"), do: "ready"
+  defp humanize_context_status(_status), do: "unavailable"
 end

@@ -176,6 +176,60 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  @spec run_context_payload(map()) :: map()
+  def run_context_payload(%{} = payload) do
+    anchor = map_value(payload, :anchor) || %{}
+    conversation = map_value(payload, :conversation) || %{}
+    continuation = map_value(payload, :continuation) || %{}
+    tools = map_value(payload, :tools) || %{}
+    shell = map_value(payload, :shell) || %{}
+    subagents = map_value(payload, :subagents) || %{}
+
+    %{
+      anchor: %{
+        session_id: map_value(anchor, :session_id),
+        thread_id: map_value(anchor, :thread_id),
+        turn_id: map_value(anchor, :turn_id),
+        turn_count: map_integer_value(anchor, :turn_count)
+      },
+      conversation: %{
+        items:
+          conversation
+          |> map_value(:items)
+          |> List.wrap()
+          |> Enum.map(&run_context_conversation_item/1),
+        truncated: map_value(conversation, :truncated) == true
+      },
+      continuation: %{
+        status: map_value(continuation, :status),
+        label: map_value(continuation, :label),
+        event_id: map_value(continuation, :event_id)
+      },
+      tools: %{
+        items:
+          tools
+          |> map_value(:items)
+          |> List.wrap()
+          |> Enum.map(&run_context_tool_item/1)
+      },
+      shell: %{
+        items:
+          shell
+          |> map_value(:items)
+          |> List.wrap()
+          |> Enum.map(&run_context_shell_item/1)
+      },
+      subagents: %{
+        items:
+          subagents
+          |> map_value(:items)
+          |> List.wrap()
+          |> Enum.map(&run_context_subagent_item/1),
+        status: map_value(subagents, :status)
+      }
+    }
+  end
+
   @spec find_project_run_summary(map(), String.t()) :: map() | nil
   def find_project_run_summary(project, issue_identifier)
       when is_map(project) and is_binary(issue_identifier) do
@@ -813,6 +867,40 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp run_context_conversation_item(item) do
+    %{
+      event_id: map_value(item, :event_id),
+      kind: map_value(item, :kind),
+      label: map_value(item, :label),
+      text: map_value(item, :text)
+    }
+  end
+
+  defp run_context_tool_item(item) do
+    %{
+      event_id: map_value(item, :event_id),
+      tool: map_value(item, :tool),
+      status: map_value(item, :status),
+      summary: map_value(item, :summary)
+    }
+  end
+
+  defp run_context_shell_item(item) do
+    %{
+      event_id: map_value(item, :event_id),
+      kind: map_value(item, :kind),
+      text: map_value(item, :text)
+    }
+  end
+
+  defp run_context_subagent_item(item) do
+    %{
+      event_id: map_value(item, :event_id),
+      label: map_value(item, :label),
+      text: map_value(item, :text)
+    }
+  end
 
   defp generated_at do
     DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()

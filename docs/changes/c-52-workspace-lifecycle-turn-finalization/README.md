@@ -9,6 +9,15 @@
 
 本 change 不是继续追“是否真的存在第二个顶层线程”，也不是去回退 `C-50/C-52` 已经建立的 owner gate，而是在保留现有保守 gate 的前提下，把资源生命周期和 continuation 边界补强到能稳定收口。
 
+当前实现边界进一步收紧为：
+
+- `turn finalization` 先落成 `resume-barrier based finalization gate`
+- 不在本轮引入完整 `settle` 状态机
+- `binding` 继续承担资源事实与资源层局部 fencing policy，但不是 owner 真相源
+- `ambiguous workspace` 先做到保守停住并留痕，不宣称后台治理闭环已完成
+- `Workspace.remove/2` 明确只是低层物理删除原语；生命周期调用方仍走 `cleanup_issue_workspace/2`
+- 观察层看到 raw codex `turn_completed` 时只能表达“pending finalization”，不能偷渡成已 finalized 成功
+
 ## 需求快照
 
 ### 要解决什么问题
@@ -47,7 +56,7 @@
 | Incident 已确认结论 | 本 change 必须交付什么 | 最低验证口径 |
 | --- | --- | --- |
 | `workspace lifecycle contract` 不完整 | cleanup side-path 统一走 generation-aware contract，删除前有唯一授权模型 | running/startup/retry/blocked-claim/local/remote 全覆盖 |
-| `turn finalization contract` 不完整 | `turn/completed` 不再直接等价 finalized；`late cancel/aborted` 回收至保守路径 | `completed -> late cancelled/aborted` 回归成立 |
+| `turn finalization contract` 不完整 | `turn/completed` 不再直接等价 finalized；当前先以 resume barrier 阻止过早 continuation，`late cancel/aborted` 回收至保守路径 | `completed -> late cancelled/aborted` 回归成立 |
 | `01:38 interrupted` 不应解释成 API 断线 | turn terminal conflict 与 transport/network failure 有稳定区分 | 状态/事件口径与错误分类回归成立 |
 | `C-50/C-52` gate 不能回退 | 不新增第二套 owner 真相源，不重开乐观 redispatch | zero-context review 明确确认此项 |
 

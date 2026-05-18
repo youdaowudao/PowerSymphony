@@ -1,6 +1,11 @@
 defmodule SymphonyElixir.Workspace do
   @moduledoc """
   Creates isolated per-issue workspaces for parallel Codex agents.
+
+  Lifecycle callers should use `cleanup_issue_workspace/2` when they need
+  generation-aware cleanup semantics. `remove/2` is intentionally narrower:
+  it is the low-level physical delete primitive once a caller has already
+  decided deletion is authorized.
   """
 
   require Logger
@@ -183,6 +188,11 @@ defmodule SymphonyElixir.Workspace do
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
 
+  @doc """
+  Physically deletes a workspace path after the caller has already fenced the
+  lifecycle transition. This function does not decide whether a workspace
+  should be removed; lifecycle entrypoints must use `cleanup_issue_workspace/2`.
+  """
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
     case File.exists?(workspace) do

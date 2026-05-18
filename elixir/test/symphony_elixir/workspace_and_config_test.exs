@@ -1016,6 +1016,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "cleanup_issue_workspace is the lifecycle cleanup entrypoint while remove is only physical delete" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-cleanup-entrypoint-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %{id: "issue-cleanup-entrypoint", identifier: "MT-CLEANUP-ENTRY", run_instance_id: "run-cleanup-entrypoint"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert :ok =
+               Workspace.cleanup_issue_workspace(issue.identifier,
+                 mode: :terminal_cleanup,
+                 run_instance_id: issue.run_instance_id,
+                 closing_reason: "terminal_cleanup_pending"
+               )
+
+      assert {:ok, binding} = Workspace.read_resource_binding(workspace)
+      assert binding["state"] == "closing"
+      assert binding["closing_reason"] == "terminal_cleanup_pending"
+
+      assert {:ok, _removed_paths} = Workspace.remove(workspace)
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "startup sweep delete evidence does not remove closing workspace without explicit removal proof" do
     test_root =
       Path.join(

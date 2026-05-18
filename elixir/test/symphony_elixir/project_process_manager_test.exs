@@ -494,6 +494,31 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     kill_pid(os_pid)
   end
 
+  test "startup marks start_failed when worker pid dies before the startup port closes" do
+    test_root = temp_root!("startup-dead-os-pid")
+    manager_name = Module.concat(__MODULE__, StartupDeadOsPidManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+
+    assert {_, 0} = System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert is_nil(entry.runtime_state.pid)
+  end
+
   test "startup timeout fallback can recurse on await_exit_status data and then time out" do
     test_root = temp_root!("startup-timeout-await-exit-status-data")
     manager_name = Module.concat(__MODULE__, StartupTimeoutAwaitExitStatusDataManager)
@@ -595,6 +620,35 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert {:ok, beta_state} = ProjectProcessManager.start_project(manager_name, "beta")
     assert alpha_state.status == :running
     assert beta_state.status == :running
+  end
+
+  test "registry preserves runtime status for valid entries that do not match projected overrides" do
+    test_root = temp_root!("projected-default-status")
+    manager_name = Module.concat(__MODULE__, ProjectedDefaultStatusManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    :sys.replace_state(manager_name, fn state ->
+      runtime_state =
+        state.runtimes["alpha"]
+        |> Map.put(:status, :stopped)
+        |> Map.put(:pid, nil)
+        |> Map.put(:worker_port, port)
+
+      %{state | runtimes: Map.put(state.runtimes, "alpha", runtime_state)}
+    end)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.validation_result == :valid
+    assert entry.normalized_config.enabled == true
+    assert entry.runtime_state.status == :stopped
   end
 
   test "explicit manager calls avoid global env routing collisions" do
@@ -2230,6 +2284,35 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     runtime_dir = control_plane_runtime_dir(test_root, "alpha")
     assert fetch_entry!(manager_name, "alpha").runtime_state.status == :stopped
     refute File.exists?(Path.join(runtime_dir, "worker.pid"))
+    assert_eventually(fn -> not process_alive?(running_state.pid) end)
+  end
+
+  test "stop_project escalates from TERM to KILL when worker ignores TERM" do
+    test_root = temp_root!("term-then-kill-worker")
+    manager_name = Module.concat(__MODULE__, TermThenKillManager)
+    port = reserve_tcp_port!()
+
+    ignored_term_command =
+      "bash -lc " <> shell_escape("trap '' TERM; while true; do sleep 1; done")
+
+    command_builder = raw_command_builder(ignored_term_command)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: command_builder})
+
+    assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert running_state.status == :running
+    assert is_integer(running_state.pid)
+
+    assert {:ok, stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+    assert stopped_state.status == :stopped
+    assert is_nil(stopped_state.pid)
     assert_eventually(fn -> not process_alive?(running_state.pid) end)
   end
 

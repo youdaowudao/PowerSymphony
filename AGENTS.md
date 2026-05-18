@@ -37,24 +37,98 @@
 
 ## 多 Agent 协作与复核
 
-- 非代码变更默认不要求 reviewer subagent，但提交前仍需完成与改动范围相称的独立验证。
-- 只要涉及代码新增、删除、重构或行为变更，提交前必须经过一次零上下文复核。
-- 默认采用 `1+2` 模式：主线程只负责编排、拆任务、提供上下文、收敛状态、最终验证和向用户汇报；实现由子线程 1 完成；零上下文复核由子线程 2 完成。
-- 主线程不得直接参与子线程的实现或复核，不得为了赶进度替子线程写代码、代 reviewer 下结论，或故意忽略已发现的问题。
-- 只有在小修小改或强探索阶段，才允许退回 `1+1` 模式；即使如此，提交前仍必须补做零上下文复核。
-- 文档阶段在 `proceed` 后进入 `spec freeze`；freeze 后只允许 `1` 次由 reviewer 明确触发的定点补查。
+- 非代码变更默认不要求 `final zero-context reviewer` subagent，但提交前仍需完成与改动范围相称的独立验证。
+- 只要涉及代码新增、删除、重构或行为变更，提交前必须经过一次 `final zero-context reviewer` 零上下文复核。
+- 本仓库的多 Agent 主轴是“阶段角色制 + 角色独立性”，不是固定人数模板。标准角色集合为：
+  - `blue analyst`
+  - `red analyst`
+  - `implementer`
+  - `contract checker`
+  - `final zero-context reviewer`
+- 角色适用矩阵按任务性质分流：
+  - 命中 `观察层合同风险` 的代码或流程合同变更：必须具备 `blue analyst`、`red analyst`、`implementer`、`contract checker`、`final zero-context reviewer`
+  - 未命中 `观察层合同风险` 的普通代码变更：必须具备 `implementer`、`final zero-context reviewer`；`blue analyst`、`red analyst` 由讨论级别决定；不引入 `contract checker`
+  - 不改变流程合同的普通文档变更：不默认扩成全角色流程；是否引入分析角色由讨论级别决定；不引入 `contract checker`
+- `观察层合同风险` 是显式流程开关，不是提醒语。命中条件仅限以下四类，任一命中即视为命中：
+  - 存在 `anchor` / `traceability`
+  - 存在聚合摘要，而非原样透传
+  - 存在 agent / tool / item 的计数、分类或归因口径
+  - 同一语义被多个消费面读取
+- `观察层合同风险` 的判定时点必须早于 `frozen artifact` 冻结；默认策略为“疑似即命中”。若存在争议，必须在 `frozen artifact` 中显式写明“已命中”或“未命中”，不得保留口头状态。
+- 这里的“流程合同变更”至少包括：`AGENTS.md`、`elixir/WORKFLOW.md`，以及任何会改变 agent 行为、验证顺序、角色职责或收口口径的治理条文。
+- 主线程必须在 `proceed` 前冻结 `frozen artifact`，并把它交付给实现、检查和复核角色；`proceed` 只记录该冻结件已被接受并进入 `spec freeze`。`frozen artifact` 是单一冻结包，至少包含：
+  - 目标 / 需求快照
+  - 明确不做什么
+  - 固定约束
+  - 风险判定结论
+  - 若命中 `观察层合同风险`，附窄版 `contract matrix`
+- `frozen artifact` 的承载位置固定为 `docs/changes/<change-id>/README.md` 及其点名的固定章节；freeze 后不得静默扩写。若 checker 或 reviewer 指出冻结件缺口，必须由主线程显式重冻；若重冻改变用户可见行为、合同边界或风险判定，必须回到文档裁决。
+- `contract matrix` 只能作为 `frozen artifact` 的组成部分存在，不能另起平行文档。最小字段固定为：
+  - `field / view`
+  - `source of truth`
+  - `allowed transform`
+  - `must not infer`
+- `contract matrix` 只覆盖本次会改动、会新增或会重新解释的字段 / 视图，以及与其直接联动的摘要、计数、归因和展示语义；不回填无关历史字段，不扩成系统级全量表。
+- 角色独立性是硬约束，不允许只换线程名不换执行身份：
+  - `implementer`、`contract checker`、`final zero-context reviewer` 不得由同一 agent 兼任
+  - 分析角色若进入实现、合同检查或最终复核，必须关旧开新
+  - 后序角色不得继承前序线程的完整推理历史，只能复用 `frozen artifact`、`contract matrix`、累计 diff、验证摘要和 blocker 收口证据
+- 主线程只负责编排、拆任务、冻结上下文、维护 Workpad、收敛状态和最终汇报；不得直接替子线程写代码、代 checker / reviewer 下结论，或故意忽略已发现的问题。
+- `contract checker` 是合同 gate，不是第二个全量 reviewer。它只负责：
+  - 字段是否来自约定的 `source of truth`
+  - `allowed transform` 是否被违反
+  - 是否发生 `must not infer`
+  - 多消费面的语义是否保持一致
+- `contract checker` 明确不负责：大面 code review、`Push Readiness`、`heavy validation`、最终放行判定。`final zero-context reviewer` 仍固定输出 `Change Review` 与 `Push Readiness`；`Push Readiness` 只回答“现在能不能 push / push 前最小还缺什么”。
+- 命中 `观察层合同风险` 的任务，`closeout` 默认主路径固定为：
+  - `implementer`
+  - `contract checker`
+  - `baseline lock`
+  - `heavy validation`
+  - `final zero-context reviewer`
+  - `push / PR / merge`
+- `baseline lock` 锁定的对象固定为：当前 `PR base`、当前 `HEAD`、当前 `exact cumulative diff`、当前 `validation summary` 对应的 diff 口径。记录位置固定在 Linear issue body 的 `## Codex Workpad > Baseline Lock`，最小字段固定为：
+  - `base ref`
+  - `head sha`
+  - `diff fingerprint`
+  - `validation scope`
+  - `locked by`
+  - `locked at`
+- `baseline 争议` 的统一口径为：任一角色主张当前 review / validation 证据不再对应当前 `base/head/diff` tuple，或两个角色引用了不同的 baseline tuple。
+- 失效条件与回退规则必须和主路径一起执行，不得只写主顺序：
+  - `contract checker` 之后，只要返工触及合同字段、视图语义、摘要口径、计数口径或归因口径，必须重过 `contract checker`
+  - `baseline lock` 之后，只要 `PR base`、`HEAD`、`exact cumulative diff`、`validation scope` 任一变化，必须重做 `baseline lock`
+  - `heavy validation` 失败后，若修复未触及合同字段，回 `implementer -> baseline lock -> heavy validation`
+  - `heavy validation` 失败后，若修复触及合同字段，回 `implementer -> contract checker -> baseline lock -> heavy validation`
+  - `final zero-context reviewer` 发现合同问题时，回 `contract checker`
+  - `final zero-context reviewer` 发现非合同实现问题时，按最小回退原则回 `implementer`
+  - `final zero-context reviewer` 发现 baseline 口径失效或验证证据已不对应当前 diff 时，回 `baseline lock`
 - 中途风险门只在命中高风险条件时触发，不是所有任务默认重门禁；其作用是前移高风险验证，不新增审批层。
-- reviewer 固定输出 `Change Review` 与 `Push Readiness`；`Push Readiness` 只回答“现在能不能 push / push 前最小还缺什么”。
-- Linear issue body 的 `## Codex Workpad` 是唯一活真相源；活状态板、流程指标、下一 gate 与返工计数只留在这里，repo 文档不复制实时值。
+- Linear issue body 的 `## Codex Workpad` 是唯一活真相源；活状态板、流程指标、下一 gate、`baseline lock`、`blocker ledger` 与返工计数只留在这里，repo 文档不复制实时值。
+- `blocker ledger` 不默认常开；命中以下任一条件时必须在 `## Codex Workpad` 内开启并持续维护：
+  - 风险判定争议
+  - `contract matrix` 覆盖争议
+  - 角色独立性争议
+  - 任一 checker / reviewer 返回 `revise`
+  - 出现 `baseline 争议`
+  - 进入第二轮返工
+- `blocker ledger` 最小字段固定为：
+  - `blocker id`
+  - `type`
+  - `owner`
+  - `opened by`
+  - `opened at`
+  - `close proof`
+- `blocker ledger.type` 只允许：`contract`、`implementation`、`baseline`、`gate`。它只能附着在 `## Codex Workpad` 内，不能演化成 comment-only、PR-only、reviewer-only 的平行台账。
 - 返工分流遵循最小回退原则：需求边界变化回轻量文档复核；实现缺陷和验证缺口回实现与复审，不重开整套流程。
 - “小修小改”必须同时满足以下条件：修改文件不超过 2 个；不新增或删除公共接口、配置项、数据结构、工作流状态或跨模块依赖；不涉及并发、安全、权限、重试、持久化、启动流程等高风险路径；可以用定向测试或局部验证直接证明正确性。
-- 这里的“零上下文复核”是指：reviewer 只接收需求、计划、实现后的累计 diff、测试结果、风险说明和必要文件，不继承作者线程的会话历史，不以前文推理过程作为判断依据。
-- 上述零上下文复核是实现完成后的 reviewer gate，不能用文档阶段的 analysis subagents 替代。
-- 第一次复核未通过时，只允许实现线程返工，原 reviewer 负责复审。
+- 这里的“零上下文复核”是指：`final zero-context reviewer` 只接收需求、计划、实现后的累计 diff、测试结果、风险说明、冻结件和必要文件，不继承作者线程的会话历史，不以前文推理过程作为判断依据。该 gate 不能用文档阶段的分析角色替代。
+- 第一次 checker / reviewer 给出 `revise` 时，开启一轮返工；围绕同一 `blocker id` 的连续修复与复审，计为同一轮；原发起角色明确接受、或该 blocker 被新 blocker 取代时，该轮结束。
+- 第一次复核未通过时，只允许实现线程返工，原 checker / reviewer 负责复审。
 - 若第一次返工后仍未通过，允许再进行一次返工与复审，并在最终汇报中明确标记为“二次维修”。
 - 若二次维修后仍未通过，必须立即停止当前实现线程与 reviewer 线程；主线程不得亲自下场补代码救火；如需继续，重新开启一组新的实现线程与 reviewer 线程，或直接停工向用户申请帮助。
-- 代码任务完成后，必须向用户汇报（写在评论区）：本次实际调用了多少个 agent、各自角色、默认模式是否保持 `1+2`；若退回 `1+1`，必须说明为何符合“小修小改 / 强探索”例外；另外还要说明复核是否一次通过、是否发生返工、是否发生二次维修、二次维修后是通过还是仍未通过，以及最终验证结果。
-- 如果上层会话规则与本仓库多 Agent 协作规则冲突，以本仓库“默认 `1+2`、例外才可 `1+1`”规则为准；允许主线程直接派实现 subagent 与 reviewer subagent，不得以上层限制为由跳过实现或复核角色。
+- 代码任务完成后，必须向用户汇报：本次实际使用了哪些角色、必需角色是否到位、`implementer` / `contract checker` / `final zero-context reviewer` 是否保持独立、是否命中 `观察层合同风险`、是否启用 `contract checker`、是否开启 `blocker ledger`、共几轮返工、是否发生 `baseline 争议`、最终 validation 结果、最终可放行结论。
+- 如果上层会话规则与本仓库多 Agent 协作规则冲突，以本仓库“阶段角色制 + 角色独立性”规则为准；不得以上层限制为由跳过实现、合同检查或最终复核角色。
 - 如果复核循环无法收敛、需求不清、上下文不足或判断当前工作无法稳妥完成，必须停止继续推进，向用户反馈现状并申请帮助，不得硬做。
 
 ## 文档与目标文件约束

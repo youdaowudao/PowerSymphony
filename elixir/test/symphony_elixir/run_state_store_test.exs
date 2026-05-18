@@ -393,4 +393,144 @@ defmodule SymphonyElixir.RunStateStoreTest do
   test "raw event store streams an empty list when trace file metadata is missing" do
     assert [] = RawEventStore.stream_events(%{}) |> Enum.to_list()
   end
+
+  test "context summary for running entries stays scoped to the current run_instance_id and preserves store errors" do
+    with_logs_root("context-summary-success", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-CONTEXT-STATE-1"), logs_root: logs_root)
+      base_time = ~U[2026-05-17 03:00:00Z]
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: base_time
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-old",
+        thread_id: "thread-old",
+        turn_id: "turn-old",
+        session_id: "thread-old-turn-old",
+        timestamp: DateTime.add(base_time, 1, :second),
+        payload: %{"method" => "item/reasoning/summaryTextDelta", "params" => %{"summaryText" => "old summary"}}
+      })
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current",
+        timestamp: DateTime.add(base_time, 2, :second),
+        payload: %{"method" => "item/reasoning/summaryTextDelta", "params" => %{"summaryText" => "current summary"}}
+      })
+
+      entry =
+        timeline_entry("MT-CONTEXT-STATE-1", trace, %{
+          run_instance_id: "run-current",
+          thread_id: "thread-current",
+          turn_id: "turn-current",
+          session_id: "thread-current-turn-current",
+          turn_count: 7
+        })
+
+      assert {:ok, context} =
+               RunStateStore.context_summary_for_running_entries(
+                 [entry],
+                 "MT-CONTEXT-STATE-1"
+               )
+
+      assert context.anchor == %{
+               session_id: "thread-current-turn-current",
+               thread_id: "thread-current",
+               turn_id: "turn-current",
+               turn_count: 7
+             }
+
+      assert Enum.any?(context.conversation.items, &(&1.text == "current summary"))
+      refute Enum.any?(context.conversation.items, &(&1.text == "old summary"))
+    end)
+
+    with_logs_root("context-summary-anchor-from-entry", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-CONTEXT-STATE-ANCHOR"), logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :notification,
+        run_instance_id: "run-anchor",
+        timestamp: ~U[2026-05-17 03:05:00Z],
+        payload: %{"method" => "item/reasoning/summaryTextDelta", "params" => %{"summaryText" => "anchor from entry"}}
+      })
+
+      entry =
+        timeline_entry("MT-CONTEXT-STATE-ANCHOR", trace, %{
+          run_instance_id: "run-anchor",
+          thread_id: "thread-from-entry",
+          turn_id: "turn-from-entry",
+          session_id: "thread-from-entry-turn-from-entry",
+          turn_count: 11
+        })
+
+      assert {:ok, context} =
+               RunStateStore.context_summary_for_running_entries(
+                 [entry],
+                 "MT-CONTEXT-STATE-ANCHOR"
+               )
+
+      assert context.anchor == %{
+               session_id: "thread-from-entry-turn-from-entry",
+               thread_id: "thread-from-entry",
+               turn_id: "turn-from-entry",
+               turn_count: 11
+             }
+    end)
+
+    with_logs_root("context-summary-errors", fn logs_root ->
+      trace = RunTrace.start!(issue("MT-CONTEXT-STATE-2"), logs_root: logs_root)
+
+      RunTrace.record(trace, :codex, %{
+        event: :session_started,
+        run_instance_id: "run-current",
+        thread_id: "thread-current",
+        turn_id: "turn-current",
+        session_id: "thread-current-turn-current"
+      })
+
+      duplicate_entries = [
+        timeline_entry("MT-CONTEXT-DUP", trace, %{run_instance_id: "run-one"}),
+        timeline_entry("MT-CONTEXT-DUP", trace, %{run_instance_id: "run-two"})
+      ]
+
+      assert {:error, :duplicate_run} =
+               RunStateStore.context_summary_for_running_entries(
+                 duplicate_entries,
+                 "MT-CONTEXT-DUP"
+               )
+
+      assert {:error, :run_not_found} =
+               RunStateStore.context_summary_for_running_entries([], "MT-CONTEXT-MISSING")
+
+      broken_entry = %{
+        issue: issue("MT-CONTEXT-NO-TRACE"),
+        identifier: "MT-CONTEXT-NO-TRACE",
+        run_trace: nil
+      }
+
+      assert {:error, :run_not_found} =
+               RunStateStore.context_summary_for_running_entries(
+                 [broken_entry],
+                 "MT-CONTEXT-NO-TRACE"
+               )
+
+      File.write!(trace.trace_file, "{bad json}\n")
+
+      assert {:error, :context_unavailable} =
+               RunStateStore.context_summary_for_running_entries(
+                 [timeline_entry("MT-CONTEXT-STATE-2", trace, %{run_instance_id: "run-current"})],
+                 "MT-CONTEXT-STATE-2"
+               )
+    end)
+  end
 end

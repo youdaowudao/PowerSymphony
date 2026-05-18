@@ -94,6 +94,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Map.get(results, {issue_identifier, event_id, surface}, {:error, :run_not_found}), state}
     end
 
+    def handle_call({:run_context_summary, issue_identifier}, _from, state) do
+      results = Keyword.get(state, :run_context_results, %{})
+      {:reply, Map.get(results, issue_identifier, {:error, :run_not_found}), state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
@@ -2271,6 +2276,100 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "control-plane context api maps worker responses and keeps project-only lookup semantics" do
+    manager_name = Module.concat(__MODULE__, ContextApiManager)
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-CONTEXT/context" ->
+          {200,
+           %{
+             anchor: %{session_id: "thread-1-turn-2", thread_id: "thread-1", turn_id: "turn-2", turn_count: 2},
+             conversation: %{items: [%{event_id: "evt-ctx-1", kind: "reasoning_summary", label: "reasoning", text: "compare options"}], truncated: false},
+             continuation: %{status: "continuation_required", label: "continuation required", event_id: "evt-ctx-2"},
+             tools: %{items: [%{event_id: "evt-ctx-3", tool: "shell", status: "completed", summary: "dynamic tool call completed (shell)"}]},
+             shell: %{items: [%{event_id: "evt-ctx-4", kind: "exec_command", text: "git status --short"}]},
+             subagents: %{items: [], status: "none_observed"}
+           }}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-DUP/context" ->
+          {409, %{error: %{code: "duplicate_run", message: "duplicate"}}}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-MISSING/context" ->
+          {404, %{error: %{code: "run_not_found", message: "missing"}}}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-DOWN/context" ->
+          {503, %{error: %{code: "context_unavailable", message: "down"}}}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    assert {:ok, payload} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
+               "alpha",
+               "MT-CONTEXT"
+             )
+
+    assert payload.anchor.turn_id == "turn-2"
+    assert hd(payload.conversation.items).text == "compare options"
+    assert payload.continuation.status == "continuation_required"
+
+    assert {:error, :duplicate_run} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
+               "alpha",
+               "MT-CONTEXT-DUP"
+             )
+
+    assert {:error, :run_not_found} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
+               "alpha",
+               "MT-CONTEXT-MISSING"
+             )
+
+    assert {:error, :context_unavailable} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
+               "alpha",
+               "MT-CONTEXT-DOWN"
+             )
+
+    assert {:error, :project_not_found} =
+             SymphonyElixirWeb.ObservabilityApiController.project_run_context_payload(
+               "missing",
+               "MT-CONTEXT"
+             )
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-CONTEXT/context"), 200)["anchor"]["turn_id"] == "turn-2"
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-CONTEXT-DUP/context"), 409) == %{
+             "error" => %{"code" => "duplicate_run", "message" => "Multiple running entries matched this run"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-CONTEXT-MISSING/context"), 404) == %{
+             "error" => %{"code" => "run_not_found", "message" => "Run context not found"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/projects/alpha/runs/MT-CONTEXT-DOWN/context"), 503) == %{
+             "error" => %{"code" => "context_unavailable", "message" => "Run context is unavailable"}
+           }
+  end
+
   test "control-plane timeline api maps manager exit to timeline unavailable" do
     manager_name = Module.concat(__MODULE__, TimelineExitManager)
 
@@ -3310,11 +3409,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "960s"
     assert html =~ "Timeline"
     assert html =~ "Event detail"
-    assert html =~ "Thread"
-    assert html =~ "Turn"
-    assert html =~ "Conversation"
-    assert html =~ "Tools"
-    assert html =~ "Sub-agent context"
+    assert html =~ "Run context"
+    assert html =~ "Context unavailable"
     assert html =~ "Dependencies"
     assert html =~ "Attention"
     assert html =~ "Timeline unavailable"
@@ -3716,6 +3812,171 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
   end
 
+  test "workflow run deep view renders context from orchestrator and humanizes statuses" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowContextOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-WORKFLOW-CONTEXT", nil} =>
+            {:ok,
+             %{
+               items: [
+                 %{
+                   event_id: "evt-workflow-context",
+                   timestamp: "2026-05-16T01:10:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "workflow timeline with context",
+                   status_markers: ["completed"]
+                 }
+               ],
+               next_cursor: nil
+             }}
+        },
+        run_context_results: %{
+          "MT-WORKFLOW-CONTEXT" =>
+            {:ok,
+             %{
+               anchor: %{session_id: "workflow-session", thread_id: "workflow-thread", turn_id: "workflow-turn", turn_count: 6},
+               conversation: %{items: [], truncated: false},
+               continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               tools: %{items: []},
+               shell: %{items: []},
+               subagents: %{items: [], status: "ready"}
+             }}
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW-CONTEXT", "Workflow context")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-CONTEXT")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow context" and
+        rendered =~ "workflow timeline with context" and
+        rendered =~ "Run context" and
+        rendered =~ "session: workflow-session" and
+        rendered =~ "turn_count: 6" and
+        rendered =~ "ready"
+    end)
+  end
+
+  test "workflow run deep view humanizes unavailable and unknown context statuses" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowContextStatusOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-WORKFLOW-CONTEXT-STATUS", nil} =>
+            {:ok,
+             %{
+               items: [
+                 %{
+                   event_id: "evt-workflow-context-status",
+                   timestamp: "2026-05-16T01:20:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "workflow timeline with context statuses",
+                   status_markers: []
+                 }
+               ],
+               next_cursor: nil
+             }}
+        },
+        run_context_results: %{
+          "MT-WORKFLOW-CONTEXT-STATUS" =>
+            {:ok,
+             %{
+               anchor: %{session_id: "workflow-session-2", thread_id: "workflow-thread-2", turn_id: "workflow-turn-2", turn_count: 2},
+               conversation: %{items: [], truncated: false},
+               continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               tools: %{items: []},
+               shell: %{items: []},
+               subagents: %{items: [], status: "mystery_status"}
+             }}
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW-CONTEXT-STATUS", "Workflow context status")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-CONTEXT-STATUS")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow context status" and
+        rendered =~ "workflow timeline with context statuses" and
+        rendered =~ "unavailable"
+    end)
+  end
+
+  test "workflow run deep view humanizes explicit unavailable context status" do
+    orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowContextUnavailableStatusOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        run_timeline_results: %{
+          {"MT-WORKFLOW-CONTEXT-UNAVAILABLE", nil} =>
+            {:ok,
+             %{
+               items: [
+                 %{
+                   event_id: "evt-workflow-context-unavailable",
+                   timestamp: "2026-05-16T01:21:00Z",
+                   source: "codex",
+                   event_type: "turn_completed",
+                   summary: "workflow timeline with unavailable context status",
+                   status_markers: []
+                 }
+               ],
+               next_cursor: nil
+             }}
+        },
+        run_context_results: %{
+          "MT-WORKFLOW-CONTEXT-UNAVAILABLE" =>
+            {:ok,
+             %{
+               anchor: %{session_id: "workflow-session-3", thread_id: "workflow-thread-3", turn_id: "workflow-turn-3", turn_count: 3},
+               conversation: %{items: [], truncated: false},
+               continuation: %{status: "none_observed", label: "none observed", event_id: nil},
+               tools: %{items: []},
+               shell: %{items: []},
+               subagents: %{items: [], status: "unavailable"}
+             }}
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      project_registry: run_live_project_registry("MT-WORKFLOW-CONTEXT-UNAVAILABLE", "Workflow context unavailable status")
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-WORKFLOW-CONTEXT-UNAVAILABLE")
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Workflow context unavailable status" and
+        rendered =~ "workflow timeline with unavailable context status" and
+        rendered =~ "unavailable"
+    end)
+  end
+
   test "workflow run deep view degrades timeline errors without hiding summary" do
     orchestrator_name = Module.concat(__MODULE__, RunLiveWorkflowTimelineErrorOrchestrator)
 
@@ -3774,6 +4035,56 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       rendered =~ "Workflow timeout" and rendered =~ "Timeline unavailable" and
         not String.contains?(rendered, "Run unavailable")
+    end)
+  end
+
+  test "run deep view skips context loading when summary is unavailable" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-NO-SUMMARY-CONTEXT")
+    assert html =~ "Run unavailable"
+    refute html =~ "Run context"
+  end
+
+  test "run deep view ignores context load messages when summary is unavailable" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{status: :running, run_summaries: []}
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-NO-SUMMARY-CONTEXT-MESSAGE")
+    send(view.pid, :load_context)
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Run unavailable" and rendered =~ "MT-NO-SUMMARY-CONTEXT-MESSAGE" and
+        not String.contains?(rendered, "Run context")
     end)
   end
 
@@ -4314,6 +4625,163 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     render_click(element(view, "button[phx-value-surface='prompt']"))
     assert_eventually(fn -> render(view) =~ "Surface unavailable for this event" end)
+  end
+
+  test "run deep view renders context cards independently and degrades context failures without hiding timeline or detail" do
+    manager_name = Module.concat(__MODULE__, RunLiveContextManager)
+    test_pid = self()
+
+    {:ok, port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/runs/MT-CONTEXT-LIVE/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-live-1",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "timeline survives context",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-LIVE/context" ->
+          send(test_pid, {:stub_request, "context", "MT-CONTEXT-LIVE"})
+
+          {200,
+           %{
+             anchor: %{session_id: "thread-live-turn-4", thread_id: "thread-live", turn_id: "turn-4", turn_count: 4},
+             conversation: %{
+               items: [
+                 %{event_id: "evt-live-ctx-3", kind: "user_input_request", label: "tool input request", text: "Continue?"}
+               ],
+               truncated: false
+             },
+             continuation: %{status: "checking_recheck", label: "checking recheck", event_id: "evt-live-ctx-2"},
+             tools: %{items: [%{event_id: "evt-live-ctx-4", tool: "shell", status: "completed", summary: "dynamic tool call completed (shell)"}]},
+             shell: %{items: [%{event_id: "evt-live-ctx-5", kind: "exec_command", text: "git status --short"}]},
+             subagents: %{items: [], status: "none_observed"}
+           }}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-LIVE/events/evt-live-1" ->
+          {200, run_live_detail_payload("evt-live-1")}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-DOWN-LIVE/timeline" ->
+          {200,
+           %{
+             items: [
+               %{
+                 event_id: "evt-live-down",
+                 timestamp: "2026-05-14T02:01:00Z",
+                 source: "codex",
+                 event_group: "turn",
+                 summary: "timeline still visible",
+                 event_type: "turn_completed",
+                 status_markers: []
+               }
+             ],
+             next_cursor: nil
+           }}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-DOWN-LIVE/context" ->
+          send(test_pid, {:stub_request, "context", "MT-CONTEXT-DOWN-LIVE"})
+          {503, %{error: %{code: "context_unavailable", message: "context down"}}}
+
+        "GET", "/api/v1/runs/MT-CONTEXT-DOWN-LIVE/events/evt-live-down" ->
+          {200, run_live_detail_payload("evt-live-down")}
+      end)
+
+    start_supervised!({WorkerPortManagerStub, name: manager_name, worker_ports: %{"alpha" => port}})
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-CONTEXT-LIVE", title: "Context ready", linear_state: "In Progress"},
+                %{issue_identifier: "MT-CONTEXT-DOWN-LIVE", title: "Context down", linear_state: "In Progress"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, view, _html} = live(build_conn(), "/projects/alpha/runs/MT-CONTEXT-LIVE")
+    assert_receive {:stub_request, "context", "MT-CONTEXT-LIVE"}
+
+    assert_eventually(fn ->
+      rendered = render(view)
+
+      rendered =~ "Context ready" and
+        rendered =~ "timeline survives context" and
+        rendered =~ "Thread &amp; Turn" and
+        rendered =~ "session: thread-live-turn-4" and
+        rendered =~ "thread: thread-live" and
+        rendered =~ "turn: turn-4" and
+        rendered =~ "turn_count: 4" and
+        rendered =~ "Recent interaction signals" and
+        rendered =~ "tool input request" and
+        rendered =~ "Continue?" and
+        rendered =~ "Continuation &amp; Retry" and
+        rendered =~ "checking recheck" and
+        rendered =~ "event_id: evt-live-ctx-2" and
+        rendered =~ "Open detail: evt-live-ctx-2" and
+        rendered =~ "Tools &amp; Shell" and
+        rendered =~ "dynamic tool call completed (shell)" and
+        rendered =~ "Open detail: evt-live-ctx-4" and
+        rendered =~ "Open detail: evt-live-ctx-5" and
+        rendered =~ "git status --short" and
+        rendered =~ "Sub-agent" and
+        rendered =~ "none observed"
+    end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-live-ctx-2']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "event_id: evt-live-ctx-2"
+    end)
+
+    render_click(element(view, "button[phx-value-event_id='evt-live-1']"))
+
+    assert_eventually(fn ->
+      rendered = render(view)
+      rendered =~ "event_id: evt-live-1" and rendered =~ "shell summary: git status --short"
+    end)
+
+    {:ok, down_view, _html} = live(build_conn(), "/projects/alpha/runs/MT-CONTEXT-DOWN-LIVE")
+    assert_receive {:stub_request, "context", "MT-CONTEXT-DOWN-LIVE"}
+
+    assert_eventually(fn ->
+      rendered = render(down_view)
+
+      rendered =~ "Context down" and
+        rendered =~ "timeline still visible" and
+        rendered =~ "Context unavailable" and
+        not String.contains?(rendered, "Run unavailable")
+    end)
+
+    render_click(element(down_view, "button[phx-value-event_id='evt-live-down']"))
+
+    assert_eventually(fn ->
+      rendered = render(down_view)
+      rendered =~ "event_id: evt-live-down" and rendered =~ "timeline still visible"
+    end)
   end
 
   test "run deep view renders empty detail summaries as n/a and preview fallback text" do
