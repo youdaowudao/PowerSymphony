@@ -37,14 +37,18 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 
 Current workflow principles are intentionally stricter than the older multi-reviewer defaults:
 
-- implementation now defaults to a `1+2` collaboration model: one main thread, one implementation
-  subagent, and one zero-context reviewer
-- the document phase must leave a fixed output, then enter `spec freeze`; after that, only one
+- implementation now follows a stage-role model rather than a fixed headcount model
+- the standard role vocabulary is `blue analyst`, `red analyst`, `implementer`,
+  `contract checker`, and `final zero-context reviewer`
+- the document phase must leave a frozen artifact, then enter `spec freeze`; after that, only one
   reviewer-triggered focused recheck is allowed
-- `Change Review` and `Push Readiness` are separate reviewer outputs; `Push Readiness` only states
+- when a task hits `观察层合同风险`, the default closeout order is `implementer ->
+  contract checker -> baseline lock -> heavy validation -> final zero-context reviewer`
+- `Change Review` and `Push Readiness` stay separate reviewer outputs; `Push Readiness` only states
   whether the next push is allowed and what minimum proof is still missing
-- the live execution board stays only in Linear issue body `## Codex Workpad`, including `Status Board`
-  and `Flow Metrics`; repo docs define the boundary but do not mirror live values
+- the live execution board stays only in Linear issue body `## Codex Workpad`, including role
+  coverage, `Baseline Lock`, `blocker ledger`, `Status Board`, and `Flow Metrics`; repo docs define
+  the boundary but do not mirror live values
 - in-flight risk gates are conditional, not universal; they trigger only when the diff hits riskier
   paths such as typed/core, integration, state-machine, concurrency, or similar boundaries
 
@@ -234,10 +238,15 @@ Choose the validation command based on the current `git diff`.
   `4000`; use another free port such as `4100`, `4123`, or `4311`.
 - Current repo-level coverage gate is `99%`.
 - Current time-sensitive test baseline is `8000ms`.
-- Before opening a PR or updating an existing PR, run a closeout gate with format check, lint,
-  and targeted tests for the touched area. Every test command must carry an explicit
-  `SYMPHONY_TEST_MAX_CASES` value. For docs-only diffs, still run the closeout gate, but targeted
-  tests may be omitted when there is no executable coverage tied to the change.
+- Before opening a PR or updating an existing PR, determine `Next Push Gate` from the cumulative
+  diff that the branch / PR head will have against PR base after the push.
+  - If that cumulative diff hits `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or
+    `SPEC.md`, local `make all` is the hard pre-push gate.
+  - Otherwise use the closeout gate with format check, lint, and targeted tests for the touched
+    area.
+  - For docs-only diffs, targeted tests may be omitted when there is no executable coverage tied
+    to the change, but this does not weaken the full-gate rule above.
+  - Every test command must carry an explicit `SYMPHONY_TEST_MAX_CASES` value.
 - For ordinary local milestone checks or pre-PR self-checks, prefer:
 
 ```bash
@@ -245,9 +254,10 @@ cd elixir
 SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix test test/some_targeted_test.exs
 ```
 
-- `make all` is not a daily development command and is not a reproduction tool. Use it only as
-  final confirmation for major fixes, high-risk changes, or after CI has failed and you have already
-  finished local targeted investigation and repair.
+- `make all` is not a daily development command and is not a reproduction tool. It is the required
+  local hard gate whenever a PR create/update push hits the full-gate paths above, and it is also
+  used after CI has failed once the repair is complete and the next push still falls on the
+  full-gate path.
 - If CI fails, read the CI error first, run targeted local checks next, fix the problem, and only
   after the fix is complete run local `make all` once for final confirmation:
 
@@ -256,7 +266,7 @@ cd elixir
 SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all
 ```
 
-- GitHub Actions remains the authoritative remote full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`.
+- GitHub Actions remains the authoritative remote full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`, but the matching local `make all` hard gate must run before the PR create/update push.
 
 Heavy tests and `make all` must be monitored for memory growth, swap growth, CPU saturation that
 does not recover, abnormal subprocess/port/worker growth, and signs of system lag or loss of
