@@ -165,7 +165,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       ])
 
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
-    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "crash"})})
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("exit 1")})
 
     assert {:error, :start_failed} = ProjectProcessManager.start_project(manager_name, "alpha")
 
@@ -954,12 +954,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     start_supervised!(
       {ProjectProcessManager,
        name: manager_name,
-       command_builder:
-         fake_worker_builder(%{
-           "alpha" => "normal",
-           "beta" => "normal",
-           "gamma" => "crash"
-         })}
+       command_builder: fn entry ->
+         case entry.project_id do
+           "alpha" -> fake_worker_builder(%{"alpha" => "normal"}).(entry)
+           "beta" -> fake_worker_builder(%{"beta" => "normal"}).(entry)
+           "gamma" -> "exit 1"
+         end
+       end}
     )
 
     assert {:ok, _} = ProjectProcessManager.start_project(manager_name, "alpha")
@@ -1235,6 +1236,10 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
+    assert_eventually(fn ->
+      fetch_display_entry!(manager_name, "alpha").runtime_state.run_summaries != []
+    end)
+
     running_entry = fetch_display_entry!(manager_name, "alpha")
     assert running_entry.runtime_state.run_summaries != []
 
@@ -1274,6 +1279,8 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       fetch_display_entry!(manager_name, "alpha").runtime_state.run_summaries != []
     end)
 
+    display_entry = fetch_display_entry!(manager_name, "alpha")
+    assert display_entry.runtime_state.run_summaries != []
     assert_eventually(fn -> state_request_logged?(request_log) end)
   end
 
@@ -1292,13 +1299,231 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
+    assert_eventually(fn ->
+      match?([_summary], fetch_display_entry!(manager_name, "alpha").runtime_state.run_summaries)
+    end)
+
     entry = fetch_display_entry!(manager_name, "alpha")
     assert entry.runtime_state.status == :running
-
     [summary] = entry.runtime_state.run_summaries
     assert summary.issue_identifier == "MT-PPM-1"
     assert summary.turn_count == 3
     assert %DateTime{} = summary.last_event_at
+    assert summary.attention_items == []
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+  end
+
+  test "display registry derives blocker and blocked-children attention from worker run summaries" do
+    test_root = temp_root!("display-derives-dependency-attention")
+    manager_name = Module.concat(__MODULE__, DependencyAttentionManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "dependency_attention"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    assert_eventually(fn ->
+      summaries =
+        manager_name
+        |> fetch_display_entry!("alpha")
+        |> then(& &1.runtime_state.run_summaries)
+        |> Enum.sort_by(& &1.issue_identifier)
+
+      match?(
+        [%{issue_identifier: "MT-CHILD-1"}, %{issue_identifier: "MT-ROOT-1"}],
+        summaries
+      )
+    end)
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    summaries = Enum.sort_by(entry.runtime_state.run_summaries, & &1.issue_identifier)
+    assert [%{issue_identifier: "MT-CHILD-1"}, %{issue_identifier: "MT-ROOT-1"}] = summaries
+
+    root_summary = Enum.find(summaries, &(&1.issue_identifier == "MT-ROOT-1"))
+    assert root_summary.health == "normal"
+
+    assert [%{issue_identifier: "MT-BLOCKER-1", linear_state: "In Progress"}] = root_summary.blocked_by
+    assert [%{issue_identifier: "MT-CHILD-1", linear_state: "Todo", url: "https://linear.app/acme/issue/MT-CHILD-1"}] = root_summary.blocks
+
+    assert Enum.any?(
+             root_summary.attention_items,
+             &(&1.kind == "blocked_by" and String.contains?(&1.message, "MT-BLOCKER-1"))
+           )
+
+    assert Enum.any?(
+             root_summary.attention_items,
+             &(&1.kind == "blocks" and String.contains?(&1.message, "MT-CHILD-1"))
+           )
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+  end
+
+  test "display registry ignores terminal blockers for blocker attention" do
+    test_root = temp_root!("display-ignores-terminal-blockers")
+    manager_name = Module.concat(__MODULE__, TerminalBlockerAttentionManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "terminal_blocker_attention"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    [summary] = entry.runtime_state.run_summaries
+    assert summary.issue_identifier == "MT-TERMINAL-1"
+    assert [%{issue_identifier: "MT-DONE-1", linear_state: "Done"}] = summary.blocked_by
+    refute Enum.any?(summary.attention_items, &(&1.kind == "blocked_by"))
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+  end
+
+  test "display registry does not promote slow worker summaries into attention" do
+    test_root = temp_root!("display-does-not-promote-slow-health")
+    manager_name = Module.concat(__MODULE__, SlowHealthAttentionManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "slow_health_attention"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    [summary] = entry.runtime_state.run_summaries
+    assert summary.issue_identifier == "MT-SLOW-1"
+    assert summary.health == "slow"
+    assert summary.attention_items == []
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+  end
+
+  test "display registry derives fallback health attention and keeps malformed dependency placeholders stable" do
+    test_root = temp_root!("display-derives-fallback-health-attention")
+    manager_name = Module.concat(__MODULE__, FallbackHealthAttentionManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "fallback_health_attention"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    assert_eventually(fn ->
+      summaries =
+        manager_name
+        |> fetch_display_entry!("alpha")
+        |> then(& &1.runtime_state.run_summaries)
+        |> Map.new(&{&1.issue_identifier, &1})
+
+      Map.has_key?(summaries, "MT-TOOL-1") and Map.has_key?(summaries, "MT-PARENT-UNKNOWN-1")
+    end)
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    summaries = Map.new(entry.runtime_state.run_summaries, &{&1.issue_identifier, &1})
+
+    tool_summary = Map.fetch!(summaries, "MT-TOOL-1")
+    assert tool_summary.health == nil
+    assert tool_summary.run_status == "running"
+    assert Enum.any?(tool_summary.attention_items, &(&1.kind == "tool_blocked"))
+    assert [%{issue_identifier: nil, linear_state: "Todo", url: "https://linear.app/acme/issue/UNLABELED"}] = tool_summary.blocked_by
+    assert Enum.any?(tool_summary.attention_items, &(&1.kind == "blocked_by" and &1.message == "Current blockers are still unresolved."))
+
+    codex_summary = Map.fetch!(summaries, "MT-CODEX-1")
+    assert codex_summary.health == nil
+    assert codex_summary.run_status == "failed"
+    assert Enum.any?(codex_summary.attention_items, &(&1.kind == "codex_error"))
+
+    stalled_summary = Map.fetch!(summaries, "MT-STALL-1")
+    assert stalled_summary.health == nil
+    assert Enum.any?(stalled_summary.attention_items, &(&1.kind == "stalled"))
+
+    quiet_summary = Map.fetch!(summaries, "MT-QUIET-1")
+    assert quiet_summary.health == "quiet"
+    assert [%{issue_identifier: nil, linear_state: nil, url: "https://linear.app/acme/issue/QUIET-UNKNOWN"}] = quiet_summary.blocked_by
+    assert quiet_summary.attention_items == [%{kind: "blocked_by", message: "Current blockers are still unresolved."}]
+
+    parent_summary = Map.fetch!(summaries, "MT-PARENT-UNKNOWN-1")
+
+    assert [%{issue_identifier: "MT-BLOCKS-UNKNOWN-1", linear_state: "In Progress", url: "https://linear.app/acme/issue/MT-BLOCKS-UNKNOWN-1"}] =
+             parent_summary.blocks
+
+    assert Enum.any?(parent_summary.attention_items, &(&1.kind == "blocks" and &1.message == "Related blocked issues are still waiting: MT-BLOCKS-UNKNOWN-1."))
+
+    assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
+  end
+
+  test "display registry covers approval pending, possible stall, generic blocked children, and mixed terminal states" do
+    test_root = temp_root!("display-edge-case-attention")
+    manager_name = Module.concat(__MODULE__, EdgeCaseAttentionManager)
+    port = reserve_tcp_port!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: 10_000)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "edge_case_attention"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    entry = fetch_display_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+
+    summaries = entry.runtime_state.run_summaries
+
+    approval_summary = Enum.find(summaries, &(&1.issue_identifier == "MT-APPROVAL-1"))
+    assert approval_summary.health == nil
+    assert approval_summary.attention_items == [%{kind: "needs_attention", message: "Run requires manual follow-up."}]
+
+    possible_summary = Enum.find(summaries, &(&1.issue_identifier == "MT-POSSIBLE-1"))
+    assert possible_summary.health == nil
+    assert possible_summary.attention_items == [%{kind: "possibly_stalled", message: "Run may be stalled and needs a closer look."}]
+
+    parent_summary = Enum.find(summaries, &(&1.issue_identifier == "MT-PARENT-GENERIC-1"))
+
+    assert [%{issue_identifier: nil, linear_state: "Todo", url: "https://linear.app/acme/issue/UNLABELED-CHILD"}] =
+             parent_summary.blocks
+
+    assert parent_summary.attention_items == [%{kind: "blocks", message: "Related blocked issues are still waiting."}]
+
+    approval_only_summary = Enum.find(summaries, &(&1.issue_identifier == nil and &1.approval_pending == true))
+    assert approval_only_summary.attention_items == [%{kind: "needs_attention", message: "Run requires manual follow-up."}]
+
+    integer_only_summary = Enum.find(summaries, &(is_nil(&1.issue_identifier) and &1.turn_count == 7))
+    assert integer_only_summary.attention_items == []
 
     assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
   end
@@ -1329,10 +1554,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-503"}])
     end)
 
-    entry = fetch_display_entry!(manager_name, "alpha")
-    assert entry.runtime_state.status == :running
-    assert entry.runtime_state.run_summaries == []
-    assert_eventually(fn -> state_request_logged?(request_log) end)
+    assert_eventually(fn ->
+      entry = fetch_display_entry!(manager_name, "alpha")
+
+      entry.runtime_state.status == :running and
+        entry.runtime_state.run_summaries == [] and
+        state_request_logged?(request_log)
+    end)
   end
 
   test "worker state timeout clears stale run summaries" do
@@ -1361,10 +1589,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-TIMEOUT"}])
     end)
 
-    entry = fetch_display_entry!(manager_name, "alpha")
-    assert entry.runtime_state.status == :running
-    assert entry.runtime_state.run_summaries == []
-    assert_eventually(fn -> state_request_logged?(request_log) end)
+    assert_eventually(fn ->
+      entry = fetch_display_entry!(manager_name, "alpha")
+
+      entry.runtime_state.status == :running and
+        entry.runtime_state.run_summaries == [] and
+        state_request_logged?(request_log)
+    end)
   end
 
   test "runtime reload does not restore persisted run summaries" do
@@ -1730,6 +1961,60 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     end)
   end
 
+  test "display registry keeps atom runtime fields and treats non-binary terminal blockers as unresolved" do
+    test_root = temp_root!("display-runtime-atom-fields")
+    manager_name = Module.concat(__MODULE__, DisplayRuntimeAtomFieldsManager)
+    port = reserve_tcp_port!()
+    event_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+
+    start_supervised!({
+      ProjectProcessManager,
+      name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "nonbinary_blocker_attention"})
+    })
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    inject_runtime!(manager_name, "alpha", fn runtime_state ->
+      runtime_state
+      |> Map.put(:status, :running)
+      |> Map.put(:started_at, event_at)
+      |> Map.put(:last_seen_at, event_at)
+      |> Map.put(:last_health_check_at, event_at)
+      |> Map.put(:health_status, :healthy)
+    end)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :running
+    assert entry.runtime_state.started_at == event_at
+    assert entry.runtime_state.last_seen_at == event_at
+    assert entry.runtime_state.last_health_check_at == event_at
+    assert entry.runtime_state.health_status == :healthy
+
+    assert_eventually(fn ->
+      match?(
+        [%{issue_identifier: "MT-NONBINARY-BLOCKER-1"}],
+        manager_name
+        |> fetch_display_entry!("alpha")
+        |> then(& &1.runtime_state.run_summaries)
+      )
+    end)
+
+    display_entry = fetch_display_entry!(manager_name, "alpha")
+    assert display_entry.runtime_state.status == :running
+    [summary] = display_entry.runtime_state.run_summaries
+
+    assert summary.attention_items == [
+             %{kind: "blocked_by", message: "Current blockers are still unresolved: MT-ACTIVE-1, MT-DONE-NONBINARY."}
+           ]
+  end
+
   test "default command builder quotes generated workflow paths" do
     test_root = temp_root!("default-command-builder 'quoted'")
     manager_name = Module.concat(__MODULE__, DefaultCommandBuilderManager)
@@ -1938,6 +2223,41 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert entry.runtime_state.exit_reason == "worker exited with status 61"
 
     kill_pid(os_pid)
+  end
+
+  test "startup reports start_failed when worker pid dies before port closes" do
+    test_root = temp_root!("startup-dead-pid-open-port")
+    manager_name = Module.concat(__MODULE__, StartupDeadPidOpenPortManager)
+    port = reserve_tcp_port!()
+    runtime_dir = control_plane_runtime_dir(test_root, "alpha")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: raw_command_builder("sleep 5")})
+
+    manager_pid = GenServer.whereis(manager_name)
+    existing_ports = :erlang.ports()
+    task = Task.async(fn -> ProjectProcessManager.start_project(manager_name, "alpha") end)
+    os_pid = await_worker_pid!(runtime_dir)
+    startup_port = await_port_for_os_pid!(existing_ports, os_pid)
+
+    kill_pid(os_pid)
+
+    Task.start(fn ->
+      Process.sleep(100)
+      send(manager_pid, {startup_port, {:exit_status, 62}})
+    end)
+
+    assert {:error, :start_failed} = Task.await(task, 3_000)
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.runtime_state.status == :start_failed
+    assert entry.runtime_state.exit_code in [62, 137]
+    assert entry.runtime_state.exit_reason == "worker exited with status #{entry.runtime_state.exit_code}"
   end
 
   test "stops a hang worker and clears runtime resources" do

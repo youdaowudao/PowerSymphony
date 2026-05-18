@@ -599,6 +599,18 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["running"] |> List.first() |> Map.fetch!("last_event_at"),
                  "run_duration_seconds" => 0,
                  "last_error" => nil,
+                 "issue_url" => "https://example.org/issues/MT-HTTP",
+                 "blocked_by" => [
+                   %{
+                     "issue_identifier" => "MT-BLOCKER-1",
+                     "title" => "HTTP blocker",
+                     "linear_state" => "In Progress",
+                     "url" => "https://example.org/issues/MT-BLOCKER-1"
+                   }
+                 ],
+                 "run_status" => "running",
+                 "approval_pending" => true,
+                 "tool_failure" => false,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -643,6 +655,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "linear_state" => "In Progress",
                "current_phase" => "codex_reasoning",
                "current_action" => "reasoning summary streaming",
+               "run_status" => "running",
                "health" => "normal",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
@@ -759,6 +772,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-ALPHA-1",
           "title" => "Alpha task",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_editing_files",
           "current_action" => "Codex 正在修改文件",
           "health" => "normal",
@@ -768,7 +782,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 3,
           "last_event_at" => "2026-05-14T02:00:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -830,6 +847,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-ALPHA-1",
           "title" => "Alpha task",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_editing_files",
           "current_action" => "Codex 正在修改文件",
           "health" => "normal",
@@ -839,7 +857,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 3,
           "last_event_at" => "2026-05-14T02:00:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -891,6 +912,349 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert summary["title"] == "String keyed summary"
     assert summary["turn_count"] == nil
     assert summary["run_duration_seconds"] == nil
+  end
+
+  test "project summary preserves dependency and attention fields on run summaries" do
+    start_test_endpoint(
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-DEP-1",
+                  title: "Dependency summary",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "waiting for dependency",
+                  health: "needs_attention",
+                  blocked_by: [
+                    %{issue_identifier: "MT-BLOCKER-1", title: "Blocker one", linear_state: "In Progress"}
+                  ],
+                  blocks: [
+                    %{issue_identifier: "MT-BLOCKED-1", title: "Blocked child", linear_state: "Todo"}
+                  ],
+                  attention_items: [
+                    %{kind: "needs_attention", message: "Run requires manual follow-up."}
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    [summary] = detail["project"]["run_summaries"]
+
+    assert summary["blocked_by"] == [
+             %{
+               "issue_identifier" => "MT-BLOCKER-1",
+               "title" => "Blocker one",
+               "linear_state" => "In Progress"
+             }
+           ]
+
+    assert summary["blocks"] == [
+             %{
+               "issue_identifier" => "MT-BLOCKED-1",
+               "title" => "Blocked child",
+               "linear_state" => "Todo"
+             }
+           ]
+
+    assert summary["attention_items"] == [
+             %{
+               "kind" => "needs_attention",
+               "message" => "Run requires manual follow-up."
+             }
+           ]
+  end
+
+  test "project summary keeps blocker attention even when health is normal" do
+    test_root = temp_root!("project-summary-blocker-attention-normal-health")
+    manager_name = Module.concat(__MODULE__, BlockerAttentionNormalHealthManager)
+    port = reserve_tcp_port!()
+
+    alpha_project = project_fixture(test_root, "alpha", port)
+    config_path = write_projects_config!(test_root, [alpha_project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    {:ok, stub_port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/state" ->
+          {200,
+           %{
+             running: [
+               %{
+                 issue_identifier: "MT-BLOCKED-NORMAL-1",
+                 title: "Blocked but healthy-looking summary",
+                 linear_state: "In Progress",
+                 current_phase: "codex_reasoning",
+                 current_action: "working",
+                 health: "normal",
+                 blocked_by: [
+                   %{issue_identifier: "MT-BLOCKER-1", title: "Blocker one", linear_state: "In Progress"}
+                 ]
+               }
+             ]
+           }}
+      end)
+
+    File.write!(
+      config_path,
+      """
+      projects:
+        - id: "alpha"
+          name: "Alpha"
+          workflow_generated: "#{alpha_project.workflow_generated}"
+          workspace_root: "#{alpha_project.workspace_root}"
+          logs_root: "#{alpha_project.logs_root}"
+          enabled: true
+          worker_port: #{stub_port}
+      """
+    )
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    :sys.replace_state(manager_name, fn state ->
+      runtime_state =
+        state.runtimes
+        |> Map.fetch!("alpha")
+        |> Map.merge(%{status: :running, worker_port: stub_port})
+
+      %{state | runtimes: Map.put(state.runtimes, "alpha", runtime_state)}
+    end)
+
+    start_test_endpoint(runtime_mode: :control_plane, orchestrator: SymphonyElixir.ControlPlaneSnapshotServer)
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    [summary] = detail["project"]["run_summaries"]
+
+    assert Enum.any?(summary["attention_items"], &String.contains?(&1["message"], "MT-BLOCKER-1"))
+  end
+
+  test "project summary ignores terminal blockers for blocker attention" do
+    test_root = temp_root!("project-summary-terminal-blocker-attention")
+    manager_name = Module.concat(__MODULE__, TerminalBlockerAttentionManager)
+    port = reserve_tcp_port!()
+
+    alpha_project = project_fixture(test_root, "alpha", port)
+    config_path = write_projects_config!(test_root, [alpha_project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    {:ok, stub_port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/state" ->
+          {200,
+           %{
+             running: [
+               %{
+                 issue_identifier: "MT-BLOCKED-DONE-1",
+                 title: "Blocked by done summary",
+                 linear_state: "In Progress",
+                 current_phase: "codex_reasoning",
+                 current_action: "working",
+                 health: "normal",
+                 blocked_by: [
+                   %{issue_identifier: "MT-DONE-1", title: "Done blocker", linear_state: "Done"}
+                 ]
+               }
+             ]
+           }}
+      end)
+
+    File.write!(
+      config_path,
+      """
+      projects:
+        - id: "alpha"
+          name: "Alpha"
+          workflow_generated: "#{alpha_project.workflow_generated}"
+          workspace_root: "#{alpha_project.workspace_root}"
+          logs_root: "#{alpha_project.logs_root}"
+          enabled: true
+          worker_port: #{stub_port}
+      """
+    )
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    :sys.replace_state(manager_name, fn state ->
+      runtime_state =
+        state.runtimes
+        |> Map.fetch!("alpha")
+        |> Map.merge(%{status: :running, worker_port: stub_port})
+
+      %{state | runtimes: Map.put(state.runtimes, "alpha", runtime_state)}
+    end)
+
+    start_test_endpoint(runtime_mode: :control_plane, orchestrator: SymphonyElixir.ControlPlaneSnapshotServer)
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    [summary] = detail["project"]["run_summaries"]
+
+    refute Enum.any?(summary["attention_items"], &String.contains?(&1["message"], "MT-DONE-1"))
+  end
+
+  test "project summary does not promote slow health into attention" do
+    start_test_endpoint(
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-SLOW-1",
+                  title: "Slow but not attention-worthy summary",
+                  linear_state: "In Progress",
+                  current_phase: "codex_reasoning",
+                  current_action: "still thinking",
+                  health: "slow",
+                  blocked_by: [],
+                  blocks: []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    [summary] = detail["project"]["run_summaries"]
+
+    assert summary["attention_items"] == []
+  end
+
+  test "project summary derives dependency and attention fields from project process manager worker state" do
+    test_root = temp_root!("project-summary-derived-run-relationships")
+    manager_name = Module.concat(__MODULE__, DerivedRunRelationshipsManager)
+    port = reserve_tcp_port!()
+
+    alpha_project = project_fixture(test_root, "alpha", port)
+    config_path = write_projects_config!(test_root, [alpha_project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    {:ok, stub_port} =
+      start_stub_http_server(fn
+        "GET", "/api/v1/state" ->
+          {200,
+           %{
+             running: [
+               %{
+                 issue_identifier: "MT-ROOT-1",
+                 title: "Root run",
+                 issue_url: "https://linear.app/example/issue/MT-ROOT-1",
+                 linear_state: "In Progress",
+                 current_phase: "codex_waiting_next_event",
+                 current_action: "waiting for blocker",
+                 health: "needs_attention",
+                 blocked_by: [
+                   %{
+                     issue_identifier: "MT-BLOCKER-1",
+                     title: "Blocker one",
+                     linear_state: "In Progress",
+                     url: "https://linear.app/example/issue/MT-BLOCKER-1"
+                   }
+                 ]
+               },
+               %{
+                 issue_identifier: "MT-CHILD-1",
+                 title: "Child run",
+                 issue_url: "https://linear.app/example/issue/MT-CHILD-1",
+                 linear_state: "Todo",
+                 current_phase: "retry_scheduled",
+                 current_action: "queued behind root",
+                 health: "normal",
+                 blocked_by: [
+                   %{
+                     issue_identifier: "MT-ROOT-1",
+                     title: "Root run",
+                     linear_state: "In Progress",
+                     url: "https://linear.app/example/issue/MT-ROOT-1"
+                   }
+                 ]
+               }
+             ]
+           }}
+      end)
+
+    File.write!(
+      config_path,
+      """
+      projects:
+        - id: "alpha"
+          name: "Alpha"
+          workflow_generated: "#{alpha_project.workflow_generated}"
+          workspace_root: "#{alpha_project.workspace_root}"
+          logs_root: "#{alpha_project.logs_root}"
+          enabled: true
+          worker_port: #{stub_port}
+      """
+    )
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    :sys.replace_state(manager_name, fn state ->
+      runtime_state =
+        state.runtimes
+        |> Map.fetch!("alpha")
+        |> Map.merge(%{status: :running, worker_port: stub_port})
+
+      %{state | runtimes: Map.put(state.runtimes, "alpha", runtime_state)}
+    end)
+
+    start_test_endpoint(runtime_mode: :control_plane, orchestrator: SymphonyElixir.ControlPlaneSnapshotServer)
+
+    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    [root_summary, child_summary] = detail["project"]["run_summaries"]
+
+    assert root_summary["issue_identifier"] == "MT-ROOT-1"
+
+    assert root_summary["blocked_by"] == [
+             %{
+               "issue_identifier" => "MT-BLOCKER-1",
+               "title" => "Blocker one",
+               "linear_state" => "In Progress",
+               "url" => "https://linear.app/example/issue/MT-BLOCKER-1"
+             }
+           ]
+
+    assert root_summary["blocks"] == [
+             %{
+               "issue_identifier" => "MT-CHILD-1",
+               "title" => "Child run",
+               "linear_state" => "Todo",
+               "url" => "https://linear.app/example/issue/MT-CHILD-1"
+             }
+           ]
+
+    assert Enum.any?(root_summary["attention_items"], &(&1["message"] == "Run requires manual follow-up."))
+    assert Enum.any?(root_summary["attention_items"], &String.contains?(&1["message"], "MT-BLOCKER-1"))
+
+    assert child_summary["issue_identifier"] == "MT-CHILD-1"
+    assert child_summary["blocks"] == []
   end
 
   test "projects api reads dynamic runtime state from project process manager" do
@@ -950,6 +1314,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-CP-RUN-1",
           "title" => "Fake worker summary",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_reasoning",
           "current_action" => "reasoning summary streaming",
           "health" => "normal",
@@ -959,7 +1324,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 7,
           "last_event_at" => "2026-05-12T00:08:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -982,6 +1350,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-CP-RUN-1",
           "title" => "Fake worker summary",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_reasoning",
           "current_action" => "reasoning summary streaming",
           "health" => "normal",
@@ -991,7 +1360,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 7,
           "last_event_at" => "2026-05-12T00:08:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -1184,6 +1556,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-CP-RUN-1",
           "title" => "Fake worker summary",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_reasoning",
           "current_action" => "reasoning summary streaming",
           "health" => "normal",
@@ -1193,7 +1566,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 7,
           "last_event_at" => "2026-05-12T00:08:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -1254,6 +1630,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "issue_identifier" => "MT-CP-RUN-1",
           "title" => "Fake worker summary",
           "linear_state" => "In Progress",
+          "issue_url" => nil,
           "current_phase" => "codex_reasoning",
           "current_action" => "reasoning summary streaming",
           "health" => "normal",
@@ -1263,7 +1640,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           "turn_count" => 7,
           "last_event_at" => "2026-05-12T00:08:00Z",
           "run_duration_seconds" => 480,
-          "last_error" => nil
+          "last_error" => nil,
+          "blocked_by" => [],
+          "blocks" => [],
+          "attention_items" => []
         }
       ]
     )
@@ -3162,6 +3542,205 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Timeline"
     refute html =~ "Shell output"
     refute html =~ "Prompt"
+  end
+
+  test "run deep view renders dependency and attention panels" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-1",
+                  title: "Alpha task",
+                  issue_url: "https://linear.app/example/issue/MT-ALPHA-1",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_next_event",
+                  current_action: "waiting for blocker",
+                  health: "needs_attention",
+                  blocked_by: [
+                    %{
+                      issue_identifier: "MT-BLOCKER-1",
+                      title: "Blocker one",
+                      linear_state: "In Progress",
+                      url: "https://linear.app/example/issue/MT-BLOCKER-1"
+                    }
+                  ],
+                  blocks: [
+                    %{
+                      issue_identifier: "MT-BLOCKED-1",
+                      title: "Blocked child",
+                      linear_state: "Todo",
+                      url: "https://linear.app/example/issue/MT-BLOCKED-1"
+                    }
+                  ],
+                  attention_items: [
+                    %{kind: "needs_attention", message: "Run requires manual follow-up."}
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-1")
+    document = Floki.parse_document!(html)
+
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Blocked by"))
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "MT-BLOCKER-1"))
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Blocks"))
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "MT-BLOCKED-1"))
+    assert project_section_texts(document, "Attention") == ["Run requires manual follow-up."]
+
+    links =
+      document
+      |> find_section_by_title("Dependencies")
+      |> Floki.find("a.issue-link")
+      |> Enum.map(&Floki.attribute(&1, "href"))
+      |> List.flatten()
+
+    assert "https://linear.app/example/issue/MT-BLOCKER-1" in links
+    assert "https://linear.app/example/issue/MT-BLOCKED-1" in links
+  end
+
+  test "run deep view keeps dependency placeholders without identifiers visible" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-ALPHA-2",
+                  title: "Placeholder dependency task",
+                  issue_url: "https://linear.app/example/issue/MT-ALPHA-2",
+                  linear_state: "In Progress",
+                  current_phase: "codex_waiting_tool",
+                  current_action: "waiting for dependency placeholder",
+                  health: "tool_blocked",
+                  blocked_by: [
+                    %{
+                      title: "External blocker",
+                      linear_state: "Todo",
+                      url: "https://linear.app/example/issue/EXT-BLOCKER"
+                    }
+                  ],
+                  attention_items: [
+                    %{kind: "tool_blocked", message: "Run is blocked on a tool failure and needs manual follow-up."}
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-ALPHA-2")
+    document = Floki.parse_document!(html)
+
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "External blocker"))
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&String.contains?(&1, "Todo"))
+
+    links =
+      document
+      |> find_section_by_title("Dependencies")
+      |> Floki.find("a.issue-link")
+      |> Enum.map(&Floki.attribute(&1, "href"))
+      |> List.flatten()
+
+    assert "https://linear.app/example/issue/EXT-BLOCKER" in links
+  end
+
+  test "run deep view hides checking cooldown summaries from attention panel" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-CHECKING-1",
+                  title: "Checking task",
+                  linear_state: "Checking",
+                  current_phase: "checking_tracker_state",
+                  current_action: "bounded recheck queued",
+                  health: "normal",
+                  attention_items: []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-CHECKING-1")
+    document = Floki.parse_document!(html)
+    assert project_section_texts(document, "Attention") == ["No attention items."]
+  end
+
+  test "run deep view renders empty dependency and attention states" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{
+                  issue_identifier: "MT-CLEAR-1",
+                  title: "Clear task",
+                  linear_state: "In Progress",
+                  current_phase: "codex_reasoning",
+                  current_action: "active",
+                  health: "normal",
+                  blocked_by: [],
+                  blocks: [],
+                  attention_items: []
+                }
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha/runs/MT-CLEAR-1")
+    document = Floki.parse_document!(html)
+
+    assert project_section_texts(document, "Dependencies") |> Enum.any?(&(&1 == "No dependencies."))
+    assert project_section_texts(document, "Attention") == ["No attention items."]
   end
 
   test "run deep view ignores timeline load messages when summary is unavailable" do
@@ -5504,11 +6083,23 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           title: "HTTP issue",
+          issue_url: "https://example.org/issues/MT-HTTP",
           state: "In Progress",
           linear_state: "In Progress",
           current_phase: "codex_reasoning",
           current_action: "reasoning summary streaming",
           health: "normal",
+          run_status: "running",
+          approval_pending: true,
+          tool_failure: false,
+          blocked_by: [
+            %{
+              identifier: "MT-BLOCKER-1",
+              title: "HTTP blocker",
+              state: "In Progress",
+              url: "https://example.org/issues/MT-BLOCKER-1"
+            }
+          ],
           session_id: "thread-http",
           thread_id: "thread-http",
           turn_id: "turn-http",

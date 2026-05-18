@@ -41,6 +41,8 @@ defmodule SymphonyElixir.Linear.Client do
             issue {
               id
               identifier
+              title
+              url
               project {
                 id
                 slugId
@@ -94,6 +96,8 @@ defmodule SymphonyElixir.Linear.Client do
             issue {
               id
               identifier
+              title
+              url
               project {
                 id
                 slugId
@@ -576,6 +580,8 @@ defmodule SymphonyElixir.Linear.Client do
             %{
               id: blocker_issue["id"],
               identifier: blocker_issue["identifier"],
+              title: blocker_issue["title"],
+              url: blocker_issue["url"],
               state: get_in(blocker_issue, ["state", "name"]),
               project_id: get_in(blocker_issue, ["project", "id"]),
               project_slug: get_in(blocker_issue, ["project", "slugId"])
