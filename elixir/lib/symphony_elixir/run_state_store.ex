@@ -81,7 +81,7 @@ defmodule SymphonyElixir.RunStateStore do
       [entry] ->
         case Map.get(entry, :run_trace) do
           %RunTrace{} = trace ->
-            read_timeline(trace, opts)
+            read_timeline(trace, Keyword.put(opts, :running_entry, entry))
 
           _ ->
             {:error, :run_not_found}
@@ -244,6 +244,17 @@ defmodule SymphonyElixir.RunStateStore do
 
   defp events_for_generation(events, _running_entry), do: events
 
+  defp timeline_items_for_generation(items, %{run_instance_id: run_instance_id})
+       when is_binary(run_instance_id) and is_list(items) do
+    if Enum.any?(items, &is_binary(Map.get(&1, :run_instance_id))) do
+      Enum.filter(items, &(Map.get(&1, :run_instance_id) == run_instance_id))
+    else
+      items
+    end
+  end
+
+  defp timeline_items_for_generation(items, _running_entry), do: items
+
   defp hydrate_payload(event, nil), do: event
 
   defp hydrate_payload(event, %RunTrace{} = trace) do
@@ -333,9 +344,12 @@ defmodule SymphonyElixir.RunStateStore do
   end
 
   defp read_timeline(%RunTrace{} = trace, opts) do
-    case RunTrace.timeline(trace, opts) do
+    running_entry = Keyword.get(opts, :running_entry)
+    timeline_opts = Keyword.delete(opts, :running_entry)
+
+    case RunTrace.timeline(trace, timeline_opts) do
       {:ok, timeline} ->
-        {:ok, timeline}
+        {:ok, %{timeline | items: timeline_items_for_generation(timeline.items, running_entry)}}
 
       {:error, :invalid_cursor} ->
         {:error, :invalid_cursor}

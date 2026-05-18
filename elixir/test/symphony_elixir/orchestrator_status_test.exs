@@ -130,6 +130,103 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert summary.current_action == "retry scheduled"
   end
 
+  test "retry assigns a new run_instance_id for the next generation" do
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-new-run-generation-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(logs_root, "workspaces")
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    issue = %Issue{
+      id: "issue-retry-new-generation",
+      identifier: "MT-RETRY-GEN",
+      title: "Retry generation",
+      description: "Drive retry to the next generation",
+      state: "In Progress",
+      labels: []
+    }
+
+    try do
+      File.mkdir_p!(logs_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        max_concurrent_agents: 1
+      )
+
+      Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      orchestrator_name = Module.concat(__MODULE__, :RetryNewGenerationOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        File.rm_rf(logs_root)
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      retry_state =
+        initial_state
+        |> Map.put(:max_concurrent_agents, 1)
+        |> Map.put(:claimed, MapSet.new([issue.id]))
+        |> Orchestrator.schedule_issue_retry_for_test(issue.id, 1, %{
+          identifier: issue.identifier,
+          error: "retrying",
+          run_trace: trace,
+          run_instance_id: "run-old"
+        })
+
+      retry_token = retry_state.retry_attempts[issue.id].retry_token
+
+      :sys.replace_state(pid, fn _ -> retry_state end)
+
+      send(pid, {:retry_issue, issue.id, retry_token})
+
+      assert_eventually(fn ->
+        events = RawEventStore.list_events(trace)
+        dispatch_events = Enum.filter(events, &(&1["event_type"] in ["dispatch_started", "dispatch_accepted"]))
+
+        Enum.any?(dispatch_events, &(&1["run_instance_id"] != "run-old"))
+      end)
+
+      events = RawEventStore.list_events(trace)
+
+      assert Enum.any?(events, &(&1["event_type"] == "retry_scheduled" and &1["run_instance_id"] == "run-old"))
+
+      dispatch_run_instance_ids =
+        events
+        |> Enum.filter(&(&1["event_type"] in ["dispatch_started", "dispatch_accepted"]))
+        |> Enum.map(& &1["run_instance_id"])
+        |> Enum.uniq()
+
+      assert dispatch_run_instance_ids != []
+      refute "run-old" in dispatch_run_instance_ids
+
+      state = :sys.get_state(pid)
+      running_entry = state.running[issue.id]
+      assert is_map(running_entry)
+      assert running_entry.run_instance_id in dispatch_run_instance_ids
+
+      if Process.alive?(running_entry.pid) do
+        Process.exit(running_entry.pid, :shutdown)
+      end
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
   test "orchestrator traces accepted dispatch and normal worker exit retry flow" do
     logs_root =
       Path.join(
@@ -268,6 +365,110 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         if Process.alive?(running_entry.pid) do
           Process.exit(running_entry.pid, :shutdown)
         end
+      end
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
+  test "dispatch acceptance keeps claim, running entry, and trace in sync" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    logs_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestrator-dispatch-sync-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(logs_root, "workspaces")
+
+    issue = %Issue{
+      id: "issue-orch-dispatch-sync",
+      identifier: "MT-DISPATCH-SYNC",
+      title: "Dispatch sync trace",
+      description: "Keep claim, running entry, and trace aligned",
+      state: "In Progress",
+      labels: []
+    }
+
+    try do
+      File.mkdir_p!(logs_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        max_concurrent_agents: 1
+      )
+
+      Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      trace = RunTrace.start!(issue, logs_root: logs_root)
+      orchestrator_name = Module.concat(__MODULE__, :DispatchSyncOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        File.rm_rf(logs_root)
+      end)
+
+      initial_state = :sys.get_state(pid)
+      retry_token = make_ref()
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:max_concurrent_agents, 1)
+        |> Map.put(:claimed, MapSet.new([issue.id]))
+        |> Map.put(:retry_attempts, %{
+          issue.id => %{
+            attempt: 1,
+            timer_ref: nil,
+            retry_token: retry_token,
+            due_at_ms: System.monotonic_time(:millisecond) + 30_000,
+            identifier: issue.identifier,
+            error: "dispatching",
+            run_trace: trace,
+            run_instance_id: "run-before-dispatch"
+          }
+        })
+      end)
+
+      send(pid, {:retry_issue, issue.id, retry_token})
+
+      assert_eventually(fn ->
+        state = :sys.get_state(pid)
+        running_entry = state.running[issue.id]
+
+        is_map(running_entry) and is_binary(running_entry.run_instance_id) and
+          Enum.any?(RawEventStore.list_events(trace), &(&1["event_type"] == "dispatch_accepted"))
+      end)
+
+      state = :sys.get_state(pid)
+      running_entry = state.running[issue.id]
+      assert MapSet.member?(state.claimed, issue.id)
+      assert is_map(running_entry)
+      assert is_binary(running_entry.run_instance_id)
+      refute running_entry.run_instance_id == "run-before-dispatch"
+
+      dispatch_events =
+        trace
+        |> RawEventStore.list_events()
+        |> Enum.filter(&(&1["event_type"] in ["dispatch_started", "dispatch_accepted"]))
+
+      assert Enum.any?(dispatch_events, &(&1["event_type"] == "dispatch_started"))
+      assert Enum.any?(dispatch_events, &(&1["event_type"] == "dispatch_accepted"))
+
+      assert Enum.all?(dispatch_events, fn event ->
+               event["run_instance_id"] == running_entry.run_instance_id
+             end)
+
+      if Process.alive?(running_entry.pid) do
+        Process.exit(running_entry.pid, :shutdown)
       end
     after
       restore_app_env(:memory_tracker_issues, previous_memory_issues)

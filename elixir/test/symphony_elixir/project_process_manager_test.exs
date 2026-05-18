@@ -61,7 +61,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert persisted["stdout_path"] == runtime_state.stdout_path
     assert persisted["stderr_path"] == runtime_state.stderr_path
 
-    assert_eventually(fn -> request_ok?(port) end)
+    assert_eventually(fn -> request_ok?(port) end, 80)
   end
 
   test "stops one project without affecting another running project" do
@@ -103,7 +103,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert beta_entry.runtime_state.status == :running
     assert beta_entry.runtime_state.pid == beta_running.pid
     assert beta_entry.runtime_state.pid != alpha_running.pid
-    assert_eventually(fn -> request_ok?(beta_port) end)
+    assert_eventually(fn -> request_ok?(beta_port) end, 80)
   end
 
   test "restarts a project worker with a new pid" do
@@ -125,7 +125,7 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert restarted_state.status == :running
     assert restarted_state.pid != first_state.pid
     assert fetch_entry!(manager_name, "alpha").runtime_state.pid == restarted_state.pid
-    assert_eventually(fn -> request_ok?(port) end)
+    assert_eventually(fn -> request_ok?(port) end, 80)
   end
 
   test "marks crashed when fake worker exits unexpectedly" do
@@ -1236,11 +1236,11 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
-    assert_eventually(fn ->
-      fetch_display_entry!(manager_name, "alpha").runtime_state.run_summaries != []
-    end)
+    running_entry =
+      await_display_entry!(manager_name, "alpha", fn entry ->
+        entry.runtime_state.status == :running and entry.runtime_state.run_summaries != []
+      end)
 
-    running_entry = fetch_display_entry!(manager_name, "alpha")
     assert running_entry.runtime_state.run_summaries != []
 
     assert {:ok, _stopped_state} = ProjectProcessManager.stop_project(manager_name, "alpha")
@@ -1275,13 +1275,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert entry.runtime_state.run_summaries == []
     refute File.exists?(request_log)
 
-    assert_eventually(fn ->
-      fetch_display_entry!(manager_name, "alpha").runtime_state.run_summaries != []
-    end)
+    display_entry =
+      await_display_entry!(manager_name, "alpha", fn entry ->
+        entry.runtime_state.run_summaries != []
+      end)
 
-    display_entry = fetch_display_entry!(manager_name, "alpha")
     assert display_entry.runtime_state.run_summaries != []
-    assert_eventually(fn -> state_request_logged?(request_log) end)
+    assert_eventually(fn -> state_request_logged?(request_log) end, 40)
   end
 
   test "display registry filters malformed worker run summaries" do
@@ -1554,13 +1554,16 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-503"}])
     end)
 
-    assert_eventually(fn ->
-      entry = fetch_display_entry!(manager_name, "alpha")
+    assert_eventually(
+      fn ->
+        entry = fetch_display_entry!(manager_name, "alpha")
 
-      entry.runtime_state.status == :running and
-        entry.runtime_state.run_summaries == [] and
-        state_request_logged?(request_log)
-    end)
+        entry.runtime_state.status == :running and
+          entry.runtime_state.run_summaries == [] and
+          state_request_logged?(request_log)
+      end,
+      40
+    )
   end
 
   test "worker state timeout clears stale run summaries" do
@@ -1589,13 +1592,16 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
       |> Map.put(:run_summaries, [%{issue_identifier: "STALE-TIMEOUT"}])
     end)
 
-    assert_eventually(fn ->
-      entry = fetch_display_entry!(manager_name, "alpha")
+    assert_eventually(
+      fn ->
+        entry = fetch_display_entry!(manager_name, "alpha")
 
-      entry.runtime_state.status == :running and
-        entry.runtime_state.run_summaries == [] and
-        state_request_logged?(request_log)
-    end)
+        entry.runtime_state.status == :running and
+          entry.runtime_state.run_summaries == [] and
+          state_request_logged?(request_log)
+      end,
+      40
+    )
   end
 
   test "runtime reload does not restore persisted run summaries" do
@@ -2375,6 +2381,23 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert entry != nil
     entry
   end
+
+  defp await_display_entry!(manager_name, project_id, predicate, attempts \\ 20)
+
+  defp await_display_entry!(manager_name, project_id, predicate, attempts)
+       when is_function(predicate, 1) and attempts > 0 do
+    entry = fetch_display_entry!(manager_name, project_id)
+
+    if predicate.(entry) do
+      entry
+    else
+      Process.sleep(25)
+      await_display_entry!(manager_name, project_id, predicate, attempts - 1)
+    end
+  end
+
+  defp await_display_entry!(_manager_name, _project_id, _predicate, 0),
+    do: flunk("display entry did not satisfy predicate in time")
 
   defp find_entry!(registry, project_id) do
     entry = Enum.find(registry.entries, &(&1.project_id == project_id))

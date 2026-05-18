@@ -170,6 +170,29 @@ defmodule SymphonyElixir.M3PrecheckTest do
     assert result.capacity_queued_todos == []
   end
 
+  test "current work ignores current work entries without issue identifiers when matching issues" do
+    issue = %Issue{id: "issue-current-work-fallback", identifier: "MT-919A", title: "Fallback current work", state: "Todo", blocked_by: []}
+
+    result =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: 0,
+        current_work: %{
+          count: 1,
+          entries: [%{}]
+        },
+        terminal_states: ["Done"]
+      })
+
+    assert Enum.map(result.eligible, & &1.identifier) == ["MT-919A"]
+    assert result.dispatch == []
+    assert Enum.map(result.capacity_queued_todos, & &1.identifier) == ["MT-919A"]
+    assert result.blocked == %{}
+  end
+
   test "structural_errors_for_issue handles nil blockers fallback and project_id cross-project blockers" do
     no_blockers_issue = %Issue{id: "issue-no-blockers", identifier: "MT-920", state: "Todo", blocked_by: nil}
 
@@ -497,5 +520,61 @@ defmodule SymphonyElixir.M3PrecheckTest do
     assert integer_fallback_active_running_count.current_work == nil
     assert Enum.map(integer_fallback_active_running_count.dispatched_todos, & &1.identifier) == []
     assert Enum.map(integer_fallback_active_running_count.capacity_queued_todos, & &1.identifier) == ["MT-961"]
+  end
+
+  test "todo already present in current_work is not redispatched in the same round" do
+    issue = %Issue{
+      id: "issue-current-work",
+      identifier: "MT-C53-1",
+      title: "Already running",
+      state: "Todo",
+      blocked_by: []
+    }
+
+    result =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 2,
+        active_running_count: 1,
+        current_work: %{
+          count: 1,
+          entries: [%{issue_id: "issue-current-work", issue_identifier: "MT-C53-1", state: "In Progress"}]
+        },
+        terminal_states: ["Done"]
+      })
+
+    assert result.eligible_todos == []
+    assert result.dispatched_todos == []
+    assert result.capacity_queued_todos == []
+    assert result.blocked_todos["MT-C53-1"] == ["already present in current work: MT-C53-1"]
+  end
+
+  test "current_work does not block todo when both issue id and identifier are missing" do
+    issue = %Issue{
+      id: nil,
+      identifier: nil,
+      title: "Missing identifiers",
+      state: "Todo",
+      blocked_by: []
+    }
+
+    result =
+      SymphonyElixir.M3Precheck.run([issue], %{
+        current_project_slug: "alpha",
+        current_project_id: "project-alpha",
+        m3_enabled: true,
+        max_concurrent_agents: 1,
+        active_running_count: 0,
+        current_work: %{
+          count: 1,
+          entries: [%{issue_id: nil, issue_identifier: nil, state: "In Progress"}]
+        },
+        terminal_states: ["Done"]
+      })
+
+    refute Map.has_key?(result.blocked_todos, nil)
+    refute Enum.any?(Map.values(result.blocked_todos), &("already present in current work: " in &1))
   end
 end

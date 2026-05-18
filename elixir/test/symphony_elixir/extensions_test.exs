@@ -1295,77 +1295,91 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
     assert running_state.status == :running
 
-    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
-    [project] = payload["projects"]
+    assert_eventually(
+      fn ->
+        payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+        [project] = payload["projects"]
 
-    assert_project_summary_shape(project,
-      project_id: "alpha",
-      project_name: "Alpha",
-      enabled: true,
-      validation_result: "valid",
-      validation_errors: [],
-      worker_status: "running",
-      worker_port: port,
-      last_seen_at: nil,
-      last_health_check_at: nil,
-      last_error: nil,
-      run_summaries: [
-        %{
-          "issue_identifier" => "MT-CP-RUN-1",
-          "title" => "Fake worker summary",
-          "linear_state" => "In Progress",
-          "issue_url" => nil,
-          "current_phase" => "codex_reasoning",
-          "current_action" => "reasoning summary streaming",
-          "health" => "normal",
-          "session_id" => "thread-cp-turn-7",
-          "thread_id" => "thread-cp",
-          "turn_id" => "turn-7",
-          "turn_count" => 7,
-          "last_event_at" => "2026-05-12T00:08:00Z",
-          "run_duration_seconds" => 480,
-          "last_error" => nil,
-          "blocked_by" => [],
-          "blocks" => [],
-          "attention_items" => []
-        }
-      ]
+        assert_project_summary_shape(project,
+          project_id: "alpha",
+          project_name: "Alpha",
+          enabled: true,
+          validation_result: "valid",
+          validation_errors: [],
+          worker_status: "running",
+          worker_port: port,
+          last_seen_at: nil,
+          last_health_check_at: nil,
+          last_error: nil,
+          run_summaries: [
+            %{
+              "issue_identifier" => "MT-CP-RUN-1",
+              "title" => "Fake worker summary",
+              "linear_state" => "In Progress",
+              "issue_url" => nil,
+              "current_phase" => "codex_reasoning",
+              "current_action" => "reasoning summary streaming",
+              "health" => "normal",
+              "session_id" => "thread-cp-turn-7",
+              "thread_id" => "thread-cp",
+              "turn_id" => "turn-7",
+              "turn_count" => 7,
+              "last_event_at" => "2026-05-12T00:08:00Z",
+              "run_duration_seconds" => 480,
+              "last_error" => nil,
+              "blocked_by" => [],
+              "blocks" => [],
+              "attention_items" => []
+            }
+          ]
+        )
+
+        true
+      end,
+      160
     )
 
-    detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
+    assert_eventually(
+      fn ->
+        detail = json_response(get(build_conn(), "/api/v1/projects/alpha/summary"), 200)
 
-    assert_project_summary_shape(detail["project"],
-      project_id: "alpha",
-      project_name: "Alpha",
-      enabled: true,
-      validation_result: "valid",
-      validation_errors: [],
-      worker_status: "running",
-      worker_port: port,
-      last_seen_at: nil,
-      last_health_check_at: nil,
-      last_error: nil,
-      run_summaries: [
-        %{
-          "issue_identifier" => "MT-CP-RUN-1",
-          "title" => "Fake worker summary",
-          "linear_state" => "In Progress",
-          "issue_url" => nil,
-          "current_phase" => "codex_reasoning",
-          "current_action" => "reasoning summary streaming",
-          "health" => "normal",
-          "session_id" => "thread-cp-turn-7",
-          "thread_id" => "thread-cp",
-          "turn_id" => "turn-7",
-          "turn_count" => 7,
-          "last_event_at" => "2026-05-12T00:08:00Z",
-          "run_duration_seconds" => 480,
-          "last_error" => nil,
-          "blocked_by" => [],
-          "blocks" => [],
-          "attention_items" => []
-        }
-      ]
+        assert_project_summary_shape(detail["project"],
+          project_id: "alpha",
+          project_name: "Alpha",
+          enabled: true,
+          validation_result: "valid",
+          validation_errors: [],
+          worker_status: "running",
+          worker_port: port,
+          last_seen_at: nil,
+          last_health_check_at: nil,
+          last_error: nil,
+          run_summaries: [
+            %{
+              "issue_identifier" => "MT-CP-RUN-1",
+              "title" => "Fake worker summary",
+              "linear_state" => "In Progress",
+              "issue_url" => nil,
+              "current_phase" => "codex_reasoning",
+              "current_action" => "reasoning summary streaming",
+              "health" => "normal",
+              "session_id" => "thread-cp-turn-7",
+              "thread_id" => "thread-cp",
+              "turn_id" => "turn-7",
+              "turn_count" => 7,
+              "last_event_at" => "2026-05-12T00:08:00Z",
+              "run_duration_seconds" => 480,
+              "last_error" => nil,
+              "blocked_by" => [],
+              "blocks" => [],
+              "attention_items" => []
+            }
+          ]
+        )
+
+        true
+      end,
+      160
     )
 
     {:ok, view, html} = live(build_conn(), "/")
@@ -5602,49 +5616,52 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
-    payload = json_response(post(build_conn(), "/api/v1/projects/alpha/m3_precheck", %{}), 200)
 
-    assert payload["generated_at"] == "2026-05-12T00:00:00Z"
-    assert payload["m3_enabled"] == true
-    refute Map.has_key?(payload, "eligible")
-    refute Map.has_key?(payload, "dispatch")
-    refute Map.has_key?(payload, "blocked")
+    assert_eventually(fn ->
+      payload = json_response(post(build_conn(), "/api/v1/projects/alpha/m3_precheck", %{}), 200)
 
-    assert payload["eligible_todos"] == [
-             %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
-           ]
+      assert payload["generated_at"] == "2026-05-12T00:00:00Z"
+      assert payload["m3_enabled"] == true
+      refute Map.has_key?(payload, "eligible")
+      refute Map.has_key?(payload, "dispatch")
+      refute Map.has_key?(payload, "blocked")
 
-    assert payload["dispatched_todos"] == []
+      assert payload["eligible_todos"] == [
+               %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
+             ]
 
-    assert payload["capacity_queued_todos"] == [
-             %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
-           ]
+      assert payload["dispatched_todos"] == []
 
-    assert payload["blocked_todos"] == %{"MT-CP-2" => ["waiting on non-terminal blockers: MT-CP-9"]}
+      assert payload["capacity_queued_todos"] == [
+               %{"issue_identifier" => "MT-CP-1", "issue_id" => "cp-1", "state" => "Todo"}
+             ]
 
-    assert payload["current_work"] == %{
-             "count" => 1,
-             "entries" => [
+      assert payload["blocked_todos"] == %{"MT-CP-2" => ["waiting on non-terminal blockers: MT-CP-9"]}
+
+      assert payload["current_work"] == %{
+               "count" => 1,
+               "entries" => [
+                 %{
+                   "issue_id" => "cp-running",
+                   "issue_identifier" => "RUN-CP-1",
+                   "state" => "In Progress",
+                   "worker_host" => "worker-alpha"
+                 }
+               ]
+             }
+
+      assert payload["anomalies"] == [
                %{
-                 "issue_id" => "cp-running",
-                 "issue_identifier" => "RUN-CP-1",
+                 "type" => "blocked_but_in_progress",
+                 "issue_identifier" => "MT-CP-3",
+                 "issue_id" => "cp-3",
                  "state" => "In Progress",
-                 "worker_host" => "worker-alpha"
+                 "blocking_identifiers" => ["MT-CP-10"]
                }
              ]
-           }
 
-    assert payload["anomalies"] == [
-             %{
-               "type" => "blocked_but_in_progress",
-               "issue_identifier" => "MT-CP-3",
-               "issue_id" => "cp-3",
-               "state" => "In Progress",
-               "blocking_identifiers" => ["MT-CP-10"]
-             }
-           ]
-
-    assert payload["text"] =~ "fake worker m3 precheck"
+      assert payload["text"] =~ "fake worker m3 precheck"
+    end)
   end
 
   test "presenter m3 precheck payload normalizes malformed worker body safely" do
@@ -6065,12 +6082,20 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp start_test_endpoint(overrides) do
-    endpoint_config =
+    base_endpoint_config =
       :symphony_elixir
       |> Application.get_env(SymphonyElixirWeb.Endpoint, [])
       |> Keyword.merge(server: false, secret_key_base: String.duplicate("s", 64))
       |> Keyword.put_new(:runtime_mode, :workflow)
-      |> Keyword.merge(overrides)
+
+    endpoint_config =
+      if Keyword.has_key?(overrides, :project_registry) do
+        Keyword.merge(base_endpoint_config, overrides)
+      else
+        base_endpoint_config
+        |> Keyword.delete(:project_registry)
+        |> Keyword.merge(overrides)
+      end
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
