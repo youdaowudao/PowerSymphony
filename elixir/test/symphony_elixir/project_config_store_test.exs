@@ -3,7 +3,7 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
 
   alias SymphonyElixir.{ProjectConfig, ProjectConfigError, ProjectConfigStore}
 
-  @sample_config_path Path.expand("../../../symphony.projects.example.yaml", __DIR__)
+  @sample_config_path Path.expand("../../../bin/symphony.projects.example.yaml", __DIR__)
 
   setup do
     tmp_dir = create_tmp_dir()

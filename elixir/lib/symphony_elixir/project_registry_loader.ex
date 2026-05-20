@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ProjectRegistryLoader do
 
   alias SymphonyElixir.ProjectRegistry
 
-  @default_config_filename "symphony.projects.yaml"
+  @default_config_path Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
 
   @spec load() :: ProjectRegistry.t()
   def load do
@@ -28,7 +28,7 @@ defmodule SymphonyElixir.ProjectRegistryLoader do
         Path.expand(path)
 
       _ ->
-        path = Path.expand(@default_config_filename)
+        path = @default_config_path
         if File.regular?(path), do: path, else: nil
     end
   end

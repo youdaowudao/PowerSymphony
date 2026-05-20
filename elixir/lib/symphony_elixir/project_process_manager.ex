@@ -1097,7 +1097,15 @@ defmodule SymphonyElixir.ProjectProcessManager do
   end
 
   defp default_command_builder(%Entry{normalized_config: config}) do
-    "./bin/symphony --logs-root #{shell_escape(config.logs_root)} --port #{config.worker_port} #{shell_escape(config.workflow_generated)}"
+    token_bootstrap =
+      IO.iodata_to_binary([
+        "LINEAR_TOKEN_PATH=\"${HOME:-}/.config/linear/linear_api_key.token\"; ",
+        "if [ -z \"${LINEAR_API_KEY+x}\" ] && [ -r \"$LINEAR_TOKEN_PATH\" ] && [ -f \"$LINEAR_TOKEN_PATH\" ];",
+        " then LINEAR_API_KEY=\"$(tr -d '\\r' < \"$LINEAR_TOKEN_PATH\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')\"; ",
+        "export LINEAR_API_KEY; fi"
+      ])
+
+    "#{token_bootstrap}; exec ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails --logs-root #{shell_escape(config.logs_root)} --port #{config.worker_port} #{shell_escape(config.workflow_generated)}"
   end
 
   defp alive?(name) do

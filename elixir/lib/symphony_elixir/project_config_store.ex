@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.ProjectConfigStore do
   @moduledoc """
-  Loads static multi-project control-plane config from `symphony.projects.yaml`.
+  Loads static multi-project control-plane config from `bin/symphony.projects.yaml`.
   """
 
   alias SymphonyElixir.{PathSafety, ProjectConfig, ProjectConfigError}

@@ -2191,10 +2191,61 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     entry = fetch_entry!(manager_name, project_id)
     command = :sys.get_state(manager_name).command_builder.(entry)
 
-    assert command =~ "./bin/symphony --logs-root "
+    assert command =~
+             "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
+
+    assert command =~ "./bin/symphony "
+    assert command =~ "LINEAR_API_KEY"
+    assert command =~ ".config/linear/linear_api_key.token"
+    refute command =~ "then;"
     assert command =~ "--port #{port}"
+    assert command =~ "--logs-root "
     assert command =~ shell_escape(entry.normalized_config.logs_root)
     assert command =~ shell_escape(entry.normalized_config.workflow_generated)
+  end
+
+  test "default command builder bootstraps LINEAR_API_KEY from token file during real startup" do
+    test_root = temp_root!("default-command-builder token bootstrap")
+    manager_name = Module.concat(__MODULE__, DefaultCommandBuilderBootstrapManager)
+    port = reserve_tcp_port!()
+    project_id = "alpha"
+    previous_home = System.get_env("HOME")
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    home_dir = Path.join(test_root, "home")
+    token_dir = Path.join(home_dir, ".config/linear")
+    token_path = Path.join(token_dir, "linear_api_key.token")
+
+    on_exit(fn ->
+      if previous_home do
+        System.put_env("HOME", previous_home)
+      else
+        System.delete_env("HOME")
+      end
+
+      if previous_linear_api_key do
+        System.put_env("LINEAR_API_KEY", previous_linear_api_key)
+      else
+        System.delete_env("LINEAR_API_KEY")
+      end
+    end)
+
+    File.mkdir_p!(token_dir)
+    File.write!(token_path, "  bootstrap-token-from-file  \n")
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, project_id, port)
+      ])
+
+    System.put_env("HOME", home_dir)
+    System.delete_env("LINEAR_API_KEY")
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name})
+
+    assert {:ok, runtime_state} = ProjectProcessManager.start_project(manager_name, project_id)
+    assert runtime_state.status == :running
+    assert is_integer(runtime_state.pid)
+    assert_eventually(fn -> request_ok?(port) end, 200)
   end
 
   test "project registry reconciles dead in-memory workers as crashed" do

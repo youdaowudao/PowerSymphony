@@ -3,6 +3,7 @@ defmodule SymphonyElixir.ControlCLI do
   Entrypoint for the standalone Symphony control plane.
   """
 
+  @default_config_path Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
   @switches [config: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
@@ -30,7 +31,7 @@ defmodule SymphonyElixir.ControlCLI do
   def evaluate(args, deps \\ runtime_deps()) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
-        config_path = Keyword.get(opts, :config, "symphony.projects.yaml")
+        config_path = Keyword.get(opts, :config, @default_config_path)
 
         with :ok <- maybe_set_server_port(opts, deps) do
           run(config_path, deps)

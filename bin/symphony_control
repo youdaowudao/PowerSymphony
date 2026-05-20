@@ -37,7 +37,7 @@ while (($#)); do
 done
 
 if [[ "$HAS_CONFIG" -eq 0 ]]; then
-  ARGS=("--config" "$ROOT_DIR/symphony.projects.yaml" "${ARGS[@]}")
+  ARGS=("--config" "$ROOT_DIR/bin/symphony.projects.yaml" "${ARGS[@]}")
 fi
 
 cd "$ROOT_DIR/elixir"

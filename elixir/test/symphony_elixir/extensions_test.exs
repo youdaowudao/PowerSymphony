@@ -1397,8 +1397,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Alpha"
-    assert html =~ "running"
-    assert render(view) =~ "running"
+    assert html =~ "运行中"
+    assert render(view) =~ "运行中"
   end
 
   test "projects api projects unreachable when running worker times out and recovers after health resumes" do
@@ -3232,18 +3232,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "View details"
+    assert html =~ "<th>当前运行</th>"
+    assert html =~ "项目概览"
+    assert html =~ "项目现场"
     assert html =~ "/projects/alpha"
-    refute html =~ "线程状态"
-    refute html =~ "MT-ALPHA-1"
-    refute html =~ "Alpha task"
-    refute html =~ "codex_waiting_next_event"
-    refute html =~ "最近一段时间没有新事件"
-    refute html =~ "possibly_stalled"
+    refute html =~ "View details"
+    assert html =~ "1 条活跃运行。"
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "Alpha task"
+    assert html =~ "等待新事件"
+    assert html =~ "进行中 · 可能卡住"
+    assert html =~ "最近一段时间没有新事件"
+    assert html =~ "/projects/alpha/runs/MT-ALPHA-1"
+    assert html =~ "打开运行"
+    assert html =~ "9 轮 · 最近事件 2026-05-14T02:00:00Z · 960s"
     refute html =~ "thread-alpha"
     refute html =~ "turn-9"
     refute html =~ "thread-alpha-turn-9"
-    refute html =~ "960s"
     refute html =~ "tool_call_failed"
     refute html =~ "Recent events"
     refute html =~ "Prompt"
@@ -3251,7 +3256,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Timeline"
   end
 
-  test "control-plane dashboard exposes a clear entry to project detail pages" do
+  test "control-plane dashboard exposes clear human navigation links" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3260,6 +3265,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           %{
             project_id: "alpha",
             project_name: "Alpha",
+            normalized_config: %{worker_port: 4101},
             validation_result: :valid,
             validation_errors: [],
             runtime_state: %{status: :running}
@@ -3269,12 +3275,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "项目概览"
+    assert html =~ "项目现场"
+    assert html =~ "JSON 摘要"
+    assert html =~ "Worker 页面"
     assert html =~ "/projects/alpha"
-    assert html =~ "View details"
-    refute html =~ "/projects/alpha/runs/"
+    assert html =~ "http://127.0.0.1:4101/"
+    refute html =~ "View details"
   end
 
-  test "project detail page stays lightweight and links each run to a deep view" do
+  test "project route reuses dashboard with focused project summary and run entry" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3312,24 +3322,31 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    assert html =~ "项目现场"
     assert html =~ "Alpha"
+    assert html =~ "首页内聚焦视图"
+    assert html =~ "当前活跃运行: 1"
+    assert html =~ "活跃运行"
+    assert html =~ "Worker 状态: 运行中"
+    assert html =~ "JSON 摘要"
+    assert html =~ "Worker 页面"
+    assert html =~ "http://127.0.0.1:4101/"
     assert html =~ "MT-ALPHA-1"
     assert html =~ "Alpha task"
-    assert html =~ "codex_waiting_next_event"
+    assert html =~ "等待新事件"
     assert html =~ "最近一段时间没有新事件"
-    assert html =~ "possibly_stalled"
-    assert html =~ "thread-alpha"
-    assert html =~ "turn-9"
+    assert html =~ "进行中 · 可能卡住"
+    assert html =~ "返回总览"
     assert html =~ "960s"
     assert html =~ "/projects/alpha/runs/MT-ALPHA-1"
-    assert html =~ "Open run"
+    assert html =~ "打开运行"
     refute html =~ "Timeline"
     refute html =~ "Shell output"
     refute html =~ "Prompt"
     refute html =~ "Raw event"
   end
 
-  test "project detail page encodes run detail path segments" do
+  test "project route keeps encoded run links in focused dashboard mode" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3358,13 +3375,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/projects/alpha")
     {:ok, document} = Floki.parse_document(html)
 
-    assert ["/projects/alpha/runs/MT%2FALPHA"] =
+    assert ["/", "/api/v1/projects/alpha/summary", "/api/v1/projects/alpha/summary", "/projects/alpha/runs/MT%2FALPHA"] =
              document
              |> Floki.find("a.issue-link")
+             |> Enum.reject(&(Floki.text(&1, sep: " ", deep: true) |> String.trim() == "项目现场"))
              |> Floki.attribute("href")
   end
 
-  test "project detail page shows unavailable state when project summary is missing" do
+  test "project route shows focused dashboard unavailable state when project is missing" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3372,12 +3390,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/projects/missing")
-    assert html =~ "Project unavailable"
-    assert html =~ "No lightweight project summary matched"
+    assert html =~ "项目现场"
+    assert html =~ "未找到项目"
     assert html =~ "missing"
   end
 
-  test "project detail page renders presenter-backed empty summary fields as n/a and keeps empty run lists lightweight" do
+  test "project route renders focused dashboard summary fields as n/a and keeps empty run state lightweight" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3396,15 +3414,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha")
-    {:ok, document} = Floki.parse_document(html)
-
-    assert project_section_texts(document, "Project summary") |> Enum.member?("worker port: n/a")
-    assert project_section_texts(document, "Project summary") |> Enum.member?("last seen: n/a")
-    assert project_section_texts(document, "Project summary") |> Enum.member?("last error: n/a")
-    assert run_summaries_empty_state_text(document) == "No run summaries available."
+    assert html =~ "Worker 端口: n/a"
+    assert html =~ "最近存活: n/a"
+    assert html =~ "最近错误: n/a"
+    assert html =~ "当前无活跃运行。"
   end
 
-  test "project detail page renders empty run action text as n/a" do
+  test "project route focused dashboard omits empty run action text" do
     start_test_endpoint(
       runtime_mode: :control_plane,
       orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
@@ -3438,15 +3454,88 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "Alpha task"
+    refute html =~ "<span class=\"mono\">\n                        n/a · Alpha task\n                      </span>"
+  end
+
+  test "control-plane dashboard counts all active runs even when homepage preview is truncated" do
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :running,
+              run_summaries: [
+                %{issue_identifier: "MT-ALPHA-1", title: "Alpha task 1", current_phase: "codex_waiting_next_event"},
+                %{issue_identifier: "MT-ALPHA-2", title: "Alpha task 2", current_phase: "codex_waiting_next_event"},
+                %{issue_identifier: "MT-ALPHA-3", title: "Alpha task 3", current_phase: "codex_waiting_next_event"},
+                %{issue_identifier: "MT-ALPHA-4", title: "Alpha task 4", current_phase: "codex_waiting_next_event"}
+              ]
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
     {:ok, document} = Floki.parse_document(html)
 
-    assert [
-             {"article", _, _} = article
-           ] = Floki.find(document, "article.section-card")
+    assert metric_value(document, "活跃运行") == "4"
+    assert html =~ "4 条活跃运行。"
+    assert html =~ "MT-ALPHA-1"
+    assert html =~ "MT-ALPHA-2"
+    assert html =~ "MT-ALPHA-3"
+    assert html =~ "仅展示前 3 条运行。"
+    refute html =~ "MT-ALPHA-4"
+  end
 
-    assert Floki.text(article) =~ "MT-ALPHA-1"
-    assert Floki.text(article) =~ "Alpha task"
-    assert article_mono_texts(article) |> Enum.member?("n/a")
+  test "project route focused dashboard shows startup failure hints and humanized validation" do
+    runtime_dir =
+      Path.join(System.tmp_dir!(), "project-dashboard-start-failed-#{System.unique_integer([:positive])}")
+
+    stderr_path = Path.join(runtime_dir, "worker.stderr.log")
+
+    on_exit(fn -> File.rm_rf!(runtime_dir) end)
+    File.mkdir_p!(runtime_dir)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :start_failed,
+              worker_port: 4101,
+              error_summary: "worker command exited during startup",
+              stderr_path: stderr_path
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/projects/alpha")
+    assert html =~ "项目现场"
+    assert html =~ "校验: 通过"
+    assert html =~ "Worker 状态: 启动失败"
+    assert html =~ "最近错误: worker command exited during startup"
+    assert html =~ stderr_path
+    assert html =~ "先看 worker.stderr.log，确认启动阶段具体报错。"
+    assert html =~ "先修复启动错误，再重新点击“启动”。"
   end
 
   test "run deep view renders summary fields and timeline shell without heavy content by default" do
@@ -5725,30 +5814,35 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Projects"
+    assert html =~ "项目总览"
     assert html =~ "Alpha"
     assert html =~ "Beta"
     assert html =~ "gamma"
+    assert html =~ "项目数"
+    assert html =~ "运行中"
+    assert html =~ "启动失败"
+    assert html =~ "活跃运行"
     assert html =~ "project_id: alpha"
     assert html =~ "project_id: beta"
-    assert html =~ "validation: valid"
-    assert html =~ "validation: invalid"
-    assert html =~ "Enabled"
-    assert html =~ "Worker status"
-    assert html =~ "Worker port"
-    assert html =~ "Last seen"
-    assert html =~ "Last error"
-    assert html =~ "Actions"
-    assert html =~ "running"
-    assert html =~ "disabled"
-    assert html =~ "unreachable"
+    assert html =~ "校验: 通过"
+    assert html =~ "校验: 未通过"
+    assert html =~ "启用"
+    assert html =~ "Worker 状态"
+    assert html =~ "Worker 端口"
+    assert html =~ "最近存活"
+    assert html =~ "最近错误"
+    assert html =~ "操作"
+    assert html =~ "JSON 摘要"
+    assert html =~ "运行中"
+    assert html =~ "已禁用"
+    assert html =~ "失去连接"
     assert html =~ "5101"
     assert html =~ "2026-05-07T01:02:03Z"
     assert html =~ "workspace_root: workspace_root is required"
     assert html =~ "request timed out"
     assert html =~ "/api/v1/projects/alpha/summary"
-    assert html =~ "true"
-    assert html =~ "false"
+    assert html =~ "是"
+    assert html =~ "否"
     refute html =~ "Validation"
     refute html =~ "Runtime"
     refute html =~ "Errors"
@@ -5822,7 +5916,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, html} = live(build_conn(), "/")
 
-    assert html =~ "Projects"
+    assert html =~ "项目总览"
 
     assert_eventually(fn ->
       rendered_html = render(view)
@@ -5842,15 +5936,15 @@ defmodule SymphonyElixir.ExtensionsTest do
         rendered_html =~ "phx-value-project_id=\"disabled-project\" phx-value-action=\"restart\" disabled" and
         rendered_html =~ "phx-value-project_id=\"running-project\" phx-value-action=\"start\" disabled" and
         rendered_html =~ "phx-value-project_id=\"stopped-project\" phx-value-action=\"stop\" disabled" and
-        rendered_html =~ "unreachable" and
+        rendered_html =~ "失去连接" and
         rendered_html =~ "phx-value-project_id=\"unreachable-project\" phx-value-action=\"start\" disabled"
     end)
 
     feedback_html =
       render_click(view, "project_action", %{"project_id" => "disabled-project", "action" => "start"})
 
-    assert feedback_html =~ "Project action failed"
-    assert feedback_html =~ "disabled"
+    assert feedback_html =~ "项目操作失败"
+    assert feedback_html =~ "项目已禁用，当前不能操作"
   end
 
   test "control-plane dashboard project actions refresh only the targeted row" do
@@ -5882,7 +5976,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "alpha"
     assert html =~ "beta"
-    assert html =~ "not_started"
+    assert html =~ "未启动"
 
     view
     |> element("button[phx-click='project_action'][phx-value-project_id='alpha'][phx-value-action='start']")
@@ -5899,8 +5993,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     running_html = render(view)
-    assert running_html =~ "running"
-    assert running_html =~ "not_started"
+    assert running_html =~ "运行中"
+    assert running_html =~ "未启动"
     assert running_html =~ "#{alpha_port}"
     assert running_html =~ "#{beta_port}"
 
@@ -5917,8 +6011,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     restarted_html = render(view)
-    assert restarted_html =~ "running"
-    assert restarted_html =~ "not_started"
+    assert restarted_html =~ "运行中"
+    assert restarted_html =~ "未启动"
 
     view
     |> element("button[phx-click='project_action'][phx-value-project_id='alpha'][phx-value-action='stop']")
@@ -5935,8 +6029,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     stopped_html = render(view)
-    assert stopped_html =~ "stopped"
-    assert stopped_html =~ "not_started"
+    assert stopped_html =~ "已停止"
+    assert stopped_html =~ "未启动"
     assert stopped_html =~ "#{alpha_port}"
     assert stopped_html =~ "#{beta_port}"
   end
@@ -5969,8 +6063,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     feedback_html =
       render_click(view, "project_action", %{"project_id" => "alpha", "action" => "start"})
 
-    assert feedback_html =~ "Project action failed"
-    assert feedback_html =~ "project manager unavailable"
+    assert feedback_html =~ "项目操作失败"
+    assert feedback_html =~ "项目进程管理器当前不可用"
     assert Process.alive?(view.pid)
   end
 
@@ -6006,9 +6100,47 @@ defmodule SymphonyElixir.ExtensionsTest do
     feedback_html =
       render_click(view, "project_action", %{"project_id" => "alpha", "action" => "start"})
 
-    assert feedback_html =~ "Project action failed"
-    assert feedback_html =~ "workflow generation failed"
+    assert feedback_html =~ "项目操作失败"
+    assert feedback_html =~ "生成 workflow 失败"
     assert Process.alive?(view.pid)
+  end
+
+  test "control-plane dashboard shows log path and next step for startup failure" do
+    runtime_dir = Path.join(System.tmp_dir!(), "dashboard-start-failed-#{System.unique_integer([:positive])}")
+    stderr_path = Path.join(runtime_dir, "worker.stderr.log")
+    stdout_path = Path.join(runtime_dir, "worker.stdout.log")
+
+    on_exit(fn -> File.rm_rf!(runtime_dir) end)
+    File.mkdir_p!(runtime_dir)
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer,
+      project_registry: %StaticProjectRegistry{
+        entries: [
+          %{
+            project_id: "alpha",
+            project_name: "Alpha",
+            normalized_config: %{enabled: true, worker_port: 4101},
+            validation_result: :valid,
+            validation_errors: [],
+            runtime_state: %{
+              status: :start_failed,
+              worker_port: 4101,
+              error_summary: "worker command exited during startup",
+              stderr_path: stderr_path,
+              stdout_path: stdout_path
+            }
+          }
+        ]
+      }
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "worker command exited during startup"
+    assert html =~ stderr_path
+    assert html =~ "先看 worker.stderr.log，确认启动阶段具体报错。"
+    assert html =~ "先修复启动错误，再重新点击“启动”。"
   end
 
   test "control-plane startup loads invalid project registry as visible validation error instead of an empty list" do
@@ -6053,11 +6185,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert error["message"] =~ "yaml"
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Projects"
+    assert html =~ "项目总览"
     assert html =~ "projects: "
     assert html =~ "malformed yaml"
     assert html =~ "projects: "
-    refute html =~ "No projects registered."
+    refute html =~ "尚未登记项目。"
   end
 
   test "control-plane dashboard does not refresh from observability pubsub updates" do
@@ -6155,7 +6287,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_eventually(fn ->
       rendered = render(view)
-      rendered =~ "Gamma" and rendered =~ "running"
+      rendered =~ "Gamma" and rendered =~ "运行中"
     end)
   end
 
@@ -6370,12 +6502,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "运行预检"
+    refute has_element?(view, "details[open] summary", "M3-0 预检")
 
     view
     |> element("button[phx-click='run_m3_precheck'][phx-value-project_id='alpha']")
     |> render_click()
 
     rendered = render(view)
+    assert has_element?(view, "details[open] summary", "M3-0 预检")
     assert rendered =~ "运行预检"
     assert rendered =~ "依赖阻塞"
     assert rendered =~ "可放行 Todo"
@@ -6388,6 +6522,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert rendered =~ "RUN-CP-1"
     assert rendered =~ "MT-CP-3"
     refute rendered =~ "fake worker m3 precheck"
+
+    send(view.pid, :runtime_tick)
+
+    rerendered = render(view)
+    assert has_element?(view, "details[open] summary", "M3-0 预检")
+    assert rerendered =~ "依赖阻塞"
+    assert rerendered =~ "MT-CP-2"
+
+    view
+    |> element("summary[phx-click='toggle_m3_precheck'][phx-value-project_id='alpha']")
+    |> render_click()
+
+    refute has_element?(view, "details[open] summary", "M3-0 预检")
   end
 
   test "workflow dashboard renders m3 precheck entry and result on demand" do
@@ -6841,17 +6988,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> Enum.map(&String.trim/1)
   end
 
-  defp run_summaries_empty_state_text(document) do
-    document
-    |> find_section_by_title("Run summaries")
-    |> then(fn
-      nil -> []
-      section -> Floki.find(section, "p.empty-state")
-    end)
-    |> Floki.text()
-    |> String.trim()
-  end
-
   defp metric_value(document, label) do
     document
     |> Floki.find("article.metric-card")
@@ -6965,14 +7101,6 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Floki.text()
       |> String.trim() == title
     end)
-  end
-
-  defp article_mono_texts(article) do
-    article
-    |> Floki.find("p.mono")
-    |> Enum.map(&Floki.text(&1, sep: " ", deep: true))
-    |> Enum.map(&String.replace(&1, ~r/\s+/, " "))
-    |> Enum.map(&String.trim/1)
   end
 
   defp fake_worker_builder(modes) do
@@ -7361,7 +7489,10 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
 
     assert_validation_errors_shape(project["validation_errors"], expected_validation_errors)
-    assert project["runtime_state"] == %{"status" => Keyword.fetch!(expected, :worker_status)}
+    assert Map.get(project["runtime_state"], "status") == Keyword.fetch!(expected, :worker_status)
+    assert Map.get(project["runtime_state"], "stdout_path") == nil
+    assert Map.get(project["runtime_state"], "stderr_path") == nil
+    assert Map.get(project["runtime_state"], "error_summary") == nil
     assert project["run_summaries"] == expected_run_summaries
     assert_optional_iso8601(project["last_seen_at"], Keyword.fetch!(expected, :last_seen_at))
 
