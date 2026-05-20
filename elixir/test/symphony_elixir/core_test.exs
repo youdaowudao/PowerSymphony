@@ -2076,6 +2076,31 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "## Step 2: Execution phase (Todo -> In Progress -> Checking -> Human Review)"
     assert prompt =~ "Classify the planned delta as `Small change` or `Large change` before any code edits."
     assert prompt =~ "Only after a final `proceed` may the run continue from document-phase planning into coding."
+    assert prompt =~ "pre-validation Change Review"
+    assert prompt =~ "post-validation Push Readiness confirm"
+    assert prompt =~ "baseline lock"
+    assert prompt =~ "change review fingerprint"
+    assert prompt =~ "Push Readiness: ready"
+    assert prompt =~ "Push Readiness: not ready"
+    assert prompt =~ "reopen `pre-validation Change Review`"
+
+    assert prompt =~
+             "post-validation Push Readiness confirm must run in a new bounded `final zero-context reviewer` invocation"
+
+    assert prompt =~
+             "`Push Readiness` only performs a bounded confirm on baseline, validation evidence, unresolved review state, and unreviewed code deltas"
+
+    assert prompt =~
+             "If `Checking` or any post-validation step discovers a new human review delta, force the run back to the front-loaded review path instead of only recording `Push Readiness: not ready`."
+
+    assert prompt =~
+             "`closure check` runs only after `heavy validation` and before `post-validation Push Readiness confirm`."
+
+    assert prompt =~
+             "`closure check` may only output `matched`, `mismatch`, or `escalate`."
+
+    assert prompt =~
+             "`closure check` must not expand into an open-ended review layer or invent new review findings outside those bounded outputs."
 
     assert prompt =~
              "Do not skip `Checking` closeout and do not move to `Human Review` merely because the PR already exists."
@@ -2101,6 +2126,18 @@ defmodule SymphonyElixir.CoreTest do
 
     refute prompt =~
              "When stopping work, ending the run, or yielding because of a blocker, the agent must ensure the issue state is `Human Review` before exiting."
+
+    refute prompt =~
+             "the default closeout order is `implementer ->\n  contract checker -> baseline lock -> heavy validation -> final zero-context reviewer`"
+
+    refute prompt =~
+             "post-validation Push Readiness confirm may continue a free-form full cumulative diff review"
+
+    refute prompt =~
+             "If `Checking` finds a new review delta, it is sufficient to record `Push Readiness: not ready` and wait without reopening the front-loaded review path."
+
+    refute prompt =~
+             "`closure check` may produce any additional open-ended review findings that seem useful for closeout."
 
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"

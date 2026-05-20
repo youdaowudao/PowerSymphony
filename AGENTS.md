@@ -92,33 +92,43 @@
   - `allowed transform` 是否被违反
   - 是否发生 `must not infer`
   - 多消费面的语义是否保持一致
-- `contract checker` 明确不负责：大面 code review、`Push Readiness`、`heavy validation`、最终放行判定。`final zero-context reviewer` 仍固定输出 `Change Review` 与 `Push Readiness`；`Push Readiness` 只回答“现在能不能 push / push 前最小还缺什么”。
+- `contract checker` 明确不负责：大面 code review、`Push Readiness`、`heavy validation`、最终放行判定。`final zero-context reviewer` 仍固定输出 `Change Review` 与 `Push Readiness`；其中 `Change Review` 必须前移到 `baseline lock` 之前，`Push Readiness` 只允许作为后置 bounded confirm 回答“现在能不能 push / push 前最小还缺什么”。
 - 命中 `观察层合同风险` 的任务，`closeout` 默认主路径固定为：
   - `implementer`
   - `contract checker`
+  - `final zero-context reviewer` 执行 `pre-validation Change Review`
   - `baseline lock`
   - `heavy validation`
-  - `final zero-context reviewer`
+  - `final zero-context reviewer` 执行新的独立 `post-validation Push Readiness confirm`
   - `push / PR / merge`
 - 仅当任务同时命中多层 `consumer` / contract 风险，且已触发 `任务类型识别 + source-of-truth chain` 时，`closeout` 内必须补一次有界 `closure check`。
 - `closure check` 只检查四项是否对齐：`source`、`projection`、`consumer`、`verification`。
+- `closure check` 只允许输出 `matched`、`mismatch`、`escalate`。
 - `closure check` 不是新 reviewer 角色，不是新的 `Next Push Gate`，不是新的 review state，也不替代 `contract checker`、`final zero-context reviewer` 或 full gate。
-- `baseline lock` 锁定的对象固定为：当前 `PR base`、当前 `HEAD`、当前 `exact cumulative diff`、当前 `validation summary` 对应的 diff 口径。记录位置固定在 Linear issue body 的 `## Codex Workpad > Baseline Lock`，最小字段固定为：
+- `closure check` 不得扩展成开放式审查层；除上述三种输出外，不得自由新增 findings、审查结论或新的放行标准。
+- 命中 bounded `closure check` 路径时，固定顺序为：`pre-validation Change Review -> baseline lock -> heavy validation -> closure check -> post-validation Push Readiness confirm`。
+- `post-validation Push Readiness confirm` 必须是新的独立 bounded reviewer invocation，不能沿用产出前一次 `pre-validation Change Review` 结论的同一 reviewer thread；它只能复核 baseline、validation evidence、未清 review 结论与“是否出现未复审新代码变化”，无权膨胀成第二次全量 review。
+- `baseline lock` 锁定的对象固定为：当前 `PR base`、当前 `HEAD`、当前 `exact cumulative diff`、当前 `change review fingerprint`、当前 `validation summary` 对应的 diff 口径。记录位置固定在 Linear issue body 的 `## Codex Workpad > Baseline Lock`，最小字段固定为：
   - `base ref`
   - `head sha`
   - `diff fingerprint`
+  - `change review fingerprint`
   - `validation scope`
   - `locked by`
   - `locked at`
-- `baseline 争议` 的统一口径为：任一角色主张当前 review / validation 证据不再对应当前 `base/head/diff` tuple，或两个角色引用了不同的 baseline tuple。
+- `baseline 争议` 的统一口径为：任一角色主张当前 review / validation 证据不再对应当前 `base/head/diff/change review fingerprint/validation scope` 五元组中的任一项，或两个角色引用了不同的 `change review fingerprint`。
 - 失效条件与回退规则必须和主路径一起执行，不得只写主顺序：
   - `contract checker` 之后，只要返工触及合同字段、视图语义、摘要口径、计数口径或归因口径，必须重过 `contract checker`
-  - `baseline lock` 之后，只要 `PR base`、`HEAD`、`exact cumulative diff`、`validation scope` 任一变化，必须重做 `baseline lock`
-  - `heavy validation` 失败后，若修复未触及合同字段，回 `implementer -> baseline lock -> heavy validation`
-  - `heavy validation` 失败后，若修复触及合同字段，回 `implementer -> contract checker -> baseline lock -> heavy validation`
-  - `final zero-context reviewer` 发现合同问题时，回 `contract checker`
-  - `final zero-context reviewer` 发现非合同实现问题时，按最小回退原则回 `implementer`
-  - `final zero-context reviewer` 发现 baseline 口径失效或验证证据已不对应当前 diff 时，回 `baseline lock`
+  - `pre-validation Change Review` 通过后，只要当前 cumulative diff 的实现内容变化，必须重过 `pre-validation Change Review`
+  - `baseline lock` 之后，只要 `PR base`、`HEAD`、`exact cumulative diff`、`change review fingerprint`、`validation scope` 任一变化，必须重做 `baseline lock`
+  - 若最新 `Change Review = pass` 被 reopen、替换或失效，即使 `base/head/diff/validation scope` 暂时未变，也必须重做 `baseline lock`
+  - `heavy validation` 失败后，若修复未触及合同字段且未引入未复审新代码变化，回 `baseline lock -> heavy validation`
+  - `heavy validation` 失败后，若修复引入新的实现变化，回 `implementer -> pre-validation Change Review -> baseline lock -> heavy validation`
+  - `heavy validation` 失败后，若修复触及合同字段，回 `implementer -> contract checker -> pre-validation Change Review -> baseline lock -> heavy validation`
+  - `post-validation Push Readiness confirm` 发现 `source / projection / contract` 类问题时，回 `contract checker -> pre-validation Change Review -> baseline lock -> heavy validation`
+  - `post-validation Push Readiness confirm` 发现 `consumer / verification / implementation` 类问题时，回 `pre-validation Change Review -> baseline lock -> heavy validation`
+  - `post-validation Push Readiness confirm` 发现 baseline 口径失效或验证证据已不对应当前 diff 时，回 `baseline lock -> heavy validation`
+  - `Checking` 或其他后置阶段若出现新的 review delta，必须强制 reopen `pre-validation Change Review`；不得只把 `Push Readiness` 写成 `not ready` 而不回前置审查路径
 - 中途风险门只在命中高风险条件时触发，不是所有任务默认重门禁；其作用是前移高风险验证，不新增审批层。
 - Linear issue body 的 `## Codex Workpad` 是唯一活真相源；活状态板、下一 gate、`baseline lock`、`blocker ledger` 与当前 review / blocker 结论只留在这里，repo 文档不复制实时值。流程指标、返工计数等派生审计数据仅在用户明确要求时才维护。
 - `blocker ledger` 不默认常开；命中以下任一条件时必须在 `## Codex Workpad` 内开启并持续维护：
