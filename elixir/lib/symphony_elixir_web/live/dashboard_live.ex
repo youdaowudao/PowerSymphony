@@ -1228,8 +1228,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> String.replace("normal", "正常")
   end
 
-  defp humanize_run_health_meta(value), do: value
-
   defp count_projects_with_status(projects, status) when is_list(projects) do
     Enum.count(projects, &(&1.worker_status == status))
   end

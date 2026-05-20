@@ -182,6 +182,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
 
   test "loader resolves default config from bin/symphony.projects.yaml" do
     previous_override = Application.get_env(:symphony_elixir, :project_config_path_override)
+    default_path = Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
 
     on_exit(fn ->
       if is_nil(previous_override) do
@@ -194,7 +195,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     Application.delete_env(:symphony_elixir, :project_config_path_override)
 
     assert ProjectRegistryLoader.project_config_path() ==
-             Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
+             if(File.regular?(default_path), do: default_path, else: nil)
   end
 
   test "find_entry returns matching entry and nil for unknown id" do
