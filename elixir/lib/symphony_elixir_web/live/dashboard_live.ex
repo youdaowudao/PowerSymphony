@@ -20,10 +20,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:runtime_mode, runtime_mode)
       |> assign(:project_action_feedback, nil)
       |> assign(:m3_precheck_results, %{})
+      |> assign(:m3_precheck_open, %{})
       |> assign(:workflow_snapshot_status, workflow_snapshot_status(runtime_mode))
       |> assign(:workflow_snapshot_requested_version, 0)
       |> assign(:workflow_snapshot_task, nil)
       |> assign(:workflow_snapshot_refresh_pending, false)
+      |> assign(:selected_project_id, nil)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -36,6 +38,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
 
     {:ok, socket}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    selected_project_id =
+      case socket.assigns.live_action do
+        :project -> Map.get(params, "project_id")
+        _ -> nil
+      end
+
+    {:noreply,
+     socket
+     |> assign(:selected_project_id, selected_project_id)
+     |> assign(:projects_payload, load_projects_payload())}
   end
 
   @impl true
@@ -106,7 +122,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           nil
 
         {:error, reason} ->
-          "Project action failed: #{format_project_action_error(reason)}"
+          "项目操作失败：#{format_project_action_error(reason)}"
       end
 
     {:noreply,
@@ -130,7 +146,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
         end
       end
 
-    {:noreply, assign(socket, :m3_precheck_results, Map.put(socket.assigns.m3_precheck_results, project_id, result))}
+    {:noreply,
+     socket
+     |> assign(:m3_precheck_results, Map.put(socket.assigns.m3_precheck_results, project_id, result))
+     |> assign(:m3_precheck_open, Map.put(socket.assigns.m3_precheck_open, project_id, true))}
+  end
+
+  def handle_event("toggle_m3_precheck", %{"project_id" => project_id}, socket) do
+    currently_open = Map.get(socket.assigns.m3_precheck_open, project_id, false)
+
+    {:noreply,
+     assign(
+       socket,
+       :m3_precheck_open,
+       Map.put(socket.assigns.m3_precheck_open, project_id, not currently_open)
+     )}
   end
 
   @impl true
@@ -140,25 +170,41 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <header class="hero-card">
         <div class="hero-grid">
           <div>
-            <p class="eyebrow">
-              Symphony Observability
-            </p>
-            <h1 class="hero-title">
-              Operations Dashboard
-            </h1>
-            <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
-            </p>
+            <%= if @runtime_mode == :control_plane do %>
+              <p class="eyebrow">
+                Symphony 控制台
+              </p>
+              <h1 class="hero-title">
+                <%= if @selected_project_id, do: "项目现场", else: "运行总览" %>
+              </h1>
+              <p class="hero-copy">
+                <%= if @selected_project_id do %>
+                  聚焦单个项目的运行状态、当前工作、预检结果与直达入口，但仍然留在同一个总控台里。
+                <% else %>
+                  集中查看项目运行状态、当前工作、预检结果与直达入口，不再依赖分散的副页面来判断现场情况。
+                <% end %>
+              </p>
+            <% else %>
+              <p class="eyebrow">
+                Symphony dashboard
+              </p>
+              <h1 class="hero-title">
+                Operations Dashboard
+              </h1>
+              <p class="hero-copy">
+                Inspect workflow runtime activity, retry pressure, and todo pool readiness from one place.
+              </p>
+            <% end %>
           </div>
 
           <div class="status-stack">
             <span class="status-badge status-badge-live">
               <span class="status-badge-dot"></span>
-              Live
+              <%= if @runtime_mode == :control_plane, do: "控制面已连接", else: "Runtime connected" %>
             </span>
             <span class="status-badge status-badge-offline">
               <span class="status-badge-dot"></span>
-              Offline
+              <%= if @runtime_mode == :control_plane, do: "等待连接", else: "Waiting for connection" %>
             </span>
           </div>
         </div>
@@ -168,8 +214,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Projects</h2>
-              <p class="section-copy">Static config validation with lightweight runtime summary.</p>
+              <h2 class="section-title"><%= if @selected_project_id, do: "项目现场", else: "项目总览" %></h2>
+              <p class="section-copy">
+                <%= if @selected_project_id do %>
+                  保留总控台布局，只聚焦当前项目，避免再切到另一套项目页。
+                <% else %>
+                  把项目基础状态、当前运行信息和常用入口收在同一页，优先服务现场判断。
+                <% end %>
+              </p>
             </div>
           </div>
 
@@ -177,36 +229,136 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="empty-state"><%= @project_action_feedback %></p>
           <% end %>
 
-          <%= if @projects_payload.projects == [] do %>
-            <p class="empty-state">No projects registered.</p>
+          <%= if control_plane_projects(@projects_payload, @selected_project_id) == [] do %>
+            <p class="empty-state">
+              <%= if @selected_project_id do %>
+                未找到项目 <span class="mono"><%= @selected_project_id %></span>。
+              <% else %>
+                尚未登记项目。
+              <% end %>
+            </p>
           <% else %>
+            <section class="metric-grid">
+              <article class="metric-card">
+                <p class="metric-label">项目数</p>
+                <p class="metric-value numeric"><%= length(control_plane_projects(@projects_payload, @selected_project_id)) %></p>
+                <p class="metric-detail">当前视图中可操作的项目数量。</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">运行中</p>
+                <p class="metric-value numeric"><%= count_projects_with_status(control_plane_projects(@projects_payload, @selected_project_id), "running") %></p>
+                <p class="metric-detail">worker 正常在线并可响应的项目。</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">启动失败</p>
+                <p class="metric-value numeric"><%= count_projects_with_status(control_plane_projects(@projects_payload, @selected_project_id), "start_failed") %></p>
+                <p class="metric-detail">需要先看日志定位启动问题的项目。</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">活跃运行</p>
+                <p class="metric-value numeric"><%= total_active_runs(control_plane_projects(@projects_payload, @selected_project_id)) %></p>
+                <p class="metric-detail">当前页面里可直达的活跃 run 总数。</p>
+              </article>
+            </section>
+
+            <section :if={@selected_project_id} class="section-card" style="margin-bottom: 1.25rem;">
+              <% project = List.first(control_plane_projects(@projects_payload, @selected_project_id)) %>
+              <div class="section-header">
+                <div>
+                  <h3 class="section-title"><%= project.project_name || project.project_id || @selected_project_id %></h3>
+                  <p class="section-copy">首页内聚焦视图，保留项目摘要与当前运行信息，不再依赖独立项目页。</p>
+                </div>
+                <a class="issue-link" href="/">返回总览</a>
+              </div>
+
+              <div class="detail-stack">
+                <p class="mono"><%= "project_id: #{blank_to_na(project.project_id)}" %></p>
+                <p class="mono"><%= "启用: #{format_enabled(project.enabled)}" %></p>
+                <p class="mono"><%= "校验: #{humanize_validation_result(project.validation_result)}" %></p>
+                <p class="mono"><%= "Worker 状态: #{humanize_worker_status(project.worker_status)}" %></p>
+                <p class="mono"><%= "Worker 端口: #{blank_to_na(project.worker_port)}" %></p>
+                <p class="mono"><%= "当前活跃运行: #{project_run_count(project)}" %></p>
+                <p class="mono"><%= "最近存活: #{blank_to_na(project.last_seen_at)}" %></p>
+                <p class="mono"><%= "最近错误: #{blank_to_na(project_runtime_or_validation_error(project))}" %></p>
+                <%= if is_binary(project.project_id) and project.project_id != "" do %>
+                  <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON 摘要</a>
+                  <a :if={is_integer(project.worker_port)} class="issue-link" href={"http://127.0.0.1:#{project.worker_port}/"}>Worker 页面</a>
+                <% end %>
+                <%= if failure_help = project_runtime_failure_help(project) do %>
+                  <p :if={is_binary(failure_help.stderr_path) and failure_help.stderr_path != ""} class="mono">
+                    <%= failure_help.stderr_path %>
+                  </p>
+                  <p class="muted event-meta"><%= failure_help.next_step %></p>
+                  <p class="muted event-meta"><%= failure_help.retry_hint %></p>
+                <% end %>
+              </div>
+            </section>
+
             <div class="table-wrap">
               <table class="data-table" style="min-width: 680px;">
                 <thead>
                   <tr>
-                    <th>Project</th>
-                    <th>Enabled</th>
-                    <th>Worker status</th>
-                    <th>Worker port</th>
-                    <th>Last seen</th>
-                    <th>Last error</th>
-                    <th>Actions</th>
+                    <th>项目概览</th>
+                    <th>当前运行</th>
+                    <th>启用</th>
+                    <th>Worker 状态</th>
+                    <th>Worker 端口</th>
+                    <th>最近存活</th>
+                    <th>最近错误</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr :for={project <- @projects_payload.projects}>
+                  <tr :for={project <- control_plane_projects(@projects_payload, @selected_project_id)}>
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= project.project_name || project.project_id || "n/a" %></span>
                         <span class="mono">
                           <%= "project_id: #{blank_to_na(project.project_id)}" %>
                           ·
-                          <%= "validation: #{blank_to_na(project.validation_result)}" %>
+                          <%= "校验: #{humanize_validation_result(project.validation_result)}" %>
                         </span>
                         <%= if is_binary(project.project_id) and project.project_id != "" do %>
-                          <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON summary</a>
-                          <a class="issue-link" href={"/projects/#{project.project_id}"}>View details</a>
+                          <a class="issue-link" href={"/projects/#{project.project_id}"}>项目现场</a>
+                          <a class="issue-link" href={"/api/v1/projects/#{project.project_id}/summary"}>JSON 摘要</a>
+                          <a :if={is_integer(project.worker_port)} class="issue-link" href={"http://127.0.0.1:#{project.worker_port}/"}>Worker 页面</a>
                         <% end %>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="detail-stack">
+                        <span class="muted event-meta"><%= project_run_preview_caption(project) %></span>
+                        <div :for={summary <- project_run_preview_summaries(project)} class="detail-stack">
+                          <span class="mono">
+                            <%= summary.issue_identifier || "n/a" %> · <%= Presenter.project_run_summary_title(summary) %>
+                          </span>
+                          <span class={state_badge_class(summary.current_phase || summary.linear_state || summary.health)}>
+                            <%= humanize_run_state(summary.current_phase || summary.linear_state || summary.health || "running") %>
+                          </span>
+                          <span
+                            :if={project_run_preview_health_meta(summary)}
+                            class="muted event-meta"
+                          >
+                            <%= humanize_run_health_meta(project_run_preview_health_meta(summary)) %>
+                          </span>
+                          <span
+                            :if={is_binary(summary.current_action) and summary.current_action != ""}
+                            class="mono"
+                          >
+                            <%= summary.current_action %>
+                          </span>
+                          <span class="muted event-meta"><%= Presenter.project_run_summary_runtime(summary) %></span>
+                          <a
+                            :if={is_binary(project.project_id) and is_binary(summary.issue_identifier)}
+                            class="issue-link"
+                            href={run_path(project.project_id, summary.issue_identifier)}
+                          >
+                            打开运行
+                          </a>
+                        </div>
+                        <span :if={project_run_preview_overflow?(project)} class="muted event-meta">
+                          仅展示前 3 条运行。
+                        </span>
                       </div>
                     </td>
                     <td>
@@ -214,7 +366,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td>
                       <span class={state_badge_class(project.worker_status)}>
-                        <%= project.worker_status %>
+                        <%= humanize_worker_status(project.worker_status) %>
                       </span>
                     </td>
                     <td>
@@ -224,7 +376,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <%= blank_to_na(project.last_seen_at) %>
                     </td>
                     <td>
-                      <%= project_runtime_or_validation_error(project) |> blank_to_na() %>
+                      <div class="detail-stack">
+                        <span><%= project_runtime_or_validation_error(project) |> blank_to_na() %></span>
+                        <%= if failure_help = project_runtime_failure_help(project) do %>
+                          <span :if={is_binary(failure_help.stderr_path) and failure_help.stderr_path != ""} class="mono">
+                            <%= failure_help.stderr_path %>
+                          </span>
+                          <span class="muted event-meta"><%= failure_help.next_step %></span>
+                          <span class="muted event-meta"><%= failure_help.retry_hint %></span>
+                        <% end %>
+                      </div>
                     </td>
                     <td>
                       <div class="session-stack">
@@ -236,7 +397,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           phx-value-action="start"
                           disabled={project_action_disabled?(project, "start")}
                         >
-                          Start
+                          启动
                         </button>
                         <button
                           type="button"
@@ -246,7 +407,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           phx-value-action="stop"
                           disabled={project_action_disabled?(project, "stop")}
                         >
-                          Stop
+                          停止
                         </button>
                         <button
                           type="button"
@@ -256,7 +417,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           phx-value-action="restart"
                           disabled={project_action_disabled?(project, "restart")}
                         >
-                          Restart
+                          重启
                         </button>
                         <button
                           type="button"
@@ -268,8 +429,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           运行预检
                         </button>
                       </div>
-                      <details class="session-stack">
-                        <summary>M3-0 预检</summary>
+                      <details class="session-stack" open={Map.get(@m3_precheck_open, project.project_id, false)}>
+                        <summary phx-click="toggle_m3_precheck" phx-value-project_id={project.project_id}>M3-0 预检</summary>
                         <.m3_precheck_result result={Map.get(@m3_precheck_results, project.project_id, %{})} />
                       </details>
                     </td>
@@ -355,8 +516,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <% workflow_result = Map.get(@m3_precheck_results, workflow_m3_project_id(), %{}) %>
-          <details class="session-stack" open>
-            <summary>M3-0 预检</summary>
+          <details class="session-stack" open={Map.get(@m3_precheck_open, workflow_m3_project_id(), false)}>
+            <summary phx-click="toggle_m3_precheck" phx-value-project_id={workflow_m3_project_id()}>M3-0 预检</summary>
             <.m3_precheck_result :if={not m3_result_unavailable?(workflow_result)} result={workflow_result} />
             <p :if={m3_result_unavailable?(workflow_result)} class="empty-state">
               尚未运行。点击“运行预检”查看当前 Todo 池放行、容量排队、阻塞与异常判断。
@@ -628,7 +789,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp load_projects_payload do
-    Presenter.projects_payload(project_registry())
+    Presenter.dashboard_projects_payload(project_registry())
   end
 
   defp initial_payload(:control_plane), do: Presenter.empty_state_payload()
@@ -914,13 +1075,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_project_action_error(reason) when is_atom(reason) do
-    reason
-    |> Atom.to_string()
-    |> String.replace("_", " ")
+    case reason do
+      :project_actions_unavailable -> "当前模式不支持项目操作"
+      :project_manager_unavailable -> "项目进程管理器当前不可用"
+      :unsupported_action -> "不支持这个操作"
+      :disabled -> "项目已禁用，当前不能操作"
+      :config_invalid -> "项目配置无效，当前不能操作"
+      :already_running -> "项目已经在运行中"
+      :not_running -> "项目当前没有在运行"
+      other -> other |> Atom.to_string() |> String.replace("_", " ")
+    end
   end
 
   defp format_project_action_error({:workflow_generation_failed, reason}) do
-    "workflow generation failed: #{format_project_action_error_detail(reason)}"
+    "生成 workflow 失败：#{format_project_action_error_detail(reason)}"
   end
 
   defp format_project_action_error(reason), do: inspect(reason)
@@ -932,11 +1100,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_project_action_error_detail({:missing_workflow_file, path, raw_reason}) do
-    "missing workflow file at #{path}: #{inspect(raw_reason)}"
+    "缺少 workflow 文件 #{path}: #{inspect(raw_reason)}"
   end
 
   defp format_project_action_error_detail({:workflow_parse_error, raw_reason}) do
-    "workflow parse error: #{inspect(raw_reason)}"
+    "workflow 解析失败: #{inspect(raw_reason)}"
   end
 
   defp format_project_action_error_detail(reason), do: inspect(reason)
@@ -944,6 +1112,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp project_runtime_or_validation_error(project) do
     Presenter.project_runtime_or_validation_error(project)
   end
+
+  defp project_runtime_failure_help(project) do
+    Presenter.project_runtime_failure_help(project)
+  end
+
+  defp control_plane_projects(%{projects: projects}, nil) when is_list(projects), do: projects
+
+  defp control_plane_projects(%{projects: projects}, selected_project_id)
+       when is_list(projects) and is_binary(selected_project_id) do
+    Enum.filter(projects, fn project -> project.project_id == selected_project_id end)
+  end
+
+  defp control_plane_projects(_payload, _selected_project_id), do: []
 
   defp project_action_disabled?(project, action) do
     project.validation_result == "invalid" or
@@ -965,6 +1146,112 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp m3_issue_entries(_result, _key), do: []
+
+  defp project_run_preview_summaries(project) when is_map(project) do
+    project
+    |> Map.get(:run_summaries, Map.get(project, "run_summaries", []))
+    |> List.wrap()
+    |> Enum.take(3)
+  end
+
+  defp project_run_preview_summaries(_project), do: []
+
+  defp project_run_preview_caption(project) when is_map(project) do
+    count =
+      project
+      |> Map.get(:run_summaries, Map.get(project, "run_summaries", []))
+      |> List.wrap()
+      |> length()
+
+    case count do
+      0 -> "当前无活跃运行。"
+      1 -> "1 条活跃运行。"
+      value -> "#{value} 条活跃运行。"
+    end
+  end
+
+  defp project_run_preview_caption(_project), do: "当前无活跃运行。"
+
+  defp project_run_preview_overflow?(project) when is_map(project) do
+    project
+    |> Map.get(:run_summaries, Map.get(project, "run_summaries", []))
+    |> List.wrap()
+    |> length() > 3
+  end
+
+  defp project_run_preview_overflow?(_project), do: false
+
+  defp project_run_preview_health_meta(summary) when is_map(summary) do
+    value = Presenter.project_run_summary_health_meta(summary)
+
+    if value == "n/a" do
+      nil
+    else
+      value
+    end
+  end
+
+  defp project_run_preview_health_meta(_summary), do: nil
+
+  defp humanize_validation_result("valid"), do: "通过"
+  defp humanize_validation_result("invalid"), do: "未通过"
+  defp humanize_validation_result(value) when is_binary(value), do: value
+  defp humanize_validation_result(value), do: to_string(value)
+
+  defp humanize_worker_status("running"), do: "运行中"
+  defp humanize_worker_status("not_started"), do: "未启动"
+  defp humanize_worker_status("stopped"), do: "已停止"
+  defp humanize_worker_status("start_failed"), do: "启动失败"
+  defp humanize_worker_status("disabled"), do: "已禁用"
+  defp humanize_worker_status("config_invalid"), do: "配置无效"
+  defp humanize_worker_status("unreachable"), do: "失去连接"
+  defp humanize_worker_status(value) when is_binary(value), do: value
+  defp humanize_worker_status(value), do: to_string(value)
+
+  defp humanize_run_state("codex_waiting_next_event"), do: "等待新事件"
+  defp humanize_run_state("codex_reasoning"), do: "推理中"
+  defp humanize_run_state("codex_running_shell"), do: "执行命令中"
+  defp humanize_run_state("codex_editing_files"), do: "改文件中"
+  defp humanize_run_state("starting_codex_turn"), do: "启动回合中"
+  defp humanize_run_state("possibly_stalled"), do: "可能卡住"
+  defp humanize_run_state("running"), do: "运行中"
+  defp humanize_run_state("In Progress"), do: "进行中"
+  defp humanize_run_state(value) when is_binary(value), do: value
+  defp humanize_run_state(value), do: to_string(value)
+
+  defp humanize_run_health_meta(nil), do: nil
+
+  defp humanize_run_health_meta(value) when is_binary(value) do
+    value
+    |> String.replace("In Progress", "进行中")
+    |> String.replace("possibly_stalled", "可能卡住")
+    |> String.replace("normal", "正常")
+  end
+
+  defp humanize_run_health_meta(value), do: value
+
+  defp count_projects_with_status(projects, status) when is_list(projects) do
+    Enum.count(projects, &(&1.worker_status == status))
+  end
+
+  defp count_projects_with_status(_projects, _status), do: 0
+
+  defp total_active_runs(projects) when is_list(projects) do
+    Enum.reduce(projects, 0, fn project, total ->
+      total + project_run_count(project)
+    end)
+  end
+
+  defp total_active_runs(_projects), do: 0
+
+  defp project_run_count(project) when is_map(project) do
+    project
+    |> Map.get(:run_summaries, Map.get(project, "run_summaries", []))
+    |> List.wrap()
+    |> length()
+  end
+
+  defp project_run_count(_project), do: 0
 
   defp m3_blocked_entries(result) when is_map(result) do
     result
@@ -1035,6 +1322,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp m3_worker_host_suffix(_entry), do: ""
 
+  defp run_path(project_id, issue_identifier) do
+    encoded_project_id = URI.encode(to_string(project_id), &URI.char_unreserved?/1)
+    encoded_issue_identifier = URI.encode(to_string(issue_identifier), &URI.char_unreserved?/1)
+
+    "/projects/#{encoded_project_id}/runs/#{encoded_issue_identifier}"
+  end
+
   defp m3_anomaly_blockers_suffix(anomaly) when is_map(anomaly) do
     blockers = Map.get(anomaly, "blocking_identifiers", Map.get(anomaly, :blocking_identifiers, []))
 
@@ -1098,8 +1392,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp project_validation_error_label(error), do: Presenter.project_validation_error_label(error)
 
-  defp format_enabled(true), do: "true"
-  defp format_enabled(false), do: "false"
+  defp format_enabled(true), do: "是"
+  defp format_enabled(false), do: "否"
   defp format_enabled(value), do: blank_to_na(value)
 
   defp blank_to_na(""), do: "n/a"

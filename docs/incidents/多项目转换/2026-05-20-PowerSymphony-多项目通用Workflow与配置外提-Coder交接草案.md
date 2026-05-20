@@ -455,3 +455,37 @@ projects:
    - 多项目控制面使用的真实 worker 启动命令已经过期，没有跟上单项目入口新增的 guardrails 确认要求。
 3. 当前第二阻塞点是：
    - 控制面首页、项目详情页、run 页虽然都存在，但没有形成对人类用户可理解、可导航、可排障的信息架构。
+
+## 13. 2026-05-20 运行预检追加追查
+
+在修复 guardrails 确认参数之后，多项目 worker 已经能够启动，但 `运行预检` 仍然失败。
+
+### 13.1 现场现象
+
+1. 控制面项目状态已经变为 `running`。
+2. 对项目接口直接发起：
+   - `POST /api/v1/projects/:project_id/m3_precheck`
+3. 接口返回 `503`，错误体里明确包含：
+   - `m3_precheck_unavailable`
+   - `:missing_linear_api_token`
+
+### 13.2 已确认根因
+
+1. 多项目控制面启动 worker 时，虽然已经补上了 guardrails 确认参数，但仍然是直接调用：
+   - `./bin/symphony ...`
+2. 单项目入口 `bin/symphony_start` 在真正启动前，还会额外做一层 Linear token 引导：
+   - 如果环境里没有显式设置 `LINEAR_API_KEY`；
+   - 就尝试从 `~/.config/linear/linear_api_key.token` 读取；
+   - 读取后注入为 `LINEAR_API_KEY` 再启动 worker。
+3. 多项目控制面的默认启动命令之前没有这段逻辑。
+4. 结果就是：
+   - worker 本身能起来；
+   - 但一旦执行需要 Linear 鉴权的能力，例如 `m3_precheck`；
+   - 就会在 worker 内部直接报 `:missing_linear_api_token`。
+
+### 13.3 结论
+
+1. `运行预检` 这次失败，不是页面按钮坏了。
+2. 也不是代理接口没打通。
+3. 是多项目启动链路只补了“能启动”，但还没有补齐单项目入口已有的 Linear token 引导。
+4. 因此这是第二个独立的启动环境缺口，不是同一个 guardrails 问题的尾巴。

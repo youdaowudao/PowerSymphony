@@ -192,6 +192,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     end)
 
     Application.delete_env(:symphony_elixir, :project_config_path_override)
+
     assert ProjectRegistryLoader.project_config_path() ==
              Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
   end

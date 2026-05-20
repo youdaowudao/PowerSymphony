@@ -106,7 +106,15 @@ defmodule SymphonyElixirWeb.Presenter do
   def projects_payload(registry) do
     %{
       generated_at: generated_at(),
-      projects: Enum.map(project_entries(registry), &project_entry_payload/1)
+      projects: Enum.map(project_entries(registry), &project_entry_payload(&1, runtime_debug?: false))
+    }
+  end
+
+  @spec dashboard_projects_payload(ProjectRegistry.t() | %{entries: [map()]}) :: map()
+  def dashboard_projects_payload(registry) do
+    %{
+      generated_at: generated_at(),
+      projects: Enum.map(project_entries(registry), &project_entry_payload(&1, runtime_debug?: true))
     }
   end
 
@@ -121,7 +129,7 @@ defmodule SymphonyElixirWeb.Presenter do
         {:ok,
          %{
            generated_at: generated_at(),
-           project: project_entry_payload(entry)
+           project: project_entry_payload(entry, runtime_debug?: false)
          }}
     end
   end
@@ -253,6 +261,28 @@ defmodule SymphonyElixirWeb.Presenter do
     map_value(project, :last_error) || project_validation_error_summary(map_value(project, :validation_errors))
   end
 
+  @spec project_runtime_failure_help(map()) :: map() | nil
+  def project_runtime_failure_help(project) when is_map(project) do
+    runtime_state = map_value(project, :runtime_state)
+
+    if map_value(project, :worker_status) == "start_failed" and is_map(runtime_state) do
+      stderr_path = map_value(runtime_state, :stderr_path)
+
+      %{
+        stderr_path: stderr_path,
+        next_step:
+          if is_binary(stderr_path) and stderr_path != "" do
+            "先看 worker.stderr.log，确认启动阶段具体报错。"
+          else
+            "先看 worker 启动日志，确认启动阶段具体报错。"
+          end,
+        retry_hint: "先修复启动错误，再重新点击“启动”。"
+      }
+    end
+  end
+
+  def project_runtime_failure_help(_project), do: nil
+
   @spec project_validation_error_label(map()) :: String.t()
   def project_validation_error_label(%{"field" => field, "message" => message}), do: "#{field}: #{message}"
   def project_validation_error_label(%{field: field, message: message}), do: "#{field}: #{message}"
@@ -330,7 +360,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp project_entries(%{entries: entries}) when is_list(entries), do: entries
   defp project_entries(_registry), do: []
 
-  defp project_entry_payload(entry) do
+  defp project_entry_payload(entry, opts) do
     runtime_state = Map.get(entry, :runtime_state)
 
     %{
@@ -344,22 +374,26 @@ defmodule SymphonyElixirWeb.Presenter do
       last_seen_at: project_runtime_timestamp(runtime_state, :last_seen_at),
       last_health_check_at: project_runtime_timestamp(runtime_state, :last_health_check_at),
       last_error: project_last_error(runtime_state),
-      runtime_state: project_runtime_payload(runtime_state),
+      runtime_state: project_runtime_payload(runtime_state, opts),
       run_summaries: project_run_summaries_payload(runtime_state)
     }
   end
 
-  defp project_runtime_payload(runtime_state) when is_map(runtime_state) do
-    %{
-      status: runtime_state_status(runtime_state)
-    }
+  defp project_runtime_payload(runtime_state, opts) when is_map(runtime_state) do
+    payload = %{status: runtime_state_status(runtime_state)}
+
+    if Keyword.get(opts, :runtime_debug?, false) do
+      Map.merge(payload, %{
+        stderr_path: runtime_state_value(runtime_state, :stderr_path),
+        stdout_path: runtime_state_value(runtime_state, :stdout_path),
+        error_summary: runtime_state_value(runtime_state, :error_summary)
+      })
+    else
+      payload
+    end
   end
 
-  defp project_runtime_payload(_runtime_state) do
-    %{
-      status: "not_started"
-    }
-  end
+  defp project_runtime_payload(_runtime_state, _opts), do: %{status: "not_started"}
 
   defp project_run_summaries_payload(%{} = runtime_state) do
     runtime_state
@@ -440,14 +474,14 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp run_turn_count_text(summary) do
     case map_integer_value(summary, :turn_count) do
-      value when is_integer(value) -> "#{value} turns"
+      value when is_integer(value) -> "#{value} 轮"
       _ -> nil
     end
   end
 
   defp run_last_event_text(summary) do
     case map_value(summary, :last_event_at) do
-      value when is_binary(value) and value != "" -> "last event #{value}"
+      value when is_binary(value) and value != "" -> "最近事件 #{value}"
       _ -> nil
     end
   end
