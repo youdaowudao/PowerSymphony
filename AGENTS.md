@@ -197,6 +197,9 @@
 - 本地 ExUnit 并发必须显式受控；`SYMPHONY_TEST_MAX_CASES` 不得高于 `4`，资源吃紧时自动降到 `2`，仍不稳再降到 `1`。
 - 例如：`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- mix test test/some_targeted_test.exs`、`cd elixir && SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all`。
 - 该约定仅用于本地执行，不得修改 CI 默认行为，不得借此降低 coverage threshold，也不得删测试。
+- 覆盖率长期策略采用“总门槛放宽、关键模块加严、逐步棘轮收紧”：仓库总覆盖率硬门槛为 `>= 98%`，关键模块名单、tier 规则、diff coverage 与 `ignore_modules` 审计规则以 `docs/initiatives/SPEC/33_质量门禁与验收边界.md` 为准。
+- 凡是触达关键模块的改动，覆盖率不得低于该模块当前 baseline；新增 public function、状态分支、重试/降级/恢复分支必须补直接命中的测试，不能只靠旁路集成路径顺带覆盖。
+- 在覆盖率 tier 校验和 diff coverage 自动化脚本正式设计并接入前，不得私自引入平行 gate、私有阈值或与 `make all` / `Next Push Gate` 冲突的本地 helper；若脚本方案与现有门禁顺序或 coverage 真相源冲突，必须先回到人类裁决。
 
 ## 测试安全红线
 

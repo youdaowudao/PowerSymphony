@@ -236,7 +236,12 @@ Choose the validation command based on the current `git diff`.
 - Development should use targeted validation only.
 - Any local development or test run that enables the dashboard or control plane should avoid
   `4000`; use another free port such as `4100`, `4123`, or `4311`.
-- Current repo-level coverage gate is `99%`.
+- Current repo-level coverage gate is `98%`.
+- Coverage policy follows “lower total gate, stricter critical modules”: total coverage is the
+  repo-level hard gate, but critical modules must not regress below their current baseline and are
+  expected to climb toward stricter per-module targets.
+- The long-term tier list, diff coverage policy, and `ignore_modules` audit rules live in
+  `../docs/initiatives/SPEC/33_质量门禁与验收边界.md`.
 - Current time-sensitive test baseline is `8000ms`.
 - Before opening a PR or updating an existing PR, determine `Next Push Gate` from the cumulative
   diff that the branch / PR head will have against PR base after the push.
@@ -267,6 +272,8 @@ SYMPHONY_TEST_MAX_CASES=4 mise exec -- make all
 ```
 
 - GitHub Actions remains the authoritative remote full `make all` gate when the PR touches `.github/workflows/make-all.yml`, `elixir/**`, `AGENTS.md`, or `SPEC.md`, but the matching local `make all` hard gate must run before the PR create/update push.
+- Do not add a separate local coverage helper that bypasses `make all`, changes the threshold
+  source of truth, or uses a tier/diff-coverage rule that disagrees with the long-term policy doc.
 
 Heavy tests and `make all` must be monitored for memory growth, swap growth, CPU saturation that
 does not recover, abnormal subprocess/port/worker growth, and signs of system lag or loss of
