@@ -129,7 +129,6 @@ defmodule SymphonyElixir.ProjectConfigStore do
   end
 
   defp fetch_defaults(%{"defaults" => defaults}) when is_map(defaults), do: {:ok, defaults}
-  defp fetch_defaults(%{"defaults" => _other}), do: {:error, [invalid_defaults_error()]}
   defp fetch_defaults(_decoded), do: {:ok, %{}}
 
   defp validate_root_fields(decoded) do
@@ -264,7 +263,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
            name: String.trim(project["name"]),
            enabled: normalized_enabled(project),
            worker_port: normalized_worker_port(project, index),
-           workflow_source: canonical_optional_path(Map.get(project, "workflow_source")),
+           workflow_source: canonical_path(project["workflow_source"]),
            workflow_generated: canonical_path(project["workflow_generated"]),
            workspace_root: canonical_path(project["workspace_root"]),
            logs_root: canonical_path(project["logs_root"]),
@@ -472,13 +471,6 @@ defmodule SymphonyElixir.ProjectConfigStore do
     {:ok, canonical} = value |> Path.expand() |> PathSafety.canonicalize()
     canonical
   end
-
-  defp canonical_optional_path(value) when is_binary(value) do
-    trimmed = String.trim(value)
-    if trimmed == "", do: nil, else: canonical_path(value)
-  end
-
-  defp canonical_optional_path(_value), do: nil
 
   defp normalized_enabled(project) do
     Map.get(project, "enabled", true)

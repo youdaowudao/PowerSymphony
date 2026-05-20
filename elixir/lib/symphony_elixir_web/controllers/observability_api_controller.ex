@@ -612,6 +612,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, reason}
       when reason in [:config_invalid, :disabled, :already_running, :not_running, :start_failed] ->
         error_response(conn, 409, Atom.to_string(reason), "Project action is not allowed")
+
+      {:error, {:workflow_generation_failed, _reason}} ->
+        error_response(conn, 422, "workflow_generation_failed", "Project workflow generation failed")
+
+      {:error, reason} ->
+        error_response(conn, 500, "project_action_failed", "Project action failed: #{inspect(reason)}")
     end
   end
 

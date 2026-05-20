@@ -339,12 +339,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
     case ensure_workflow_generated(entry) do
       :ok ->
         case projected_status(entry, Map.get(state.runtimes, entry.project_id)) do
-          :config_invalid ->
-            {{:error, :config_invalid}, state}
-
-          :disabled ->
-            {{:error, :disabled}, state}
-
           status when status in [:starting, :running, :stopping] ->
             {{:error, :already_running}, state}
 
@@ -355,8 +349,11 @@ defmodule SymphonyElixir.ProjectProcessManager do
       {:error, :disabled} ->
         {{:error, :disabled}, state}
 
-      {:error, _reason} ->
+      {:error, :config_invalid} ->
         {{:error, :config_invalid}, state}
+
+      {:error, reason} ->
+        {{:error, reason}, state}
     end
   end
 
@@ -646,7 +643,10 @@ defmodule SymphonyElixir.ProjectProcessManager do
         :ok
 
       workflow_generatable?(config) ->
-        ProjectWorkflowGenerator.generate(config)
+        case ProjectWorkflowGenerator.generate(config) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:workflow_generation_failed, reason}}
+        end
 
       true ->
         {:error, :config_invalid}
@@ -866,8 +866,6 @@ defmodule SymphonyElixir.ProjectProcessManager do
     |> String.trim()
     |> String.downcase()
   end
-
-  defp normalize_issue_state(_state_name), do: nil
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))

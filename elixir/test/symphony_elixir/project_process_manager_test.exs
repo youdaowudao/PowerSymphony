@@ -617,6 +617,25 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert missing_entry.runtime_state.status == :config_invalid
     assert {:error, :config_invalid} = ProjectProcessManager.start_project(manager_name, "alpha")
 
+    missing_source_root = temp_root!("missing-workflow-source-file")
+
+    missing_source_config_path =
+      write_projects_config!(missing_source_root, [
+        project_fixture(missing_source_root, "alpha", port,
+          workflow?: false,
+          source_workflow?: false,
+          workflow_source: Path.join(missing_source_root, "alpha/source/WORKFLOW.md")
+        )
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, missing_source_config_path)
+
+    missing_source_registry = ProjectProcessManager.project_registry(manager_name)
+    missing_source_entry = find_entry!(missing_source_registry, "alpha")
+    assert missing_source_entry.validation_result == :valid
+    assert missing_source_entry.runtime_state.status == :config_invalid
+    assert {:error, :config_invalid} = ProjectProcessManager.start_project(manager_name, "alpha")
+
     invalid_root = temp_root!("invalid-static")
     invalid_config_path = write_invalid_projects_config!(invalid_root)
 
@@ -626,6 +645,38 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     [invalid_entry] = invalid_registry.entries
     assert invalid_entry.validation_result == :invalid
     assert invalid_entry.runtime_state.status == :config_invalid
+  end
+
+  test "workflow generation failures stay distinct from static config_invalid" do
+    test_root = temp_root!("workflow-generation-failure")
+    manager_name = Module.concat(__MODULE__, WorkflowGenerationFailureManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+
+    config_path = write_projects_config!(test_root, [project])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.validation_result == :valid
+    assert entry.runtime_state.status == :not_started
+    refute File.regular?(project.workflow_generated)
+
+    assert {:error, {:workflow_generation_failed, :workflow_front_matter_not_a_map}} =
+             ProjectProcessManager.start_project(manager_name, "alpha")
+
+    failed_entry = fetch_entry!(manager_name, "alpha")
+    assert failed_entry.runtime_state.status == :not_started
+    refute File.regular?(project.workflow_generated)
   end
 
   test "projected config_invalid and disabled states do not persist in internal runtime state" do
@@ -2089,6 +2140,38 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert summary.attention_items == [
              %{kind: "blocked_by", message: "Current blockers are still unresolved: MT-ACTIVE-1, MT-DONE-NONBINARY."}
            ]
+  end
+
+  test "display registry preserves summaries whose only populated field is last_event_at" do
+    test_root = temp_root!("display-datetime-only-summary")
+    manager_name = Module.concat(__MODULE__, DisplayDateTimeOnlySummaryManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "datetime_only_summary"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    assert_eventually(fn ->
+      match?(
+        [%{last_event_at: %DateTime{}}],
+        manager_name
+        |> fetch_display_entry!("alpha")
+        |> then(& &1.runtime_state.run_summaries)
+      )
+    end)
+
+    display_entry = fetch_display_entry!(manager_name, "alpha")
+    assert display_entry.runtime_state.status == :running
+    [summary] = display_entry.runtime_state.run_summaries
+    assert summary.issue_identifier == nil
+    assert %DateTime{} = summary.last_event_at
+    assert summary.attention_items == []
   end
 
   test "default command builder quotes generated workflow paths" do

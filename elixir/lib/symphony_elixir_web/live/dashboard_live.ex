@@ -919,7 +919,27 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> String.replace("_", " ")
   end
 
-  defp format_project_action_error(reason), do: to_string(reason)
+  defp format_project_action_error({:workflow_generation_failed, reason}) do
+    "workflow generation failed: #{format_project_action_error_detail(reason)}"
+  end
+
+  defp format_project_action_error(reason), do: inspect(reason)
+
+  defp format_project_action_error_detail(reason) when is_atom(reason) do
+    reason
+    |> Atom.to_string()
+    |> String.replace("_", " ")
+  end
+
+  defp format_project_action_error_detail({:missing_workflow_file, path, raw_reason}) do
+    "missing workflow file at #{path}: #{inspect(raw_reason)}"
+  end
+
+  defp format_project_action_error_detail({:workflow_parse_error, raw_reason}) do
+    "workflow parse error: #{inspect(raw_reason)}"
+  end
+
+  defp format_project_action_error_detail(reason), do: inspect(reason)
 
   defp project_runtime_or_validation_error(project) do
     Presenter.project_runtime_or_validation_error(project)

@@ -1,7 +1,8 @@
 ---
 tracker:
   kind: linear
-  project_slug: "03b2b4a16461"
+  # Generated project workflows replace this placeholder with the project-specific slug.
+  project_slug: "set-via-generated-workflow"
   active_states:
     - Todo
     - In Progress
@@ -23,7 +24,7 @@ m3:
   enabled: true
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/youdaowudao/PowerSymphony.git .
+    git clone --depth 1 "${SYMPHONY_REPO_URL:?set SYMPHONY_REPO_URL for direct single-project runs}" .
     # control-plane workflow generation replaces the clone command above for each generated project workflow.
     # if command -v mise >/dev/null 2>&1; then
     #   cd elixir && mise trust && mise exec -- mix deps.get

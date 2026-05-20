@@ -131,6 +131,14 @@ defmodule SymphonyElixir.ProjectWorkflowGeneratorTest do
     refute File.regular?(output_path)
   end
 
+  test "repository workflow template does not hardcode project-level bindings" do
+    workflow_path = Path.expand("../../WORKFLOW.md", __DIR__)
+    body = File.read!(workflow_path)
+
+    refute body =~ ~s(project_slug: "03b2b4a16461")
+    refute body =~ "https://github.com/youdaowudao/PowerSymphony.git"
+  end
+
   test "returns workflow load errors when the source workflow cannot be read", %{tmp_dir: tmp_dir} do
     source_path = Path.join(tmp_dir, "missing/WORKFLOW.md")
     output_path = Path.join(tmp_dir, "generated/alpha/WORKFLOW.generated.md")

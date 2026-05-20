@@ -1729,6 +1729,56 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
   end
 
+  test "project control api returns 422 when workflow generation fails before startup" do
+    test_root = temp_root!("project-control-workflow-generation-failed")
+    manager_name = Module.concat(__MODULE__, ProjectControlWorkflowGenerationFailedManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+    config_path = write_projects_config!(test_root, [project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 422) == %{
+             "error" => %{
+               "code" => "workflow_generation_failed",
+               "message" => "Project workflow generation failed"
+             }
+           }
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    [project_payload] = payload["projects"]
+
+    assert_project_summary_shape(project_payload,
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
+    )
+  end
+
   test "project control api is not available in workflow mode" do
     start_test_endpoint(orchestrator: Module.concat(__MODULE__, :WorkflowOnlyControlApiOrchestrator))
 
@@ -5921,6 +5971,43 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert feedback_html =~ "Project action failed"
     assert feedback_html =~ "project manager unavailable"
+    assert Process.alive?(view.pid)
+  end
+
+  test "control-plane dashboard shows workflow generation failure feedback without crashing" do
+    test_root = temp_root!("dashboard-workflow-generation-failed")
+    manager_name = Module.concat(__MODULE__, DashboardWorkflowGenerationFailedManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+    config_path = write_projects_config!(test_root, [project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+
+    feedback_html =
+      render_click(view, "project_action", %{"project_id" => "alpha", "action" => "start"})
+
+    assert feedback_html =~ "Project action failed"
+    assert feedback_html =~ "workflow generation failed"
     assert Process.alive?(view.pid)
   end
 
