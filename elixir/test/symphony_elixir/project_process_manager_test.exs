@@ -555,14 +555,59 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     kill_pid(os_pid)
   end
 
-  test "projects with invalid static config or missing workflow file project as config_invalid" do
+  test "start_project generates a missing workflow before starting the worker" do
+    test_root = temp_root!("generate-before-start")
+    manager_name = Module.concat(__MODULE__, GenerateBeforeStartManager)
+    port = reserve_tcp_port!()
+    workflow_source = Path.join(test_root, "shared/WORKFLOW.md")
+
+    File.mkdir_p!(Path.dirname(workflow_source))
+
+    write_workflow_file!(workflow_source,
+      tracker_project_slug: "source-project",
+      workspace_root: Path.join(test_root, "shared-workspace"),
+      hook_after_create: "git clone --depth 1 https://example.com/source.git ."
+    )
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        workflow_source: workflow_source,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    config_path = write_projects_config!(test_root, [project])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "normal"})})
+
+    refute File.regular?(project.workflow_generated)
+    assert fetch_entry!(manager_name, "alpha").runtime_state.status == :not_started
+
+    assert {:ok, _running_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+    assert File.regular?(project.workflow_generated)
+
+    assert {:ok, %{config: generated_config}} = Workflow.load(project.workflow_generated)
+    assert get_in(generated_config, ["tracker", "project_slug"]) == "slug-alpha"
+    assert get_in(generated_config, ["workspace", "root"]) == project.workspace_root
+    assert get_in(generated_config, ["hooks", "after_create"]) =~ "https://example.com/alpha.git"
+  end
+
+  test "projects with invalid static config or missing workflow generation inputs project as config_invalid" do
     missing_root = temp_root!("missing-workflow")
     manager_name = Module.concat(__MODULE__, InvalidProjectionManager)
     port = reserve_tcp_port!()
 
     missing_config_path =
       write_projects_config!(missing_root, [
-        project_fixture(missing_root, "alpha", port, workflow?: false)
+        project_fixture(missing_root, "alpha", port,
+          workflow?: false,
+          source_workflow?: false,
+          workflow_source: nil,
+          project_slug: nil,
+          repo_url: nil
+        )
       ])
 
     Application.put_env(:symphony_elixir, :project_config_path_override, missing_config_path)
@@ -570,6 +615,25 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
     missing_entry = fetch_entry!(manager_name, "alpha")
     assert missing_entry.runtime_state.status == :config_invalid
+    assert {:error, :config_invalid} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    missing_source_root = temp_root!("missing-workflow-source-file")
+
+    missing_source_config_path =
+      write_projects_config!(missing_source_root, [
+        project_fixture(missing_source_root, "alpha", port,
+          workflow?: false,
+          source_workflow?: false,
+          workflow_source: Path.join(missing_source_root, "alpha/source/WORKFLOW.md")
+        )
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, missing_source_config_path)
+
+    missing_source_registry = ProjectProcessManager.project_registry(manager_name)
+    missing_source_entry = find_entry!(missing_source_registry, "alpha")
+    assert missing_source_entry.validation_result == :valid
+    assert missing_source_entry.runtime_state.status == :config_invalid
     assert {:error, :config_invalid} = ProjectProcessManager.start_project(manager_name, "alpha")
 
     invalid_root = temp_root!("invalid-static")
@@ -583,13 +647,53 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert invalid_entry.runtime_state.status == :config_invalid
   end
 
+  test "workflow generation failures stay distinct from static config_invalid" do
+    test_root = temp_root!("workflow-generation-failure")
+    manager_name = Module.concat(__MODULE__, WorkflowGenerationFailureManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+
+    config_path = write_projects_config!(test_root, [project])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    entry = fetch_entry!(manager_name, "alpha")
+    assert entry.validation_result == :valid
+    assert entry.runtime_state.status == :not_started
+    refute File.regular?(project.workflow_generated)
+
+    assert {:error, {:workflow_generation_failed, :workflow_front_matter_not_a_map}} =
+             ProjectProcessManager.start_project(manager_name, "alpha")
+
+    failed_entry = fetch_entry!(manager_name, "alpha")
+    assert failed_entry.runtime_state.status == :not_started
+    refute File.regular?(project.workflow_generated)
+  end
+
   test "projected config_invalid and disabled states do not persist in internal runtime state" do
     test_root = temp_root!("projected-states")
     manager_name = Module.concat(__MODULE__, ProjectedStatesManager)
     alpha_port = reserve_tcp_port!()
     beta_port = reserve_tcp_port!()
 
-    alpha = project_fixture(test_root, "alpha", alpha_port, workflow?: false)
+    alpha =
+      project_fixture(test_root, "alpha", alpha_port,
+        workflow?: false,
+        source_workflow?: false,
+        workflow_source: nil,
+        project_slug: nil,
+        repo_url: nil
+      )
+
     beta = project_fixture(test_root, "beta", beta_port, enabled: false)
 
     config_path = write_projects_config!(test_root, [alpha, beta])
@@ -613,9 +717,8 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     assert internal_state.runtimes["alpha"].status == :not_started
     assert internal_state.runtimes["beta"].status == :not_started
 
-    File.mkdir_p!(Path.dirname(alpha.workflow_generated))
-    write_workflow_file!(alpha.workflow_generated)
-    write_projects_config!(test_root, [%{alpha | enabled: true}, %{beta | enabled: true}])
+    alpha_valid = project_fixture(test_root, "alpha", alpha_port)
+    write_projects_config!(test_root, [%{alpha_valid | enabled: true}, %{beta | enabled: true}])
 
     assert {:ok, alpha_state} = ProjectProcessManager.start_project(manager_name, "alpha")
     assert {:ok, beta_state} = ProjectProcessManager.start_project(manager_name, "beta")
@@ -946,7 +1049,13 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
         project_fixture(test_root, "beta", beta_port),
         project_fixture(test_root, "gamma", gamma_port),
         project_fixture(test_root, "delta", delta_port, enabled: false),
-        project_fixture(test_root, "epsilon", epsilon_port, workflow?: false)
+        project_fixture(test_root, "epsilon", epsilon_port,
+          workflow?: false,
+          source_workflow?: false,
+          workflow_source: nil,
+          project_slug: nil,
+          repo_url: nil
+        )
       ])
 
     write_workflow_file!(Workflow.workflow_file_path(), control_plane: %{health_check_timeout_ms: 50})
@@ -1500,7 +1609,18 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
 
     assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
 
-    entry = fetch_display_entry!(manager_name, "alpha")
+    entry =
+      await_display_entry!(manager_name, "alpha", fn entry ->
+        summaries = entry.runtime_state.run_summaries
+
+        entry.runtime_state.status == :running and
+          Enum.any?(summaries, &(&1.issue_identifier == "MT-APPROVAL-1")) and
+          Enum.any?(summaries, &(&1.issue_identifier == "MT-POSSIBLE-1")) and
+          Enum.any?(summaries, &(&1.issue_identifier == "MT-PARENT-GENERIC-1")) and
+          Enum.any?(summaries, &(is_nil(&1.issue_identifier) and &1.approval_pending == true)) and
+          Enum.any?(summaries, &(is_nil(&1.issue_identifier) and &1.turn_count == 7))
+      end)
+
     assert entry.runtime_state.status == :running
 
     summaries = entry.runtime_state.run_summaries
@@ -2022,6 +2142,38 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
            ]
   end
 
+  test "display registry preserves summaries whose only populated field is last_event_at" do
+    test_root = temp_root!("display-datetime-only-summary")
+    manager_name = Module.concat(__MODULE__, DisplayDateTimeOnlySummaryManager)
+    port = reserve_tcp_port!()
+
+    config_path =
+      write_projects_config!(test_root, [
+        project_fixture(test_root, "alpha", port)
+      ])
+
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{"alpha" => "datetime_only_summary"})})
+
+    assert {:ok, _runtime_state} = ProjectProcessManager.start_project(manager_name, "alpha")
+
+    assert_eventually(fn ->
+      match?(
+        [%{last_event_at: %DateTime{}}],
+        manager_name
+        |> fetch_display_entry!("alpha")
+        |> then(& &1.runtime_state.run_summaries)
+      )
+    end)
+
+    display_entry = fetch_display_entry!(manager_name, "alpha")
+    assert display_entry.runtime_state.status == :running
+    [summary] = display_entry.runtime_state.run_summaries
+    assert summary.issue_identifier == nil
+    assert %DateTime{} = summary.last_event_at
+    assert summary.attention_items == []
+  end
+
   test "default command builder quotes generated workflow paths" do
     test_root = temp_root!("default-command-builder 'quoted'")
     manager_name = Module.concat(__MODULE__, DefaultCommandBuilderManager)
@@ -2492,9 +2644,15 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     workspace_root = Path.join(project_root, "workspace")
     logs_root = Path.join(project_root, "logs")
     workflow_path = Path.join(project_root, "generated/WORKFLOW.md")
+    workflow_source = Path.join(project_root, "source/WORKFLOW.md")
 
     File.mkdir_p!(workspace_root)
     File.mkdir_p!(logs_root)
+    File.mkdir_p!(Path.dirname(workflow_source))
+
+    if Keyword.get(opts, :source_workflow?, true) do
+      write_workflow_file!(workflow_source)
+    end
 
     if Keyword.get(opts, :workflow?, true) do
       File.mkdir_p!(Path.dirname(workflow_path))
@@ -2504,9 +2662,12 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
     %{
       id: project_id,
       name: String.capitalize(project_id),
+      workflow_source: Keyword.get(opts, :workflow_source, if(Keyword.get(opts, :source_workflow?, true), do: workflow_source, else: nil)),
       workflow_generated: workflow_path,
       workspace_root: workspace_root,
       logs_root: logs_root,
+      project_slug: Keyword.get(opts, :project_slug, "#{project_id}-slug"),
+      repo_url: Keyword.get(opts, :repo_url, "https://example.com/#{project_id}.git"),
       enabled: Keyword.get(opts, :enabled, true),
       worker_port: worker_port
     }
@@ -2567,16 +2728,24 @@ defmodule SymphonyElixir.ProjectProcessManagerTest do
   end
 
   defp project_yaml(project) do
-    """
-      - id: "#{project.id}"
-        name: "#{project.name}"
-        workflow_generated: "#{project.workflow_generated}"
-        workspace_root: "#{project.workspace_root}"
-        logs_root: "#{project.logs_root}"
-        enabled: #{if(project.enabled, do: "true", else: "false")}
-        worker_port: #{project.worker_port}
-    """
+    [
+      "  - id: \"#{project.id}\"",
+      "    name: \"#{project.name}\"",
+      optional_project_yaml_line("workflow_source", project[:workflow_source]),
+      "    workflow_generated: \"#{project.workflow_generated}\"",
+      "    workspace_root: \"#{project.workspace_root}\"",
+      "    logs_root: \"#{project.logs_root}\"",
+      optional_project_yaml_line("project_slug", project[:project_slug]),
+      optional_project_yaml_line("repo_url", project[:repo_url]),
+      "    enabled: #{if(project.enabled, do: "true", else: "false")}",
+      "    worker_port: #{project.worker_port}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
   end
+
+  defp optional_project_yaml_line(_field, nil), do: nil
+  defp optional_project_yaml_line(field, value), do: "    #{field}: \"#{value}\""
 
   defp control_plane_runtime_dir(test_root, project_id) do
     Path.join([test_root, project_id, "logs", "control-plane"])

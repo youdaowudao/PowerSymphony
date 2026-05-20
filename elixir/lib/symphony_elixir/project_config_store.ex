@@ -15,12 +15,18 @@ defmodule SymphonyElixir.ProjectConfigStore do
                          "worker_status"
                        ])
 
-  @root_allowed_fields MapSet.new(["projects"])
-  @required_fields ~w(id name workflow_generated workspace_root logs_root)
+  @root_allowed_fields MapSet.new(["defaults", "projects"])
+  @defaults_allowed_fields MapSet.new([
+                             "workflow_source",
+                             "workflow_generated_template",
+                             "workspace_root_template",
+                             "logs_root_template"
+                           ])
+  @required_fields ~w(id name workflow_source workflow_generated workspace_root logs_root project_slug repo_url)
   @optional_fields ~w(enabled worker_port)
   @allowed_fields MapSet.new(@required_fields ++ @optional_fields)
   @project_id_regex ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
-  @path_fields ~w(workflow_generated workspace_root logs_root)
+  @path_fields ~w(workflow_source workflow_generated workspace_root logs_root)
   @worker_port_base 4101
 
   @spec load(Path.t()) :: {:ok, [ProjectConfig.t()]} | {:error, [ProjectConfigError.t()]}
@@ -52,8 +58,9 @@ defmodule SymphonyElixir.ProjectConfigStore do
   def decode_projects(yaml) when is_binary(yaml) do
     with {:ok, decoded} <- decode_yaml(yaml),
          {:ok, projects} <- fetch_projects(decoded),
-         :ok <- validate_root_fields(decoded) do
-      {:ok, projects}
+         :ok <- validate_root_fields(decoded),
+         {:ok, defaults} <- fetch_defaults(decoded) do
+      {:ok, resolve_projects(projects, defaults)}
     end
   end
 
@@ -121,10 +128,16 @@ defmodule SymphonyElixir.ProjectConfigStore do
      ]}
   end
 
+  defp fetch_defaults(%{"defaults" => defaults}) when is_map(defaults), do: {:ok, defaults}
+  defp fetch_defaults(_decoded), do: {:ok, %{}}
+
   defp validate_root_fields(decoded) do
     errors =
-      Enum.reduce(decoded, [], fn {field, _value}, acc ->
+      Enum.reduce(decoded, [], fn {field, value}, acc ->
         cond do
+          field == "defaults" ->
+            acc ++ validate_defaults(value)
+
           MapSet.member?(@root_allowed_fields, field) ->
             acc
 
@@ -144,7 +157,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
                 %ProjectConfigError{
                   type: :invalid_field,
                   field: field,
-                  message: "#{field} is not part of the M1 static project schema"
+                  message: "#{field} is not part of the static project schema"
                 }
               ]
         end
@@ -182,6 +195,53 @@ defmodule SymphonyElixir.ProjectConfigStore do
     end
   end
 
+  defp validate_defaults(defaults) when is_map(defaults) do
+    Enum.reduce(defaults, [], fn {field, _value}, acc ->
+      cond do
+        MapSet.member?(@defaults_allowed_fields, field) ->
+          acc
+
+        MapSet.member?(@runtime_only_fields, field) ->
+          acc ++
+            [
+              %ProjectConfigError{
+                type: :invalid_field,
+                field: "defaults.#{field}",
+                message: "#{field} must not appear in static project config"
+              }
+            ]
+
+        true ->
+          acc ++
+            [
+              %ProjectConfigError{
+                type: :invalid_field,
+                field: "defaults.#{field}",
+                message: "#{field} is not part of the static project defaults schema"
+              }
+            ]
+      end
+    end)
+  end
+
+  defp validate_defaults(_defaults), do: [invalid_defaults_error()]
+
+  defp resolve_projects(projects, defaults) when is_list(projects) do
+    Enum.map(projects, &resolve_project(&1, defaults))
+  end
+
+  defp resolve_project(project, defaults) when is_map(project) do
+    project_id = string_or_nil(Map.get(project, "id"))
+
+    project
+    |> maybe_put_default("workflow_source", string_or_nil(Map.get(defaults, "workflow_source")))
+    |> maybe_put_default("workflow_generated", render_project_template(Map.get(defaults, "workflow_generated_template"), project_id))
+    |> maybe_put_default("workspace_root", render_project_template(Map.get(defaults, "workspace_root_template"), project_id))
+    |> maybe_put_default("logs_root", render_project_template(Map.get(defaults, "logs_root_template"), project_id))
+  end
+
+  defp resolve_project(project, _defaults), do: project
+
   defp validate_project(project, index) when is_map(project) do
     project_id = string_or_nil(Map.get(project, "id"))
 
@@ -203,9 +263,12 @@ defmodule SymphonyElixir.ProjectConfigStore do
            name: String.trim(project["name"]),
            enabled: normalized_enabled(project),
            worker_port: normalized_worker_port(project, index),
+           workflow_source: canonical_path(project["workflow_source"]),
            workflow_generated: canonical_path(project["workflow_generated"]),
            workspace_root: canonical_path(project["workspace_root"]),
-           logs_root: canonical_path(project["logs_root"])
+           logs_root: canonical_path(project["logs_root"]),
+           project_slug: string_or_nil(Map.get(project, "project_slug")),
+           repo_url: string_or_nil(Map.get(project, "repo_url"))
          }}
 
       _ ->
@@ -267,7 +330,7 @@ defmodule SymphonyElixir.ProjectConfigStore do
                 field: field,
                 project_index: index,
                 project_id: project_id,
-                message: "#{field} is not part of the M1 static project schema"
+                message: "#{field} is not part of the static project schema"
               }
             ]
       end
@@ -417,6 +480,36 @@ defmodule SymphonyElixir.ProjectConfigStore do
     Map.get(project, "worker_port", @worker_port_base + index)
   end
 
+  defp maybe_put_default(project, _field, nil), do: project
+
+  defp maybe_put_default(project, field, value) do
+    case Map.fetch(project, field) do
+      :error ->
+        Map.put(project, field, value)
+
+      {:ok, nil} ->
+        Map.put(project, field, value)
+
+      {:ok, existing} when is_binary(existing) ->
+        if String.trim(existing) == "" do
+          Map.put(project, field, value)
+        else
+          project
+        end
+
+      _ ->
+        project
+    end
+  end
+
+  defp render_project_template(value, project_id) when is_binary(value) and is_binary(project_id) do
+    value
+    |> String.replace("{{ project_id }}", project_id)
+    |> String.replace("{{project_id}}", project_id)
+  end
+
+  defp render_project_template(_value, _project_id), do: nil
+
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, nested}, acc ->
       Map.put(acc, normalize_key(key), normalize_keys(nested))
@@ -441,6 +534,14 @@ defmodule SymphonyElixir.ProjectConfigStore do
       type: :yaml_parse_error,
       field: "projects",
       message: message
+    }
+  end
+
+  defp invalid_defaults_error do
+    %ProjectConfigError{
+      type: :invalid_field,
+      field: "defaults",
+      message: "defaults must be a map"
     }
   end
 

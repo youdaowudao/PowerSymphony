@@ -534,6 +534,44 @@ case mode do
 
     accept_loop.(accept_loop)
 
+  "datetime_only_summary" ->
+    {:ok, listener} =
+      :gen_tcp.listen(port, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
+
+    accept_loop = fn accept_loop ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+
+      spawn(fn ->
+        request =
+          case :gen_tcp.recv(socket, 0, 5_000) do
+            {:ok, request} -> request
+            _other -> ""
+          end
+
+        request |> request_path.() |> log_request.()
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            case request_path.(request) do
+              "/api/v1/state" ->
+                body = ~s({"running":[{"last_event_at":"2026-05-12T00:08:00Z"}]})
+
+                "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n#{body}"
+
+              _other ->
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok"
+            end
+          )
+
+        :gen_tcp.close(socket)
+      end)
+
+      accept_loop.(accept_loop)
+    end
+
+    accept_loop.(accept_loop)
+
   _other ->
     IO.puts(:stderr, "unsupported fake worker mode")
     System.halt(2)

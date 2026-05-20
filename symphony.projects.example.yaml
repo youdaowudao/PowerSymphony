@@ -1,18 +1,22 @@
 # Static control-plane config only.
 # Do not place runtime state, validation state, pid, health, or worker status here.
+defaults:
+  workflow_source: /home/user/projects/powersymphony/elixir/WORKFLOW.md
+  workflow_generated_template: /home/user/projects/symphony-runtime/{{ project_id }}/WORKFLOW.generated.md
+  workspace_root_template: /home/user/projects/symphony-workspaces/{{ project_id }}
+  logs_root_template: /home/user/projects/symphony-runtime/{{ project_id }}/logs
+
 projects:
-  - id: chatgpt-extension
-    name: ChatGPT Extension
+  - id: powersymphony
+    name: PowerSymphony
     enabled: true
     worker_port: 4101
-    workflow_generated: /home/user/code/chatgpt-extension/WORKFLOW.generated.md
-    workspace_root: /home/user/.symphony/workspaces/chatgpt-extension
-    logs_root: /home/user/.symphony/logs/chatgpt-extension
+    project_slug: "03b2b4a16461"
+    repo_url: https://github.com/youdaowudao/PowerSymphony.git
 
-  - id: docs-site
-    name: Docs Site
+  - id: linear-agents
+    name: Linear Agents
     enabled: true
     worker_port: 4102
-    workflow_generated: /home/user/code/docs-site/WORKFLOW.generated.md
-    workspace_root: /home/user/.symphony/workspaces/docs-site
-    logs_root: /home/user/.symphony/logs/docs-site
+    project_slug: "327e2b00c1cd"
+    repo_url: https://github.com/youdaowudao/linear-agents.git

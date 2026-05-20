@@ -1016,9 +1016,12 @@ defmodule SymphonyElixir.ExtensionsTest do
       projects:
         - id: "alpha"
           name: "Alpha"
+          workflow_source: "#{alpha_project.workflow_source}"
           workflow_generated: "#{alpha_project.workflow_generated}"
           workspace_root: "#{alpha_project.workspace_root}"
           logs_root: "#{alpha_project.logs_root}"
+          project_slug: "#{alpha_project.project_slug}"
+          repo_url: "#{alpha_project.repo_url}"
           enabled: true
           worker_port: #{stub_port}
       """
@@ -1082,9 +1085,12 @@ defmodule SymphonyElixir.ExtensionsTest do
       projects:
         - id: "alpha"
           name: "Alpha"
+          workflow_source: "#{alpha_project.workflow_source}"
           workflow_generated: "#{alpha_project.workflow_generated}"
           workspace_root: "#{alpha_project.workspace_root}"
           logs_root: "#{alpha_project.logs_root}"
+          project_slug: "#{alpha_project.project_slug}"
+          repo_url: "#{alpha_project.repo_url}"
           enabled: true
           worker_port: #{stub_port}
       """
@@ -1206,9 +1212,12 @@ defmodule SymphonyElixir.ExtensionsTest do
       projects:
         - id: "alpha"
           name: "Alpha"
+          workflow_source: "#{alpha_project.workflow_source}"
           workflow_generated: "#{alpha_project.workflow_generated}"
           workspace_root: "#{alpha_project.workspace_root}"
           logs_root: "#{alpha_project.logs_root}"
+          project_slug: "#{alpha_project.project_slug}"
+          repo_url: "#{alpha_project.repo_url}"
           enabled: true
           worker_port: #{stub_port}
       """
@@ -1493,7 +1502,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
   end
 
-  test "project summary projects config_invalid when workflow file is missing" do
+  test "project summary keeps a project valid when generated workflow is missing but can be rebuilt" do
     test_root = temp_root!("project-summary-config-invalid")
     manager_name = Module.concat(__MODULE__, MissingWorkflowProjectsManager)
     port = reserve_tcp_port!()
@@ -1520,7 +1529,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       enabled: true,
       validation_result: "valid",
       validation_errors: [],
-      worker_status: "config_invalid",
+      worker_status: "not_started",
       worker_port: port,
       last_seen_at: nil,
       last_health_check_at: nil,
@@ -1717,6 +1726,56 @@ defmodule SymphonyElixir.ExtensionsTest do
       last_seen_at: nil,
       last_health_check_at: nil,
       last_error: "worker command exited during startup"
+    )
+  end
+
+  test "project control api returns 422 when workflow generation fails before startup" do
+    test_root = temp_root!("project-control-workflow-generation-failed")
+    manager_name = Module.concat(__MODULE__, ProjectControlWorkflowGenerationFailedManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+    config_path = write_projects_config!(test_root, [project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    assert json_response(post(build_conn(), "/api/v1/projects/alpha/start", %{}), 422) == %{
+             "error" => %{
+               "code" => "workflow_generation_failed",
+               "message" => "Project workflow generation failed"
+             }
+           }
+
+    payload = json_response(get(build_conn(), "/api/v1/projects"), 200)
+    [project_payload] = payload["projects"]
+
+    assert_project_summary_shape(project_payload,
+      project_id: "alpha",
+      project_name: "Alpha",
+      enabled: true,
+      validation_result: "valid",
+      validation_errors: [],
+      worker_status: "not_started",
+      worker_port: port,
+      last_seen_at: nil,
+      last_health_check_at: nil,
+      last_error: nil
     )
   end
 
@@ -5915,6 +5974,43 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Process.alive?(view.pid)
   end
 
+  test "control-plane dashboard shows workflow generation failure feedback without crashing" do
+    test_root = temp_root!("dashboard-workflow-generation-failed")
+    manager_name = Module.concat(__MODULE__, DashboardWorkflowGenerationFailedManager)
+    port = reserve_tcp_port!()
+
+    project =
+      project_fixture(test_root, "alpha", port,
+        workflow?: false,
+        project_slug: "slug-alpha",
+        repo_url: "https://example.com/alpha.git"
+      )
+
+    File.write!(project.workflow_source, "---\n[]\n---\nPrompt body\n")
+    config_path = write_projects_config!(test_root, [project])
+
+    on_exit(fn -> File.rm_rf!(test_root) end)
+    Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
+    Application.put_env(:symphony_elixir, :project_process_manager_name, manager_name)
+
+    start_supervised!({ProjectProcessManager, name: manager_name, command_builder: fake_worker_builder(%{})})
+
+    start_test_endpoint(
+      runtime_mode: :control_plane,
+      orchestrator: SymphonyElixir.ControlPlaneSnapshotServer
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Alpha"
+
+    feedback_html =
+      render_click(view, "project_action", %{"project_id" => "alpha", "action" => "start"})
+
+    assert feedback_html =~ "Project action failed"
+    assert feedback_html =~ "workflow generation failed"
+    assert Process.alive?(view.pid)
+  end
+
   test "control-plane startup loads invalid project registry as visible validation error instead of an empty list" do
     config_root =
       Path.join(
@@ -6489,14 +6585,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     projects:
       - id: alpha
         name: Alpha
+        workflow_source: /tmp/alpha/WORKFLOW.md
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
+        project_slug: alpha-slug
+        repo_url: https://example.com/alpha.git
       - id: Beta
         name: Beta
+        workflow_source: /tmp/beta/WORKFLOW.md
         workflow_generated: /tmp/beta/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/beta
         logs_root: /tmp/logs/beta
+        project_slug: beta-slug
+        repo_url: https://example.com/beta.git
     """)
 
     Application.put_env(:symphony_elixir, :project_config_path_override, config_path)
@@ -6580,9 +6682,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     projects:
       - id: alpha
         name: Alpha
+        workflow_source: /tmp/alpha/WORKFLOW.md
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
+        project_slug: alpha-slug
+        repo_url: https://example.com/alpha.git
     """)
 
     Workflow.set_workflow_file_path(Path.join(config_root, "MISSING_WORKFLOW.md"))
@@ -7136,9 +7241,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     workspace_root = Path.join(project_root, "workspace")
     logs_root = Path.join(project_root, "logs")
     workflow_path = Path.join(project_root, "generated/WORKFLOW.md")
+    workflow_source = Path.join(project_root, "source/WORKFLOW.md")
 
     File.mkdir_p!(workspace_root)
     File.mkdir_p!(logs_root)
+    File.mkdir_p!(Path.dirname(workflow_source))
+
+    if Keyword.get(opts, :source_workflow?, true) do
+      write_workflow_file!(workflow_source)
+    end
 
     if Keyword.get(opts, :workflow?, true) do
       File.mkdir_p!(Path.dirname(workflow_path))
@@ -7148,9 +7259,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     %{
       id: project_id,
       name: String.capitalize(project_id),
+      workflow_source: Keyword.get(opts, :workflow_source, if(Keyword.get(opts, :source_workflow?, true), do: workflow_source, else: nil)),
       workflow_generated: workflow_path,
       workspace_root: if(Keyword.get(opts, :omit_workspace_root?, false), do: nil, else: workspace_root),
       logs_root: logs_root,
+      project_slug: Keyword.get(opts, :project_slug, "#{project_id}-slug"),
+      repo_url: Keyword.get(opts, :repo_url, "https://example.com/#{project_id}.git"),
       enabled: Keyword.get(opts, :enabled, true),
       worker_port: worker_port
     }
@@ -7172,18 +7286,24 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp project_yaml(project) do
-    """
-      - id: "#{project.id}"
-        name: "#{project.name}"
-        workflow_generated: "#{project.workflow_generated}"
-    """ <>
-      if(project.workspace_root, do: "    workspace_root: \"#{project.workspace_root}\"\n", else: "") <>
-      """
-          logs_root: "#{project.logs_root}"
-          enabled: #{if(project.enabled, do: "true", else: "false")}
-          worker_port: #{project.worker_port}
-      """
+    [
+      "  - id: \"#{project.id}\"",
+      "    name: \"#{project.name}\"",
+      optional_project_yaml_line("workflow_source", project[:workflow_source]),
+      "    workflow_generated: \"#{project.workflow_generated}\"",
+      project.workspace_root && "    workspace_root: \"#{project.workspace_root}\"",
+      "    logs_root: \"#{project.logs_root}\"",
+      optional_project_yaml_line("project_slug", project[:project_slug]),
+      optional_project_yaml_line("repo_url", project[:repo_url]),
+      "    enabled: #{if(project.enabled, do: "true", else: "false")}",
+      "    worker_port: #{project.worker_port}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
   end
+
+  defp optional_project_yaml_line(_field, nil), do: nil
+  defp optional_project_yaml_line(field, value), do: "    #{field}: \"#{value}\""
 
   defp reserve_tcp_port! do
     {:ok, socket} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}])

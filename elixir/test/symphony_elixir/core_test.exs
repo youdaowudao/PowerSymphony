@@ -220,7 +220,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
-  test "current WORKFLOW.md file is valid and complete" do
+  test "current WORKFLOW.md file is valid and preserves direct single-project placeholders" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
     Workflow.clear_workflow_file_path()
@@ -231,7 +231,7 @@ defmodule SymphonyElixir.CoreTest do
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
     assert Map.get(tracker, "kind") == "linear"
-    assert is_binary(Map.get(tracker, "project_slug"))
+    assert Map.get(tracker, "project_slug") == "set-via-generated-workflow"
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
@@ -244,8 +244,9 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(hooks)
 
     assert Map.get(hooks, "after_create") =~
-             "git clone --depth 1 https://github.com/youdaowudao/PowerSymphony.git ."
+             ~s(git clone --depth 1 "${SYMPHONY_REPO_URL:?set SYMPHONY_REPO_URL for direct single-project runs}" .)
 
+    assert Map.get(hooks, "after_create") =~ "control-plane workflow generation replaces the clone command above"
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "true"
