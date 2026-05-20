@@ -553,9 +553,15 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
     workspace_root = Path.join(project_root, "workspace")
     logs_root = Path.join(project_root, "logs")
     workflow_path = Path.join(project_root, "generated/WORKFLOW.md")
+    workflow_source = Path.join(project_root, "source/WORKFLOW.md")
 
     File.mkdir_p!(workspace_root)
     File.mkdir_p!(logs_root)
+    File.mkdir_p!(Path.dirname(workflow_source))
+
+    if Keyword.get(opts, :source_workflow?, true) do
+      write_workflow_file!(workflow_source)
+    end
 
     if Keyword.get(opts, :workflow?, true) do
       File.mkdir_p!(Path.dirname(workflow_path))
@@ -565,9 +571,12 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
     %{
       id: project_id,
       name: String.capitalize(project_id),
+      workflow_source: Keyword.get(opts, :workflow_source, if(Keyword.get(opts, :source_workflow?, true), do: workflow_source, else: nil)),
       workflow_generated: workflow_path,
       workspace_root: workspace_root,
       logs_root: logs_root,
+      project_slug: Keyword.get(opts, :project_slug, "#{project_id}-slug"),
+      repo_url: Keyword.get(opts, :repo_url, "https://example.com/#{project_id}.git"),
       enabled: Keyword.get(opts, :enabled, true),
       worker_port: worker_port
     }
@@ -589,16 +598,24 @@ defmodule SymphonyElixir.WorkerHealthPollerTest do
   end
 
   defp project_yaml(project) do
-    """
-      - id: "#{project.id}"
-        name: "#{project.name}"
-        workflow_generated: "#{project.workflow_generated}"
-        workspace_root: "#{project.workspace_root}"
-        logs_root: "#{project.logs_root}"
-        enabled: #{if(project.enabled, do: "true", else: "false")}
-        worker_port: #{project.worker_port}
-    """
+    [
+      "  - id: \"#{project.id}\"",
+      "    name: \"#{project.name}\"",
+      optional_project_yaml_line("workflow_source", project[:workflow_source]),
+      "    workflow_generated: \"#{project.workflow_generated}\"",
+      "    workspace_root: \"#{project.workspace_root}\"",
+      "    logs_root: \"#{project.logs_root}\"",
+      optional_project_yaml_line("project_slug", project[:project_slug]),
+      optional_project_yaml_line("repo_url", project[:repo_url]),
+      "    enabled: #{if(project.enabled, do: "true", else: "false")}",
+      "    worker_port: #{project.worker_port}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
   end
+
+  defp optional_project_yaml_line(_field, nil), do: nil
+  defp optional_project_yaml_line(field, value), do: "    #{field}: \"#{value}\""
 
   defp temp_root!(label) do
     root = Path.join(System.tmp_dir!(), "symphony-worker-health-poller-#{label}-#{System.unique_integer([:positive])}")

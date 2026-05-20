@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   use GenServer
 
-  alias SymphonyElixir.{Config, ProjectRegistry, ProjectRegistryLoader, StateReducer}
+  alias SymphonyElixir.{Config, ProjectRegistry, ProjectRegistryLoader, ProjectWorkflowGenerator, StateReducer}
   alias SymphonyElixir.ProjectRegistry.Entry
 
   @startup_grace_ms 1_000
@@ -336,18 +336,27 @@ defmodule SymphonyElixir.ProjectProcessManager do
   def handle_info({_port, {:data, _data}}, state), do: {:noreply, state}
 
   defp start_project_runtime(entry, state) do
-    case projected_status(entry, Map.get(state.runtimes, entry.project_id)) do
-      :config_invalid ->
-        {{:error, :config_invalid}, state}
+    case ensure_workflow_generated(entry) do
+      :ok ->
+        case projected_status(entry, Map.get(state.runtimes, entry.project_id)) do
+          :config_invalid ->
+            {{:error, :config_invalid}, state}
 
-      :disabled ->
+          :disabled ->
+            {{:error, :disabled}, state}
+
+          status when status in [:starting, :running, :stopping] ->
+            {{:error, :already_running}, state}
+
+          _other ->
+            do_start_project_runtime(entry, state)
+        end
+
+      {:error, :disabled} ->
         {{:error, :disabled}, state}
 
-      status when status in [:starting, :running, :stopping] ->
-        {{:error, :already_running}, state}
-
-      _other ->
-        do_start_project_runtime(entry, state)
+      {:error, _reason} ->
+        {{:error, :config_invalid}, state}
     end
   end
 
@@ -624,8 +633,36 @@ defmodule SymphonyElixir.ProjectProcessManager do
 
   defp projected_status(%Entry{normalized_config: %{enabled: false}}, _runtime_state), do: :disabled
 
-  defp projected_status(%Entry{normalized_config: %{workflow_generated: workflow_generated}}, runtime_state) do
-    if File.regular?(workflow_generated), do: runtime_state.status, else: :config_invalid
+  defp projected_status(%Entry{normalized_config: config}, runtime_state) do
+    if workflow_available?(config), do: runtime_state.status, else: :config_invalid
+  end
+
+  defp ensure_workflow_generated(%Entry{validation_result: :invalid}), do: {:error, :config_invalid}
+  defp ensure_workflow_generated(%Entry{normalized_config: %{enabled: false}}), do: {:error, :disabled}
+
+  defp ensure_workflow_generated(%Entry{normalized_config: config}) do
+    cond do
+      File.regular?(config.workflow_generated) ->
+        :ok
+
+      workflow_generatable?(config) ->
+        ProjectWorkflowGenerator.generate(config)
+
+      true ->
+        {:error, :config_invalid}
+    end
+  end
+
+  defp workflow_available?(config) do
+    File.regular?(config.workflow_generated) or workflow_generatable?(config)
+  end
+
+  defp workflow_generatable?(config) do
+    is_binary(config.workflow_generated) and
+      is_binary(config.workflow_source) and
+      is_binary(config.project_slug) and
+      is_binary(config.repo_url) and
+      File.regular?(config.workflow_source)
   end
 
   defp project_health_status(%{status: :running, health_status: :unreachable} = runtime_state),

@@ -12,11 +12,17 @@ defmodule SymphonyElixir.ProjectRegistryTest do
         name: Alpha
         enabled: false
         worker_port: 4201
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
       - id: Beta
         name: Beta
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-beta
+        repo_url: https://example.com/beta.git
         workflow_generated: /tmp/beta/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/beta
         logs_root: /tmp/logs/beta
@@ -52,8 +58,8 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     assert {:ok, registry} = ProjectRegistry.load(@sample_config_path)
     [first, second] = ProjectRegistry.entries(registry)
 
-    assert first.project_id == "chatgpt-extension"
-    assert second.project_id == "docs-site"
+    assert first.project_id == "powersymphony"
+    assert second.project_id == "linear-agents"
     assert first.validation_result == :valid
     assert second.validation_result == :valid
     assert first.runtime_state == %{status: :not_started}
@@ -62,6 +68,66 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     assert first.normalized_config.worker_port == 4101
     assert second.normalized_config.enabled == true
     assert second.normalized_config.worker_port == 4102
+
+    assert Map.take(first.normalized_config, [:workflow_source, :project_slug, :repo_url]) == %{
+             workflow_source: "/home/user/projects/powersymphony/elixir/WORKFLOW.md",
+             project_slug: "03b2b4a16461",
+             repo_url: "https://github.com/youdaowudao/PowerSymphony.git"
+           }
+
+    assert Map.take(second.normalized_config, [:workflow_source, :project_slug, :repo_url]) == %{
+             workflow_source: "/home/user/projects/powersymphony/elixir/WORKFLOW.md",
+             project_slug: "327e2b00c1cd",
+             repo_url: "https://github.com/youdaowudao/linear-agents.git"
+           }
+  end
+
+  test "build preserves workflow source, project slug, and repo url in normalized configs" do
+    yaml = """
+    defaults:
+      workflow_source: /tmp/shared/WORKFLOW.md
+      workflow_generated_template: /tmp/generated/{{ project_id }}/WORKFLOW.generated.md
+      workspace_root_template: /tmp/workspaces/{{ project_id }}
+      logs_root_template: /tmp/logs/{{ project_id }}
+    projects:
+      - id: alpha
+        name: Alpha
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
+      - id: beta
+        name: Beta
+        project_slug: slug-beta
+        repo_url: https://example.com/beta.git
+    """
+
+    assert {:ok, registry} = ProjectRegistry.build(yaml)
+
+    assert [
+             %{
+               project_id: "alpha",
+               normalized_config: alpha_config,
+               validation_result: :valid,
+               runtime_state: %{status: :not_started}
+             },
+             %{
+               project_id: "beta",
+               normalized_config: beta_config,
+               validation_result: :valid,
+               runtime_state: %{status: :not_started}
+             }
+           ] = ProjectRegistry.entries(registry)
+
+    assert Map.take(alpha_config, [:workflow_source, :project_slug, :repo_url]) == %{
+             workflow_source: "/tmp/shared/WORKFLOW.md",
+             project_slug: "slug-alpha",
+             repo_url: "https://example.com/alpha.git"
+           }
+
+    assert Map.take(beta_config, [:workflow_source, :project_slug, :repo_url]) == %{
+             workflow_source: "/tmp/shared/WORKFLOW.md",
+             project_slug: "slug-beta",
+             repo_url: "https://example.com/beta.git"
+           }
   end
 
   test "explicit worker_port zero remains valid and keeps runtime_state not_started" do
@@ -71,6 +137,9 @@ defmodule SymphonyElixir.ProjectRegistryTest do
         name: Alpha
         enabled: true
         worker_port: 0
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
@@ -150,8 +219,8 @@ defmodule SymphonyElixir.ProjectRegistryTest do
   test "find_entry returns matching entry and nil for unknown id" do
     assert {:ok, registry} = ProjectRegistry.load(@sample_config_path)
 
-    assert %{project_id: "chatgpt-extension"} =
-             ProjectRegistry.find_entry(registry, "chatgpt-extension")
+    assert %{project_id: "powersymphony"} =
+             ProjectRegistry.find_entry(registry, "powersymphony")
 
     assert ProjectRegistry.find_entry(registry, "missing-project") == nil
   end

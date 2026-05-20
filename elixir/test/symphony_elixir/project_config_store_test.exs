@@ -14,24 +14,127 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
   test "loads and normalizes two projects from the sample config" do
     assert {:ok, [first, second]} = ProjectConfigStore.load(@sample_config_path)
 
-    assert first == %ProjectConfig{
-             id: "chatgpt-extension",
-             name: "ChatGPT Extension",
+    assert Map.take(first, [
+             :id,
+             :name,
+             :enabled,
+             :worker_port,
+             :workflow_source,
+             :workflow_generated,
+             :workspace_root,
+             :logs_root,
+             :project_slug,
+             :repo_url
+           ]) == %{
+             id: "powersymphony",
+             name: "PowerSymphony",
              enabled: true,
              worker_port: 4101,
-             workflow_generated: "/home/user/code/chatgpt-extension/WORKFLOW.generated.md",
-             workspace_root: "/home/user/.symphony/workspaces/chatgpt-extension",
-             logs_root: "/home/user/.symphony/logs/chatgpt-extension"
+             workflow_source: "/home/user/projects/powersymphony/elixir/WORKFLOW.md",
+             workflow_generated: "/home/user/projects/symphony-runtime/powersymphony/WORKFLOW.generated.md",
+             workspace_root: "/home/user/projects/symphony-workspaces/powersymphony",
+             logs_root: "/home/user/projects/symphony-runtime/powersymphony/logs",
+             project_slug: "03b2b4a16461",
+             repo_url: "https://github.com/youdaowudao/PowerSymphony.git"
            }
 
-    assert second == %ProjectConfig{
-             id: "docs-site",
-             name: "Docs Site",
+    assert Map.take(second, [
+             :id,
+             :name,
+             :enabled,
+             :worker_port,
+             :workflow_source,
+             :workflow_generated,
+             :workspace_root,
+             :logs_root,
+             :project_slug,
+             :repo_url
+           ]) == %{
+             id: "linear-agents",
+             name: "Linear Agents",
              enabled: true,
              worker_port: 4102,
-             workflow_generated: "/home/user/code/docs-site/WORKFLOW.generated.md",
-             workspace_root: "/home/user/.symphony/workspaces/docs-site",
-             logs_root: "/home/user/.symphony/logs/docs-site"
+             workflow_source: "/home/user/projects/powersymphony/elixir/WORKFLOW.md",
+             workflow_generated: "/home/user/projects/symphony-runtime/linear-agents/WORKFLOW.generated.md",
+             workspace_root: "/home/user/projects/symphony-workspaces/linear-agents",
+             logs_root: "/home/user/projects/symphony-runtime/linear-agents/logs",
+             project_slug: "327e2b00c1cd",
+             repo_url: "https://github.com/youdaowudao/linear-agents.git"
+           }
+  end
+
+  test "renders default templates and preserves project workflow binding fields", %{tmp_dir: tmp_dir} do
+    workflow_source = Path.join(tmp_dir, "shared/WORKFLOW.md")
+    workflow_generated_template = Path.join(tmp_dir, "generated/{{ project_id }}/WORKFLOW.generated.md")
+    workspace_root_template = Path.join(tmp_dir, "workspaces/{{ project_id }}")
+    logs_root_template = Path.join(tmp_dir, "logs/{{ project_id }}")
+
+    yaml = """
+    defaults:
+      workflow_source: #{workflow_source}
+      workflow_generated_template: #{workflow_generated_template}
+      workspace_root_template: #{workspace_root_template}
+      logs_root_template: #{logs_root_template}
+    projects:
+      - id: alpha
+        name: Alpha
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
+      - id: beta
+        name: Beta
+        project_slug: slug-beta
+        repo_url: https://example.com/beta.git
+        worker_port: 4202
+    """
+
+    assert {:ok, [first, second]} = ProjectConfigStore.parse_string(yaml)
+
+    assert Map.take(first, [
+             :id,
+             :name,
+             :enabled,
+             :worker_port,
+             :workflow_source,
+             :workflow_generated,
+             :workspace_root,
+             :logs_root,
+             :project_slug,
+             :repo_url
+           ]) == %{
+             id: "alpha",
+             name: "Alpha",
+             enabled: true,
+             worker_port: 4101,
+             workflow_source: workflow_source,
+             workflow_generated: Path.join(tmp_dir, "generated/alpha/WORKFLOW.generated.md"),
+             workspace_root: Path.join(tmp_dir, "workspaces/alpha"),
+             logs_root: Path.join(tmp_dir, "logs/alpha"),
+             project_slug: "slug-alpha",
+             repo_url: "https://example.com/alpha.git"
+           }
+
+    assert Map.take(second, [
+             :id,
+             :name,
+             :enabled,
+             :worker_port,
+             :workflow_source,
+             :workflow_generated,
+             :workspace_root,
+             :logs_root,
+             :project_slug,
+             :repo_url
+           ]) == %{
+             id: "beta",
+             name: "Beta",
+             enabled: true,
+             worker_port: 4202,
+             workflow_source: workflow_source,
+             workflow_generated: Path.join(tmp_dir, "generated/beta/WORKFLOW.generated.md"),
+             workspace_root: Path.join(tmp_dir, "workspaces/beta"),
+             logs_root: Path.join(tmp_dir, "logs/beta"),
+             project_slug: "slug-beta",
+             repo_url: "https://example.com/beta.git"
            }
   end
 
@@ -40,11 +143,17 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     projects:
       - id: alpha
         name: Alpha
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
       - id: beta
         name: Beta
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-beta
+        repo_url: https://example.com/beta.git
         workflow_generated: /tmp/beta/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/beta
         logs_root: /tmp/logs/beta
@@ -65,6 +174,9 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
         name: Alpha
         enabled: false
         worker_port: 0
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
@@ -98,6 +210,83 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
 
     assert_error(errors, :missing_field, 0, "alpha", "name")
+  end
+
+  test "reports invalid defaults containers" do
+    yaml = """
+    defaults: nope
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_generated: /tmp/generated/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+
+    assert Enum.any?(errors, fn error ->
+             error.type == :invalid_field and
+               error.project_index == nil and
+               error.project_id == nil and
+               error.field == "defaults"
+           end)
+  end
+
+  test "reports runtime-only and unknown defaults fields" do
+    yaml = """
+    defaults:
+      worker_status: running
+      unexpected: value
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
+        workflow_generated: /tmp/generated/alpha/WORKFLOW.generated.md
+        workspace_root: /tmp/workspaces/alpha
+        logs_root: /tmp/logs/alpha
+    """
+
+    assert {:error, errors} = ProjectConfigStore.parse_string(yaml)
+    assert_error(errors, :invalid_field, nil, nil, "defaults.worker_status")
+    assert_error(errors, :invalid_field, nil, nil, "defaults.unexpected")
+  end
+
+  test "decode_projects applies defaults to nil and blank values while preserving explicit and invalid ones" do
+    yaml = """
+    defaults:
+      workflow_source: /tmp/shared/WORKFLOW.md
+      workflow_generated_template: /tmp/generated/{{ project_id }}/WORKFLOW.generated.md
+      workspace_root_template: /tmp/workspaces/{{ project_id }}
+      logs_root_template: /tmp/logs/{{ project_id }}
+    projects:
+      - id: alpha
+        name: Alpha
+        workflow_source:
+        workflow_generated: "   "
+        workspace_root: /tmp/custom-workspaces/alpha
+        logs_root: 123
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
+      - id: beta
+        name: Beta
+        project_slug: slug-beta
+        repo_url: https://example.com/beta.git
+    """
+
+    assert {:ok, [alpha, beta]} = ProjectConfigStore.decode_projects(yaml)
+
+    assert alpha["workflow_source"] == "/tmp/shared/WORKFLOW.md"
+    assert alpha["workflow_generated"] == "/tmp/generated/alpha/WORKFLOW.generated.md"
+    assert alpha["workspace_root"] == "/tmp/custom-workspaces/alpha"
+    assert alpha["logs_root"] == 123
+
+    assert beta["workflow_source"] == "/tmp/shared/WORKFLOW.md"
+    assert beta["workflow_generated"] == "/tmp/generated/beta/WORKFLOW.generated.md"
+    assert beta["workspace_root"] == "/tmp/workspaces/beta"
+    assert beta["logs_root"] == "/tmp/logs/beta"
   end
 
   test "reports invalid project ids" do
@@ -165,16 +354,22 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
       %{
         "id" => "alpha",
         "name" => "Alpha",
+        "workflow_source" => "/tmp/shared/WORKFLOW.md",
         "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
         "workspace_root" => "/tmp/workspaces/alpha",
-        "logs_root" => "/tmp/logs/alpha"
+        "logs_root" => "/tmp/logs/alpha",
+        "project_slug" => "slug-alpha",
+        "repo_url" => "https://example.com/alpha.git"
       },
       %{
         "id" => "alpha",
         "name" => "Alpha Duplicate",
+        "workflow_source" => "/tmp/shared/WORKFLOW.md",
         "workflow_generated" => "/tmp/alpha-2/WORKFLOW.generated.md",
         "workspace_root" => "/tmp/workspaces/alpha-2",
-        "logs_root" => "/tmp/logs/alpha-2"
+        "logs_root" => "/tmp/logs/alpha-2",
+        "project_slug" => "slug-alpha-2",
+        "repo_url" => "https://example.com/alpha-2.git"
       }
     ]
 
@@ -207,16 +402,22 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
       %{
         "id" => "alpha",
         "name" => "Alpha",
+        "workflow_source" => "/tmp/shared/WORKFLOW.md",
         "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
         "workspace_root" => "/tmp/workspaces/alpha",
-        "logs_root" => "/tmp/logs/alpha"
+        "logs_root" => "/tmp/logs/alpha",
+        "project_slug" => "slug-alpha",
+        "repo_url" => "https://example.com/alpha.git"
       },
       %{
         "id" => "alpha",
         "name" => "Alpha Duplicate",
+        "workflow_source" => "/tmp/shared/WORKFLOW.md",
         "workflow_generated" => "relative/WORKFLOW.generated.md",
         "workspace_root" => "/tmp/workspaces/alpha-2",
-        "logs_root" => "/tmp/logs/alpha-2"
+        "logs_root" => "/tmp/logs/alpha-2",
+        "project_slug" => "slug-alpha-2",
+        "repo_url" => "https://example.com/alpha-2.git"
       }
     ]
 
@@ -254,9 +455,12 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
       %{
         "id" => "alpha",
         "name" => "Alpha",
+        "workflow_source" => "/tmp/shared/WORKFLOW.md",
         "workflow_generated" => "/tmp/alpha/WORKFLOW.generated.md",
         "workspace_root" => "/tmp/workspaces/alpha",
-        "logs_root" => "/tmp/logs/alpha"
+        "logs_root" => "/tmp/logs/alpha",
+        "project_slug" => "slug-alpha",
+        "repo_url" => "https://example.com/alpha.git"
       }
     ]
 
@@ -267,9 +471,12 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
                  name: "Alpha",
                  enabled: true,
                  worker_port: 4101,
+                 workflow_source: "/tmp/shared/WORKFLOW.md",
                  workflow_generated: "/tmp/alpha/WORKFLOW.generated.md",
                  workspace_root: "/tmp/workspaces/alpha",
-                 logs_root: "/tmp/logs/alpha"
+                 logs_root: "/tmp/logs/alpha",
+                 project_slug: "slug-alpha",
+                 repo_url: "https://example.com/alpha.git"
                },
                validation_errors: []
              }
@@ -335,6 +542,9 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
         - id: alpha
           name: Alpha
           #{worker_port_line}
+          workflow_source: /tmp/shared/WORKFLOW.md
+          project_slug: slug-alpha
+          repo_url: https://example.com/alpha.git
           workflow_generated: /tmp/alpha/WORKFLOW.generated.md
           workspace_root: /tmp/workspaces/alpha
           logs_root: /tmp/logs/alpha
@@ -351,6 +561,9 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
       - id: alpha
         name: Alpha
         worker_port: 4000
+        workflow_source: /tmp/shared/WORKFLOW.md
+        project_slug: slug-alpha
+        repo_url: https://example.com/alpha.git
         workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         workspace_root: /tmp/workspaces/alpha
         logs_root: /tmp/logs/alpha
@@ -581,9 +794,12 @@ defmodule SymphonyElixir.ProjectConfigStoreTest do
     projects:
       - !<tag:yamerl,2012:atom> id: alpha
         !<tag:yamerl,2012:atom> name: Alpha
+        !<tag:yamerl,2012:atom> workflow_source: /tmp/shared/WORKFLOW.md
         !<tag:yamerl,2012:atom> workflow_generated: /tmp/alpha/WORKFLOW.generated.md
         !<tag:yamerl,2012:atom> workspace_root: /tmp/workspaces/alpha
         !<tag:yamerl,2012:atom> logs_root: /tmp/logs/alpha
+        !<tag:yamerl,2012:atom> project_slug: slug-alpha
+        !<tag:yamerl,2012:atom> repo_url: https://example.com/alpha.git
     """)
 
     assert {:ok, [project]} = ProjectConfigStore.load(config_path)

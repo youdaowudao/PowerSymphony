@@ -24,6 +24,7 @@ m3:
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/youdaowudao/PowerSymphony.git .
+    # control-plane workflow generation replaces the clone command above for each generated project workflow.
     # if command -v mise >/dev/null 2>&1; then
     #   cd elixir && mise trust && mise exec -- mix deps.get
     # fi
