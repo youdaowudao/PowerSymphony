@@ -17,33 +17,34 @@ defmodule SymphonyElixir.CoveragePolicy.Report do
   def load_reports!(opts \\ []) do
     cover_path = Keyword.get(opts, :cover_path, "cover")
     compile_path = Keyword.get(opts, :compile_path, Mix.Project.compile_path())
+    ops = Keyword.get(opts, :ops, default_ops())
     output = String.trim_trailing(cover_path, "/")
     coverdata = Path.join(output, "policy.coverdata")
 
-    if not File.exists?(coverdata) do
+    if not ops.file_exists?.(coverdata) do
       raise ArgumentError, "no exported coverage data found in #{output}"
     end
 
-    Mix.ensure_application!(:tools)
-    _ = cover_stop()
-    {:ok, _pid} = cover_start()
+    ops.ensure_tools.()
+    _ = ops.cover_stop.()
+    {:ok, _pid} = ops.cover_start.()
 
-    compile_result = cover_compile_beam(beams(compile_path))
+    compile_result = ops.cover_compile_beam.(beams(compile_path))
 
     case compile_result do
       results when is_list(results) -> :ok
       {:error, reason} -> raise ArgumentError, "failed to cover compile beams: #{inspect(reason)}"
     end
 
-    :ok = cover_import(String.to_charlist(coverdata))
+    :ok = ops.cover_import.(String.to_charlist(coverdata))
 
-    cover_modules()
+    ops.cover_modules.()
     |> Enum.reject(&(&1 in Policy.ignore_modules()))
-    |> Enum.map(&report_for_module/1)
+    |> Enum.map(&report_for_module(&1, ops))
   end
 
-  defp report_for_module(module) do
-    {:ok, line_rows} = cover_analyse(module, :coverage, :line)
+  defp report_for_module(module, ops) do
+    {:ok, line_rows} = ops.cover_analyse.(module, :coverage, :line)
 
     %{
       tier: tier,
@@ -102,6 +103,19 @@ defmodule SymphonyElixir.CoveragePolicy.Report do
     |> File.ls!()
     |> Enum.filter(&String.ends_with?(&1, ".beam"))
     |> Enum.map(&(Path.join(dir, &1) |> String.to_charlist()))
+  end
+
+  defp default_ops do
+    %{
+      file_exists?: &File.exists?/1,
+      ensure_tools: fn -> Mix.ensure_application!(:tools) end,
+      cover_stop: &cover_stop/0,
+      cover_start: &cover_start/0,
+      cover_compile_beam: &cover_compile_beam/1,
+      cover_import: &cover_import/1,
+      cover_modules: &cover_modules/0,
+      cover_analyse: &cover_analyse/3
+    }
   end
 
   defp cover_stop do

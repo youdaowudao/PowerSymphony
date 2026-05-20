@@ -17,17 +17,18 @@ defmodule Mix.Tasks.Coverage.Policy.Check do
   def run(args) do
     Mix.Task.run("compile")
     policy = merged_policy(parse_args!(args))
+    modules = modules()
 
     try do
-      base_resolution = Policy.resolve_base_ref(policy, policy.base_ref)
-      reports = Report.load_reports!(cover_path: policy.cover_path)
-      Checker.validate_ignore_audit!(policy)
+      base_resolution = modules.policy.resolve_base_ref(policy, policy.base_ref)
+      reports = modules.report.load_reports!(cover_path: policy.cover_path)
+      modules.checker.validate_ignore_audit!(policy)
 
       {changed_lines, diff_result} =
         case base_resolution do
           {:ok, base_ref} ->
-            changed_lines = Diff.changed_lines(base_ref, git_root: project_root())
-            diff_result = Checker.validate_diff_coverage!(changed_lines, reports, policy)
+            changed_lines = modules.diff.changed_lines(base_ref, git_root: project_root())
+            diff_result = modules.checker.validate_diff_coverage!(changed_lines, reports, policy)
             {changed_lines, diff_result}
 
           {:skip, :missing_base_ref} ->
@@ -38,7 +39,7 @@ defmodule Mix.Tasks.Coverage.Policy.Check do
              }}
         end
 
-      Checker.validate_module_thresholds!(reports, changed_lines)
+      modules.checker.validate_module_thresholds!(reports, changed_lines)
 
       Mix.shell().info(success_message(length(reports), diff_result, policy))
       :ok
@@ -58,6 +59,14 @@ defmodule Mix.Tasks.Coverage.Policy.Check do
     opts
     |> Enum.to_list()
     |> merged_policy()
+  end
+
+  defp modules do
+    Application.get_env(
+      :symphony_elixir,
+      :coverage_policy_check_task_modules,
+      %{checker: Checker, diff: Diff, policy: Policy, report: Report}
+    )
   end
 
   defp parse_args!(args) do
