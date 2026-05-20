@@ -43,9 +43,12 @@ Current workflow principles are intentionally stricter than the older multi-revi
 - the document phase must leave a frozen artifact, then enter `spec freeze`; after that, only one
   reviewer-triggered focused recheck is allowed
 - when a task hits `观察层合同风险`, the default closeout order is `implementer ->
-  contract checker -> baseline lock -> heavy validation -> final zero-context reviewer`
-- `Change Review` and `Push Readiness` stay separate reviewer outputs; `Push Readiness` only states
-  whether the next push is allowed and what minimum proof is still missing
+  contract checker -> pre-validation Change Review -> baseline lock -> heavy validation ->
+  post-validation Push Readiness confirm`
+- `Change Review` is front-loaded before `baseline lock`; `Push Readiness` is a later bounded
+  confirm in a new reviewer invocation and only states whether the next push is allowed, whether
+  the current baseline still matches the same `change review fingerprint`, and what minimum proof
+  is still missing
 - the live execution board stays only in Linear issue body `## Codex Workpad`, including role
   coverage, `Baseline Lock`, `blocker ledger`, `Status Board`, and `Flow Metrics`; repo docs define
   the boundary but do not mirror live values
