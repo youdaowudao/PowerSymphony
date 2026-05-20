@@ -1,6 +1,7 @@
 .PHONY: help all setup deps build fmt fmt-check lint test coverage coverage-policy ci dialyzer e2e
 
 MIX ?= mix
+CI_TARGETS := setup build fmt-check lint coverage coverage-policy dialyzer
 
 help:
 	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, coverage-policy, dialyzer, e2e, ci"
@@ -45,12 +46,16 @@ e2e:
 	SYMPHONY_RUN_LIVE_E2E=1 $(MIX) test test/symphony_elixir/live_e2e_test.exs
 
 ci:
-	$(MAKE) setup
-	$(MAKE) build
-	$(MAKE) fmt-check
-	$(MAKE) lint
-	$(MAKE) coverage
-	$(MAKE) coverage-policy
-	$(MAKE) dialyzer
+	@status=0; \
+	for target in $(CI_TARGETS); do \
+		echo "[RUN] $$target"; \
+		if $(MAKE) $$target; then \
+			echo "[PASS] $$target"; \
+		else \
+			echo "[FAIL] $$target"; \
+			status=1; \
+		fi; \
+	done; \
+	exit $$status
 
 all: ci
