@@ -94,7 +94,7 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 Standalone control plane:
 
 ```bash
-../bin/symphony_control --config ../symphony.projects.example.yaml --port 4100
+../bin/symphony_control --config ../bin/symphony.projects.example.yaml --port 4100
 ```
 
 For local development or test runs, do not reuse `4000` if your long-running local production
@@ -118,11 +118,11 @@ Optional flags:
   - Reserve `4000` for the long-running local production thread; local development and test runs
     should use another free port.
 
-The standalone `../bin/symphony_control` entrypoint reads `symphony.projects.yaml` and builds a
-control-plane-only `ProjectProcessManager` runtime source of truth per project. It does not require
-a valid repo-root `WORKFLOW.md`, does not start the main orchestrator, and exposes the lightweight
-project dashboard/API plus `start` / `stop` / `restart` control actions for each configured
-project.
+The standalone `../bin/symphony_control` entrypoint reads `../bin/symphony.projects.yaml` and
+builds a control-plane-only `ProjectProcessManager` runtime source of truth per project. It does
+not require a valid repo-root `WORKFLOW.md`, does not start the main orchestrator, and exposes the
+lightweight project dashboard/API plus `start` / `stop` / `restart` control actions for each
+configured project.
 
 Each static project entry now also accepts:
 

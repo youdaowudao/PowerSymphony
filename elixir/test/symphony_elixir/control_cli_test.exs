@@ -3,6 +3,8 @@ defmodule SymphonyElixir.ControlCLITest do
 
   alias SymphonyElixir.ControlCLI
 
+  @default_config_path Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
+
   setup do
     previous_runtime_mode = Application.get_env(:symphony_elixir, :runtime_mode)
     previous_project_config_path = Application.get_env(:symphony_elixir, :project_config_path_override)
@@ -17,9 +19,9 @@ defmodule SymphonyElixir.ControlCLITest do
     :ok
   end
 
-  test "defaults to symphony.projects.yaml when config path is missing" do
+  test "defaults to bin/symphony.projects.yaml when config path is missing" do
     deps = %{
-      file_regular?: fn path -> Path.basename(path) == "symphony.projects.yaml" end,
+      file_regular?: fn path -> path == @default_config_path end,
       set_runtime_mode: fn :control_plane -> :ok end,
       set_project_config_path: fn _path -> :ok end,
       set_server_port_override: fn _port -> :ok end,
@@ -207,7 +209,7 @@ defmodule SymphonyElixir.ControlCLIScriptTest do
       File.chmod!(fake_mise, 0o755)
 
       {_, 0} =
-        System.cmd(@script_path, ["--config", "./symphony.projects.yaml", "--port", "4001"],
+        System.cmd(@script_path, ["--config", "./bin/symphony.projects.yaml", "--port", "4001"],
           cd: @repo_root,
           env: [
             {"PATH", "#{fake_bin}:#{previous_path}"},
@@ -217,7 +219,7 @@ defmodule SymphonyElixir.ControlCLIScriptTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "cwd=#{Path.join(@repo_root, "elixir")}"
-      assert trace =~ "--config #{@repo_root}/./symphony.projects.yaml --port 4001"
+      assert trace =~ "--config #{@repo_root}/./bin/symphony.projects.yaml --port 4001"
       assert trace =~ "SymphonyElixir.ControlCLI.main_result(System.argv())"
       assert trace =~ "System.halt(exit_code)"
     after

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
 
   alias SymphonyElixir.{ProjectConfig, ProjectConfigError, ProjectRegistry, ProjectRegistryLoader}
 
-  @sample_config_path Path.expand("../../../symphony.projects.example.yaml", __DIR__)
+  @sample_config_path Path.expand("../../../bin/symphony.projects.example.yaml", __DIR__)
 
   test "builds entries for valid and invalid projects while preserving not_started runtime state" do
     yaml = """
@@ -180,7 +180,7 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     assert %ProjectRegistry{entries: [_, _]} = ProjectRegistryLoader.load()
   end
 
-  test "loader resolves default config from current working directory" do
+  test "loader resolves default config from bin/symphony.projects.yaml" do
     previous_override = Application.get_env(:symphony_elixir, :project_config_path_override)
 
     on_exit(fn ->
@@ -192,28 +192,8 @@ defmodule SymphonyElixir.ProjectRegistryTest do
     end)
 
     Application.delete_env(:symphony_elixir, :project_config_path_override)
-
-    config_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-project-registry-loader-#{System.unique_integer([:positive])}"
-      )
-
-    on_exit(fn -> File.rm_rf!(config_root) end)
-    File.mkdir_p!(config_root)
-
-    config_path = Path.join(config_root, "symphony.projects.yaml")
-    File.cp!(@sample_config_path, config_path)
-
-    original_cwd = File.cwd!()
-
-    on_exit(fn ->
-      File.cd!(original_cwd)
-    end)
-
-    File.cd!(config_root)
-
-    assert ProjectRegistryLoader.project_config_path() == config_path
+    assert ProjectRegistryLoader.project_config_path() ==
+             Path.expand("../../../bin/symphony.projects.yaml", __DIR__)
   end
 
   test "find_entry returns matching entry and nil for unknown id" do
