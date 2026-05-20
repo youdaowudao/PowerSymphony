@@ -1,4 +1,5 @@
 import Config
+import_config "coverage_policy.exs"
 
 config :phoenix, :json_library, Jason
 
