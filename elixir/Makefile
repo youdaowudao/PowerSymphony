@@ -1,9 +1,9 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e
+.PHONY: help all setup deps build fmt fmt-check lint test coverage coverage-policy ci dialyzer e2e
 
 MIX ?= mix
 
 help:
-	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
+	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, coverage-policy, dialyzer, e2e, ci"
 
 setup:
 	$(MIX) setup
@@ -24,7 +24,15 @@ lint:
 	$(MIX) lint
 
 coverage:
-	$(MIX) test --cover
+	$(MIX) test --cover --export-coverage policy
+
+coverage-policy:
+	@if [ "$${COVERAGE_POLICY_BASE_REF_MODE:-enforce}" = "skip_without_base" ]; then \
+		$(MIX) coverage.policy.check --cover-path cover --base-ref-mode skip_without_base; \
+	else \
+		test -n "$${COVERAGE_POLICY_BASE_REF}" || { echo "COVERAGE_POLICY_BASE_REF is required when COVERAGE_POLICY_BASE_REF_MODE=enforce"; exit 1; }; \
+		$(MIX) coverage.policy.check --cover-path cover --base-ref "$${COVERAGE_POLICY_BASE_REF}" --base-ref-mode enforce; \
+	fi
 
 test:
 	$(MIX) test
@@ -42,6 +50,7 @@ ci:
 	$(MAKE) fmt-check
 	$(MAKE) lint
 	$(MAKE) coverage
+	$(MAKE) coverage-policy
 	$(MAKE) dialyzer
 
 all: ci

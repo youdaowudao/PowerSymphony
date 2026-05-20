@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up mise tools
         uses: jdx/mise-action@v4
@@ -45,4 +47,7 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Verify make all
+        env:
+          COVERAGE_POLICY_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+          COVERAGE_POLICY_BASE_REF_MODE: ${{ github.event_name == 'pull_request' && 'enforce' || 'skip_without_base' }}
         run: make all
